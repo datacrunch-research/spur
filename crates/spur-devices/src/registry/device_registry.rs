@@ -32,6 +32,10 @@ impl DeviceRegistry {
 
         let mut cdi_entries: Vec<DeviceEntry> = cdi_cache
             .iter()
+            // NVIDIA CDI publishes an aggregate `gpu=all` alias alongside
+            // its individual GPU entries. It is useful to container runtimes
+            // but is not a physical, independently schedulable device.
+            .filter(|(_, cached)| cached.device.name != "all")
             .map(|(_, cached)| from_cdi(cached))
             .collect();
         cdi_entries.sort_by(cdi_sort_key);
