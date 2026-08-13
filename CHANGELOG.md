@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.9.0](https://github.com/ROCm/spur/compare/v0.8.0...v0.9.0) (2026-08-13)
+
+
+### Features
+
+* **spurctld:** add job submission validation hook (shell + lua) ([#565](https://github.com/ROCm/spur/issues/565)) ([18e5653](https://github.com/ROCm/spur/commit/18e565325bab0d91670eb89930b3f5f5e46d3e8a))
+* **spurctld:** reap abandoned interactive allocations via client keepalive ([#594](https://github.com/ROCm/spur/issues/594)) ([6a0568b](https://github.com/ROCm/spur/commit/6a0568b2c88c9a3fda3b44a3995692cf41716eec))
+
+
+### Bug Fixes
+
+* **spurctld:** enforce partition walltime limits and validate time config ([#593](https://github.com/ROCm/spur/issues/593)) ([172bf8f](https://github.com/ROCm/spur/commit/172bf8f90aea309a90b8bf17bad2ff530ea23cb9))
+* **spurctld:** preserve node allocations during recovery ([#613](https://github.com/ROCm/spur/issues/613)) ([42cfe92](https://github.com/ROCm/spur/commit/42cfe92bd8383f343fa39d9668dab37720d0b43a))
+
 ## [0.8.0](https://github.com/ROCm/spur/compare/v0.7.0...v0.8.0) (2026-08-11)
 
 
