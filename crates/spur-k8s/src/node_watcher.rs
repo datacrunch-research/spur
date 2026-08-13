@@ -73,6 +73,7 @@ async fn sync_taint_state(
         reason,
         labels: HashMap::new(),
         remove_labels: Vec::new(),
+        external_gpus: None,
     };
 
     match client.update_node(req).await {
@@ -175,6 +176,7 @@ pub async fn run(
                     reason: Some("K8s node removed".into()),
                     labels: HashMap::new(),
                     remove_labels: Vec::new(),
+                    external_gpus: None,
                 };
 
                 if let Err(e) = ctrl_client.update_node(req).await {

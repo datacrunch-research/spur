@@ -882,6 +882,26 @@ impl SlurmController for ControllerService {
                 .update_node_labels(&req.name, req.labels, &req.remove_labels)
                 .map_err(|e| Status::internal(e.to_string()))?;
         }
+        if let Some(external_gpus) = req.external_gpus {
+            let gpu_ids = if external_gpus.trim().is_empty() {
+                Vec::new()
+            } else {
+                external_gpus
+                    .split(',')
+                    .map(|id| {
+                        id.trim().parse::<u32>().map_err(|_| {
+                            Status::invalid_argument(format!(
+                                "invalid external GPU device ID {:?}",
+                                id
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            self.cluster
+                .update_node_external_gpus(&req.name, gpu_ids)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        }
         Ok(Response::new(()))
     }
 
@@ -3100,6 +3120,7 @@ fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
         labels: node.labels.clone(),
         reservation_maint: false,
         features: node.features.clone(),
+        external_gpu_ids: node.external_gpu_ids.clone(),
     }
 }
 

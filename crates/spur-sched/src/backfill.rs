@@ -81,14 +81,14 @@ impl BackfillScheduler {
             if !node.has_free_cpu_capacity() {
                 return false;
             }
-            node.total_resources.can_satisfy(&required)
+            node.can_satisfy_request(&required)
         };
 
         if placement.nodelist_is_additive()
             && nodes.iter().any(|node| {
                 placement.is_listed(&node.name)
                     && placement.eligible(node, reservations, now)
-                    && node.total_resources.can_satisfy(&required)
+                    && node.can_satisfy_request(&required)
                     && !suitable(node)
             })
         {
@@ -112,10 +112,25 @@ impl BackfillScheduler {
         gpu_type: Option<&str>,
         time: chrono::DateTime<Utc>,
     ) -> u32 {
-        let current = self.timelines[ni].accumulated_at(time);
+        let current = self.unavailable_at(ni, node, time);
         node.total_resources
             .available_device_ids(&current, "gpu", gpu_type)
             .len() as u32
+    }
+
+    /// Managed allocations at `time` plus GPUs reported as externally occupied.
+    fn unavailable_at(
+        &self,
+        ni: usize,
+        node: &Node,
+        time: chrono::DateTime<Utc>,
+    ) -> ResourceAllocations {
+        let mut unavailable = self.timelines[ni].accumulated_at(time);
+        unavailable.add(&ResourceAllocations::from_device_ids(
+            "gpu",
+            &node.external_gpu_ids,
+        ));
+        unavailable
     }
 
     /// Resolve concrete per-node CPU and GPU allocations for non-uniform demand.
@@ -165,7 +180,7 @@ impl BackfillScheduler {
         let mut per_node_alloc = HashMap::new();
         for (idx, (ni, _)) in assigned_nodes.iter().enumerate() {
             let node = &nodes[*ni];
-            let current = self.timelines[*ni].accumulated_at(now);
+            let current = self.unavailable_at(*ni, node, now);
 
             let mut req = base.clone();
             let cpus = cpu_counts.get(idx).copied().unwrap_or(base.cpus).max(1);

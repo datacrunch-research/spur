@@ -646,6 +646,18 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                         .collect();
                     println!("   Gres={}", gpu_types.join(","));
                 }
+                if !node.external_gpu_ids.is_empty() {
+                    let mut external_gpu_ids = node.external_gpu_ids.clone();
+                    external_gpu_ids.sort_unstable();
+                    println!(
+                        "   ExternalGPUs={}",
+                        external_gpu_ids
+                            .iter()
+                            .map(u32::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    );
+                }
                 println!("   Arch={} OS={}", node.arch, node.os);
                 if !node.labels.is_empty() {
                     let mut label_str: Vec<String> = node
@@ -1106,6 +1118,7 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
     let mut node_name: Option<String> = None;
     let mut node_state: Option<String> = None;
     let mut node_reason: Option<String> = None;
+    let mut external_gpus: Option<String> = None;
 
     for param in params {
         if let Some((key, value)) = param.split_once('=') {
@@ -1120,6 +1133,7 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
                 "nodename" | "node" => node_name = Some(value.into()),
                 "state" => node_state = Some(value.into()),
                 "reason" => node_reason = Some(value.into()),
+                "externalgpus" | "external_gpu_ids" => external_gpus = Some(value.into()),
                 other => eprintln!("scontrol: unknown update key '{}'", other),
             }
         }
@@ -1137,7 +1151,15 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
         let names = resolve_node_names(&mut client, &node_pattern).await?;
         let mut failed: Vec<String> = Vec::new();
         for name in &names {
-            if let Err(e) = update_node(&mut client, name, proto_state, node_reason.clone()).await {
+            if let Err(e) = update_node(
+                &mut client,
+                name,
+                proto_state,
+                node_reason.clone(),
+                external_gpus.clone(),
+            )
+            .await
+            {
                 eprintln!("error: {name}: {e}");
                 failed.push(name.clone());
             }
@@ -1324,6 +1346,7 @@ async fn update_node(
     name: &str,
     state: Option<i32>,
     reason: Option<String>,
+    external_gpus: Option<String>,
 ) -> Result<()> {
     client
         .update_node(spur_proto::proto::UpdateNodeRequest {
@@ -1332,6 +1355,7 @@ async fn update_node(
             reason,
             labels: HashMap::new(),
             remove_labels: Vec::new(),
+            external_gpus,
         })
         .await
         .context("node update failed")?;

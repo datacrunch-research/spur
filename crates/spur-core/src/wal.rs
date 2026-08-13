@@ -196,6 +196,13 @@ pub enum WalOperation {
         set: HashMap<String, String>,
         remove: Vec<String>,
     },
+    /// Durable external GPU availability overlay. Device IDs must belong to the
+    /// node's registered GPU inventory; an empty list clears the overlay.
+    NodeExternalGpusUpdate {
+        name: String,
+        #[serde(default)]
+        gpu_ids: Vec<u32>,
+    },
 
     // Node deregistration
     NodeRemove {

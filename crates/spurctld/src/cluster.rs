@@ -2402,6 +2402,35 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Update GPU IDs occupied by work that Spur does not manage. The overlay is
+    /// replicated so failover cannot accidentally schedule an externally busy GPU.
+    pub fn update_node_external_gpus(&self, name: &str, gpu_ids: Vec<u32>) -> anyhow::Result<()> {
+        let mut gpu_ids = gpu_ids;
+        gpu_ids.sort_unstable();
+        gpu_ids.dedup();
+        {
+            let nodes = self.nodes.read();
+            let node = nodes
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("node {} not found", name))?;
+            for id in &gpu_ids {
+                if !node
+                    .total_resources
+                    .gpus
+                    .iter()
+                    .any(|gpu| gpu.device_id == *id)
+                {
+                    anyhow::bail!("node {} has no GPU device ID {}", name, id);
+                }
+            }
+        }
+        self.propose(WalOperation::NodeExternalGpusUpdate {
+            name: name.to_string(),
+            gpu_ids,
+        })?;
+        Ok(())
+    }
+
     /// assign a k0s role + allocated mesh IP + pod /24 to a node (replicated via Raft).
     /// Callers never touch `self.nodes`/`self.k0s` directly — that would bypass Raft.
     pub fn assign_node_k0s(
@@ -5024,6 +5053,11 @@ impl ClusterManager {
                     node.partitions = matched;
 
                     self.apply_node_config_policy(node);
+                }
+            }
+            WalOperation::NodeExternalGpusUpdate { name, gpu_ids } => {
+                if let Some(node) = nodes.get_mut(name) {
+                    node.external_gpu_ids = gpu_ids.clone();
                 }
             }
             WalOperation::NodeRemove { name, reason } => {

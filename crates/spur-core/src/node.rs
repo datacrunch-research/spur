@@ -284,6 +284,11 @@ pub struct Node {
 
     pub total_resources: ResourceSet,
     pub alloc_resources: ResourceAllocations,
+    /// GPU device IDs occupied by work outside Spur. This is an availability
+    /// overlay, not a Spur allocation: it never affects job accounting or node
+    /// state, but the scheduler must exclude these devices.
+    #[serde(default)]
+    pub external_gpu_ids: Vec<u32>,
 
     /// Node feature tags (e.g., "gpu", "nvme", "rack1") for --constraint matching.
     #[serde(default)]
@@ -350,6 +355,7 @@ impl Node {
             source: NodeSource::default(),
             total_resources: resources,
             alloc_resources: ResourceAllocations::default(),
+            external_gpu_ids: Vec::new(),
             features: Vec::new(),
             labels: HashMap::new(),
             arch: String::new(),
@@ -383,8 +389,23 @@ impl Node {
 
     /// Whether available inventory can satisfy a count-based request.
     pub fn can_satisfy_request(&self, request: &ResourceSet) -> bool {
+        let mut unavailable = self.alloc_resources.clone();
+        unavailable.add(&ResourceAllocations::from_device_ids(
+            "gpu",
+            &self.external_gpu_ids,
+        ));
         self.total_resources
-            .can_satisfy_with_allocated(&self.alloc_resources, request)
+            .can_satisfy_with_allocated(&unavailable, request)
+    }
+
+    /// Return managed allocations plus the external GPU availability overlay.
+    pub fn unavailable_resources(&self) -> ResourceAllocations {
+        let mut unavailable = self.alloc_resources.clone();
+        unavailable.add(&ResourceAllocations::from_device_ids(
+            "gpu",
+            &self.external_gpu_ids,
+        ));
+        unavailable
     }
 
     /// Whether the node has any unallocated CPU headroom (a saturated node is full).
@@ -447,6 +468,44 @@ mod tests {
         value.as_object_mut().unwrap().remove("k0s_last_error");
         let back: Node = serde_json::from_value(value).expect("deserialize node");
         assert_eq!(back.k0s_last_error, None);
+    }
+
+    #[test]
+    fn external_gpu_overlay_reduces_only_gpu_capacity() {
+        let mut resources = ResourceSet::default();
+        resources.cpus = 4;
+        resources.gpus = vec![
+            crate::resource::GpuResource {
+                device_id: 0,
+                gpu_type: "gpu".into(),
+                memory_mb: 1,
+                peer_gpus: Vec::new(),
+                link_type: crate::resource::GpuLinkType::PCIe,
+            },
+            crate::resource::GpuResource {
+                device_id: 1,
+                gpu_type: "gpu".into(),
+                memory_mb: 1,
+                peer_gpus: Vec::new(),
+                link_type: crate::resource::GpuLinkType::PCIe,
+            },
+        ];
+        let mut node = Node::new("n1".into(), resources);
+        node.external_gpu_ids = vec![0];
+
+        let mut one_gpu = ResourceSet::default();
+        one_gpu.gpus = vec![crate::resource::GpuResource {
+            device_id: 0,
+            gpu_type: "gpu".into(),
+            memory_mb: 0,
+            peer_gpus: Vec::new(),
+            link_type: crate::resource::GpuLinkType::PCIe,
+        }];
+        let mut two_gpus = one_gpu.clone();
+        two_gpus.gpus.push(one_gpu.gpus[0].clone());
+
+        assert!(node.can_satisfy_request(&one_gpu));
+        assert!(!node.can_satisfy_request(&two_gpus));
     }
 
     #[test]
