@@ -1257,6 +1257,15 @@ enum DispatchConfirmOutcome {
     Aborted,
 }
 
+/// A node-local prolog can report that a tray is occupied by work outside of
+/// Spur with `EX_TEMPFAIL` (75).  That is an admission conflict, not evidence
+/// that the node is unhealthy: keep it schedulable and let the job retry after
+/// the normal bounded dispatch backoff.  Other prolog failures retain the
+/// conservative drain-and-hold behavior.
+fn is_transient_capacity_prolog_failure(reason: &str) -> bool {
+    reason.contains("exit status: 75")
+}
+
 fn abort_pending_pmix_dispatch(
     cluster: &ClusterManager,
     job_id: spur_core::job::JobId,
@@ -1529,7 +1538,12 @@ async fn confirm_dispatch_on_nodes(
                 error!(job_id, node = %node_name, error = %e, "dispatch confirmation failed");
                 failures += 1;
                 if let DispatchError::PrologFailed(reason) = e {
-                    prolog_failed.push((node_name, reason));
+                    if is_transient_capacity_prolog_failure(&reason) {
+                        warn!(job_id, node = %node_name, reason = %reason,
+                            "transient external capacity conflict; leaving node schedulable");
+                    } else {
+                        prolog_failed.push((node_name, reason));
+                    }
                 }
             }
             Err(e) => {
@@ -3563,6 +3577,16 @@ mod tests {
                 !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
                 "a held job must not be scheduled anywhere"
             );
+        }
+
+        #[test]
+        fn external_occupancy_prolog_exit_is_retryable_not_a_node_fault() {
+            assert!(is_transient_capacity_prolog_failure(
+                "prolog failed: prolog_slurmd script exited with exit status: 75"
+            ));
+            assert!(!is_transient_capacity_prolog_failure(
+                "prolog failed: prolog_slurmd script exited with exit status: 1"
+            ));
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
