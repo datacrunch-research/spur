@@ -232,7 +232,7 @@ impl MpiPluginHost {
             ));
         }
 
-        let mut runtime_buf = vec![0i8; 256];
+        let mut runtime_buf = vec![0 as c_char; 256];
         let runtime_rc = unsafe { runtime_version(runtime_buf.as_mut_ptr(), runtime_buf.len()) };
         if runtime_rc == 0 {
             let runtime = c_str_to_string(&runtime_buf);
@@ -271,7 +271,7 @@ impl MpiPluginHost {
 
     fn call_server_start(&self, plan: &PmixLaunchPlan) -> Result<(), String> {
         let c_plan = plan_to_c(plan)?;
-        let mut errbuf = vec![0i8; 512];
+        let mut errbuf = vec![0 as c_char; 512];
         let rc = {
             let guard = self
                 .plugin
@@ -290,7 +290,7 @@ impl MpiPluginHost {
 
     fn call_verify_peers(&self, plan: &PmixLaunchPlan) -> Result<(), String> {
         let c_plan = plan_to_c(plan)?;
-        let mut errbuf = vec![0i8; 512];
+        let mut errbuf = vec![0 as c_char; 512];
         let rc = {
             let guard = self
                 .plugin
@@ -321,7 +321,7 @@ impl MpiPluginHost {
             );
             return Ok(());
         };
-        let mut errbuf = vec![0i8; 256];
+        let mut errbuf = vec![0 as c_char; 256];
         let rc =
             unsafe { (api.server_stop)(c_namespace.as_ptr(), errbuf.as_mut_ptr(), errbuf.len()) };
         if rc != 0 {
