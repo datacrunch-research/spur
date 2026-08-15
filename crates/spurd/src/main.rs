@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod agent_server;
+mod cgroup;
 mod cluster;
 pub mod container;
 mod executor;
@@ -127,6 +128,8 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| args.log_level.parse().unwrap()),
         )
         .init();
+
+    cgroup::initialize();
 
     let hostname = args.hostname.unwrap_or_else(|| {
         hostname::get()

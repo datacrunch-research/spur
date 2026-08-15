@@ -1238,6 +1238,7 @@ impl SlurmAgent for AgentService {
         let (alloc_result, allocated_device_ids) = self
             .allocate_local_resources(job_id, &spec, req.allocated.as_ref())
             .await?;
+        apply_cpu_allocation_environment(&mut env, &alloc_result);
 
         // Release the reservation on any exit before commit, including a
         // cancelled launch future; disarmed once committed to `running`.
@@ -2999,6 +3000,13 @@ impl AgentService {
     }
 }
 
+fn apply_cpu_allocation_environment(
+    environment: &mut HashMap<String, String>,
+    allocation: &AllocationResult,
+) {
+    environment.insert("SPUR_JOB_CPU_IDS".into(), allocation.cpu_list());
+}
+
 #[cfg(test)]
 impl TrackedJob {
     fn dummy(_pid: u32) -> Self {
@@ -3884,6 +3892,21 @@ mod tests {
         let expected = format!("{}/spur-77.out", work_dir_str);
         assert_eq!(inner.stdout_path, expected);
         assert_eq!(inner.stderr_path, expected);
+    }
+
+    #[test]
+    fn allocated_cpu_environment_overrides_user_value() {
+        let mut environment = HashMap::new();
+        environment.insert("SPUR_JOB_CPU_IDS".into(), "user-supplied".into());
+        let allocation = AllocationResult {
+            cpu_ids: vec![0, 2, 7],
+            gpu_ids: Vec::new(),
+            memory_mb: 0,
+        };
+
+        apply_cpu_allocation_environment(&mut environment, &allocation);
+
+        assert_eq!(environment["SPUR_JOB_CPU_IDS"], "0,2,7");
     }
 
     /// Poll `path` until its content stabilizes (unchanged across two

@@ -104,9 +104,6 @@ fn classify_spool_error(dir: &Path, err: anyhow::Error) -> LaunchError {
 
 use crate::container::ContainerConfig;
 
-/// Cgroup root for slurmd-managed jobs.
-const CGROUP_ROOT: &str = "/sys/fs/cgroup/spur";
-
 /// Node-local spool root for spurd's per-job scratch (job script, namespace
 /// wrapper). Deliberately off the user's work_dir so these root-side writes
 /// never hit an NFS root_squash mount. Mirrors Slurm's SlurmdSpoolDir.
@@ -501,8 +498,7 @@ async fn spawn_job_process(
     } = *cfg;
     info!(job_id, work_dir, "launching job");
 
-    // Set up cgroup for isolation
-    let cgroup_path = setup_cgroup(job_id, cpus, memory_mb, cpu_ids)?;
+    let cgroup = crate::cgroup::setup_job(job_id, cpus, memory_mb, cpu_ids)?;
 
     // Ensure work_dir exists on this node (the submitted path may only exist on the submitting
     // node). If creation fails (e.g. path is under another user's home), fall back to /tmp so
@@ -664,7 +660,7 @@ async fn spawn_job_process(
                 "stdin redirection is not supported for container jobs, ignoring"
             );
         }
-        let (job, pty_master) = launch_container_job(cfg, ctn, &env, job_io).await?;
+        let (job, pty_master) = launch_container_job(cfg, ctn, &env, job_io, cgroup).await?;
         return Ok(LaunchResult {
             job,
             stdout_path: stdout_resolved,
@@ -723,6 +719,17 @@ async fn spawn_job_process(
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+    }
+
+    let cgroup_procs = cgroup
+        .as_ref()
+        .map(crate::cgroup::JobCgroup::open_procs)
+        .transpose()?;
+    if let Some(ref procs) = cgroup_procs {
+        let procs = procs.as_raw_fd();
+        unsafe {
+            cmd.pre_exec(move || crate::cgroup::attach_current_process(procs));
+        }
     }
 
     // Reset signal dispositions to default before exec. spurd is launched in the
@@ -849,12 +856,7 @@ async fn spawn_job_process(
     // Drop the slave fd immediately so the master gets EOF when the child exits.
     let pty_master = job_io.into_master();
 
-    // Move process into cgroup
-    if let Some(ref cgroup) = cgroup_path {
-        if let Some(pid) = child.id() {
-            move_to_cgroup(cgroup, pid);
-        }
-    }
+    let cgroup_path = cgroup.map(crate::cgroup::JobCgroup::into_path);
 
     debug!(
         job_id,
@@ -871,138 +873,15 @@ async fn spawn_job_process(
     })
 }
 
-/// Set up a cgroups v2 hierarchy for a job.
-fn setup_cgroup(
-    job_id: JobId,
-    cpus: u32,
-    memory_mb: u64,
-    cpu_ids: &[u32],
-) -> anyhow::Result<Option<PathBuf>> {
-    let cgroup_root = PathBuf::from(CGROUP_ROOT);
-    let cgroup_path = cgroup_root.join(format!("job_{}", job_id));
-
-    // Delegate controllers to children: in cgroup-v2 a child only gets
-    // memory.*/cpu.*/pids.* files if the parent lists them in subtree_control;
-    // without this the per-job memory limit is never enforced. Root failure fatal.
-    if let Err(e) = std::fs::create_dir_all(&cgroup_root) {
-        if nix::unistd::geteuid().is_root() {
-            anyhow::bail!("cgroup root creation failed as root: {}", e);
-        }
-        warn!(job_id, error = %e, "cgroup creation failed (not root), running without isolation");
-        return Ok(None);
-    }
-    let subtree = cgroup_root.join("cgroup.subtree_control");
-    for ctrl in ["+memory", "+cpu", "+pids", "+cpuset"] {
-        if let Err(e) = std::fs::write(&subtree, ctrl) {
-            warn!(job_id, controller = ctrl, error = %e, "failed to delegate cgroup controller");
-        }
-    }
-    if let Err(e) = std::fs::create_dir_all(&cgroup_path) {
-        if nix::unistd::geteuid().is_root() {
-            anyhow::bail!("cgroup creation failed as root: {}", e);
-        }
-        warn!(
-            job_id,
-            error = %e,
-            "cgroup creation failed (not root), running without isolation"
-        );
-        return Ok(None);
-    }
-
-    // Set CPU limit (cpu.max: quota period)
-    // e.g., 4 CPUs → "400000 100000" (400ms out of 100ms period)
-    let quota = cpus as u64 * 100_000;
-    let cpu_max = format!("{} 100000", quota);
-    if let Err(e) = std::fs::write(cgroup_path.join("cpu.max"), &cpu_max) {
-        warn!(job_id, error = %e, "failed to set cpu.max");
-    }
-
-    // Set memory limit
-    if memory_mb > 0 {
-        let memory_bytes = memory_mb * 1024 * 1024;
-        if let Err(e) = std::fs::write(cgroup_path.join("memory.max"), memory_bytes.to_string()) {
-            warn!(job_id, error = %e, "failed to set memory.max");
-        }
-    }
-
-    // OOM isolation: kill entire cgroup on OOM, not a random process
-    if let Err(e) = std::fs::write(cgroup_path.join("memory.oom.group"), "1") {
-        warn!(job_id, error = %e, "failed to set memory.oom.group");
-    }
-
-    // Fork bomb protection: limit total processes per job
-    let max_pids = (cpus as u64 * 256).max(1024);
-    if let Err(e) = std::fs::write(cgroup_path.join("pids.max"), max_pids.to_string()) {
-        warn!(job_id, error = %e, "failed to set pids.max");
-    }
-
-    // Pin to specific CPU cores via cpuset
-    if !cpu_ids.is_empty() {
-        let cpuset_str: String = cpu_ids
-            .iter()
-            .map(|id| id.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        if let Err(e) = std::fs::write(cgroup_path.join("cpuset.cpus"), &cpuset_str) {
-            warn!(job_id, error = %e, "failed to set cpuset.cpus");
-        } else {
-            debug!(job_id, cpuset = %cpuset_str, "cpuset pinning configured");
-        }
-    }
-
-    debug!(
-        job_id,
-        cpus,
-        memory_mb,
-        path = %cgroup_path.display(),
-        "cgroup created"
-    );
-
-    Ok(Some(cgroup_path))
-}
-
-/// Move a process into a cgroup. Returns true if successful.
-fn move_to_cgroup(cgroup_path: &Path, pid: u32) -> bool {
-    let procs_file = cgroup_path.join("cgroup.procs");
-    if let Err(e) = std::fs::write(&procs_file, pid.to_string()) {
-        warn!(
-            pid,
-            error = %e,
-            "failed to move process to cgroup — job runs without isolation"
-        );
-        false
-    } else {
-        true
-    }
-}
-
 /// Whether the job's cgroup recorded an OOM kill (cgroup-v2 `memory.events`).
 /// False if the file is absent/unreadable. Call before `cleanup_cgroup`.
 pub fn cgroup_oom_killed(cgroup_path: &Path) -> bool {
-    let Ok(events) = std::fs::read_to_string(cgroup_path.join("memory.events")) else {
-        return false;
-    };
-    events.lines().any(|line| {
-        let mut it = line.split_whitespace();
-        matches!((it.next(), it.next()), (Some("oom_kill"), Some(n)) if n != "0")
-    })
+    crate::cgroup::oom_killed(cgroup_path)
 }
 
 /// Kill any leftover processes in the job's cgroup and remove the directory.
 pub fn cleanup_cgroup(cgroup_path: &Path) {
-    // Kill any remaining processes
-    if let Ok(pids) = std::fs::read_to_string(cgroup_path.join("cgroup.procs")) {
-        for pid_str in pids.lines() {
-            if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                let _ = signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
-            }
-        }
-    }
-
-    // Remove cgroup directory
-    if let Err(e) = std::fs::remove_dir(cgroup_path) {
-        warn!(error = %e, path = %cgroup_path.display(), "failed to remove cgroup");
-    }
+    crate::cgroup::cleanup(cgroup_path);
 }
 
 /// Recursively signal a process and all its descendants (children first).
@@ -1409,9 +1288,14 @@ async fn launch_container_job(
     ctn: &ContainerLaunchConfig,
     env: &HashMap<String, String>,
     job_io: JobIo,
+    cgroup: Option<crate::cgroup::JobCgroup>,
 ) -> anyhow::Result<(RunningJob, Option<OwnedFd>)> {
     let job_id = cfg.job_id;
-    let cgroup_path = setup_cgroup(job_id, cfg.cpus, cfg.memory_mb, &cfg.cpu_ids)?;
+    let cgroup_procs = cgroup
+        .as_ref()
+        .map(crate::cgroup::JobCgroup::open_procs)
+        .transpose()?;
+    let cgroup_procs_fd = cgroup_procs.as_ref().map(AsRawFd::as_raw_fd);
 
     // Sync pipe: child writes status, parent reads.
     // Convert OwnedFd to raw fds for manual lifecycle management across fork.
@@ -1446,6 +1330,16 @@ async fn launch_container_job(
             // CRITICAL: synchronous code only. Tokio runtime is broken after fork.
             unsafe {
                 libc::close(ready_r);
+            }
+
+            if let Some(procs) = cgroup_procs_fd {
+                if let Err(error) = unsafe { crate::cgroup::attach_current_process(procs) } {
+                    let message = format!("E:cgroup attach failed: {error}");
+                    unsafe {
+                        libc::write(ready_w, message.as_ptr().cast(), message.len());
+                        libc::_exit(1);
+                    }
+                }
             }
 
             // Reset signal handlers
@@ -1537,10 +1431,6 @@ async fn launch_container_job(
 
             let child_pid = child.as_raw();
 
-            if let Some(ref cgroup) = cgroup_path {
-                let _ = std::fs::write(cgroup.join("cgroup.procs"), child_pid.to_string());
-            }
-
             // pidfd prevents PID recycling; falls back gracefully on kernels < 5.3
             let pidfd = pidfd_open(child_pid).ok();
             if pidfd.is_none() {
@@ -1558,6 +1448,8 @@ async fn launch_container_job(
                 let msg = String::from_utf8_lossy(&buf[..n]);
                 bail!("container init failed for job {}: {}", job_id, msg);
             }
+
+            let cgroup_path = cgroup.map(crate::cgroup::JobCgroup::into_path);
 
             info!(
                 job_id,

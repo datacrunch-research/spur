@@ -284,10 +284,18 @@ For production, run the agent as a systemd service:
    Restart=on-failure
    RestartSec=3
    User=root
+   Delegate=cpu cpuset memory pids
+   DelegateSubgroup=spurd
    LimitNOFILE=65536
 
    [Install]
    WantedBy=multi-user.target
+
+``Delegate=`` gives the agent ownership of the job-control subtree, including when
+the service uses an unprivileged ``User=``. ``DelegateSubgroup=spurd`` keeps the
+agent process in a leaf cgroup so the unit root can enable controllers for job
+cgroups. On systemd versions older than 254, omit ``DelegateSubgroup=``; the agent
+creates and enters the leaf itself.
 
 Verify:
 
