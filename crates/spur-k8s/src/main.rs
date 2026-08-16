@@ -3,6 +3,7 @@
 
 mod agent;
 mod crd;
+mod execution_identity;
 mod health;
 mod heartbeat;
 mod job_controller;
@@ -150,13 +151,14 @@ async fn main() -> anyhow::Result<()> {
     let nw_ctrl_addr = args.controller_addr.clone();
     let nw_op_addr = operator_ip.clone();
     let nw_selector = args.node_selector.clone();
+    let nw_hb = hb.clone();
     tokio::spawn(async move {
         run_with_retry("node watcher", || {
             let c = nw_client.clone();
             let ctrl = nw_ctrl_addr.clone();
             let op = nw_op_addr.clone();
             let sel = nw_selector.clone();
-            let hb = hb.clone();
+            let hb = nw_hb.clone();
             Box::pin(node_watcher::run(c, ctrl, op, operator_port, sel, hb))
         })
         .await;
@@ -192,7 +194,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Start virtual agent gRPC server
-    let virtual_agent = agent::VirtualAgent::new(client);
+    let virtual_agent = agent::VirtualAgent::new(client, hb);
     info!(%listen_addr, "virtual agent gRPC server listening");
 
     tonic::transport::Server::builder()

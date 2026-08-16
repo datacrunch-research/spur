@@ -55,6 +55,14 @@ impl JobCgroup {
     }
 }
 
+pub(crate) fn open_procs_path(path: &Path) -> anyhow::Result<File> {
+    let procs = path.join("cgroup.procs");
+    OpenOptions::new()
+        .write(true)
+        .open(&procs)
+        .with_context(|| format!("open {}", procs.display()))
+}
+
 impl Drop for JobCgroup {
     fn drop(&mut self) {
         if self.cleanup_on_drop {

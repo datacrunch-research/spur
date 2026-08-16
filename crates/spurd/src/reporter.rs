@@ -9,22 +9,12 @@ use anyhow::Context;
 use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
 use spur_devices::{resolve_link_type, DeviceRegistry, LinkType};
 use spur_proto::proto::{RegisterAgentRequest, ResourceSet as ProtoResourceSet, RunningJobStatus};
-use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 /// Source of the job ids this node currently holds. The controller decides from
 /// its own authoritative state whether any reported id is stale.
 pub trait HeldJobs: Send + Sync {
-    fn held_job_ids(&self) -> Vec<u32>;
-}
-
-impl<T: Send> HeldJobs for Mutex<HashMap<u32, T>> {
-    fn held_job_ids(&self) -> Vec<u32> {
-        match self.try_lock() {
-            Ok(jobs) => jobs.keys().copied().collect(),
-            Err(_) => Vec::new(),
-        }
-    }
+    fn held_jobs(&self) -> Vec<RunningJobStatus>;
 }
 
 /// Discovers and reports node resources to the controller.
@@ -34,6 +24,8 @@ pub struct NodeReporter {
     pub resources: ResourceSet,
     pub node_address: spur_net::NodeAddress,
     pub labels: HashMap<String, String>,
+    /// Opaque identity generated once for this spurd process lifetime.
+    pub worker_incarnation: String,
     pub free_memory_mb: AtomicU64,
     pub cpu_load: AtomicU64,
     pub join_token: String,
@@ -67,6 +59,7 @@ impl NodeReporter {
             resources,
             node_address,
             labels,
+            worker_incarnation: uuid::Uuid::new_v4().to_string(),
             free_memory_mb: AtomicU64::new(0),
             cpu_load: AtomicU64::new(0),
             join_token,
@@ -90,8 +83,13 @@ impl NodeReporter {
     }
 
     /// Job ids this heartbeat would report, from the shared running map.
+    #[cfg(test)]
     pub fn held_job_ids(&self) -> Vec<u32> {
-        self.held_jobs.held_job_ids()
+        self.held_jobs
+            .held_jobs()
+            .into_iter()
+            .map(|status| status.job_id)
+            .collect()
     }
 
     /// Register with the controller.
@@ -111,6 +109,7 @@ impl NodeReporter {
                 wg_pubkey: self.wg_pubkey(),
                 labels: self.labels.clone(),
                 join_token: self.join_token.clone(),
+                worker_incarnation: self.worker_incarnation.clone(),
             })
             .await
             .context("registration failed")?;
@@ -141,6 +140,7 @@ impl NodeReporter {
                 hostname: self.hostname.clone(),
                 node_token: current_token,
                 reason: reason.to_string(),
+                worker_incarnation: self.worker_incarnation.clone(),
             })
             .await
             .context("deregistration RPC failed")?;
@@ -160,14 +160,7 @@ impl NodeReporter {
             self.cpu_load.store(load as u64, Ordering::Relaxed);
             self.free_memory_mb.store(free_mem, Ordering::Relaxed);
             let current_token = self.node_token.read().unwrap().clone();
-            let running_jobs: Vec<RunningJobStatus> = self
-                .held_job_ids()
-                .into_iter()
-                .map(|job_id| RunningJobStatus {
-                    job_id,
-                    ..Default::default()
-                })
-                .collect();
+            let running_jobs = self.held_jobs.held_jobs();
 
             match spur_client::connect_channel(&self.controller_addr).await {
                 Ok(channel) => {
@@ -189,6 +182,7 @@ impl NodeReporter {
                                     install_duration_seconds: install_secs,
                                 }
                             }),
+                            worker_incarnation: self.worker_incarnation.clone(),
                         })
                         .await
                     {
@@ -592,13 +586,5 @@ mod tests {
             "node token required"
         )));
         assert!(!should_reregister(&tonic::Status::internal("boom")));
-    }
-
-    #[test]
-    fn held_job_ids_accepts_send_but_not_sync_values() {
-        // Cell is Send but !Sync; this fails to compile if the bound re-tightens to Sync.
-        let map: Mutex<HashMap<u32, std::cell::Cell<u8>>> =
-            Mutex::new(HashMap::from([(7, std::cell::Cell::new(0))]));
-        assert_eq!(map.held_job_ids(), vec![7]);
     }
 }

@@ -3712,18 +3712,22 @@ dependencies = [
  "clap",
  "futures-util",
  "hostname",
+ "http",
  "k8s-openapi",
  "kube",
  "prost-types",
  "schemars",
  "serde",
  "serde_json",
+ "serde_yaml",
+ "sha2 0.11.0",
  "spur-core",
  "spur-proto",
  "thiserror 2.0.19",
  "tokio",
  "tokio-stream",
  "tonic",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]
@@ -3856,6 +3860,7 @@ dependencies = [
  "prost-types",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "spur-core",
  "spur-metrics",
  "spur-net",
@@ -3871,6 +3876,7 @@ dependencies = [
  "tower-http 0.7.0",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -3902,6 +3908,7 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

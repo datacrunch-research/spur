@@ -624,6 +624,7 @@ fn install_ctrl_c_cancel(
                     job_id,
                     signal: 2,
                     user,
+                    expected_submission_generation: String::new(),
                 })
                 .await;
             std::process::exit(130);
@@ -641,7 +642,10 @@ async fn wait_for_job_running(
     loop {
         poll_interval.tick().await;
         let job = client
-            .get_job(GetJobRequest { job_id })
+            .get_job(GetJobRequest {
+                job_id,
+                ..Default::default()
+            })
             .await
             .context("failed to get job status")?
             .into_inner();
@@ -799,6 +803,7 @@ async fn release_srun_allocation(
                 job_id,
                 signal: 2,
                 user: user.to_string(),
+                expected_submission_generation: String::new(),
             })
             .await
         {
@@ -844,6 +849,7 @@ async fn run_standalone_srun(
     let submit_resp = client
         .submit_job(SubmitJobRequest {
             spec: Some(job_spec),
+            submission_token: String::new(),
         })
         .await
         .context("job submission failed")?
@@ -881,13 +887,17 @@ async fn run_standalone_srun(
                 job_id,
                 signal: 0,
                 user: user.clone(),
+                expected_submission_generation: String::new(),
             })
             .await;
         std::process::exit(result?);
     }
 
     let job = client
-        .get_job(GetJobRequest { job_id })
+        .get_job(GetJobRequest {
+            job_id,
+            ..Default::default()
+        })
         .await
         .context("failed to get job after allocation")?
         .into_inner();
@@ -926,7 +936,7 @@ async fn run_standalone_srun(
     }
 
     let output_streamed = if io.stdout.is_empty() {
-        try_stream_output(&mut client, &nodelist, job_id, &user).await
+        try_stream_output(&mut client, &nodelist, &job, &user).await
     } else {
         false
     };
@@ -992,23 +1002,24 @@ fn first_node(nodelist: &str) -> String {
 async fn try_stream_output(
     controller: &mut SlurmControllerClient<tonic::transport::Channel>,
     nodelist: &str,
-    job_id: u32,
+    job: &spur_proto::proto::JobInfo,
     user: &str,
 ) -> bool {
+    let job_id = job.job_id;
     let first_node = nodelist.split(',').next().unwrap_or_default().trim();
     if first_node.is_empty() {
         return false;
     }
 
-    if controller
+    let node = match controller
         .get_node(GetNodeRequest {
             name: first_node.to_string(),
         })
         .await
-        .is_err()
     {
-        return false;
-    }
+        Ok(response) => response.into_inner(),
+        Err(_) => return false,
+    };
 
     let agent_addr = format!("http://{first_node}:6818");
 
@@ -1022,6 +1033,9 @@ async fn try_stream_output(
             job_id,
             stream: "stdout".into(),
             user: user.to_string(),
+            submission_generation: job.submission_generation.clone(),
+            run_attempt: job.run_attempt,
+            worker_incarnation: node.worker_incarnation,
         })
         .await
     {
@@ -1058,7 +1072,13 @@ async fn poll_for_completion(
     let mut warned_unknown_state = false;
     loop {
         poll_interval.tick().await;
-        match client.get_job(GetJobRequest { job_id }).await {
+        match client
+            .get_job(GetJobRequest {
+                job_id,
+                ..Default::default()
+            })
+            .await
+        {
             Ok(resp) => {
                 let job = resp.into_inner();
                 match JobState::try_from(job.state) {
@@ -1215,63 +1235,75 @@ async fn run_interactive_pty(
     let winsize = crate::interactive::get_terminal_size();
 
     let mut last_err: Option<anyhow::Error> = None;
-    let mut cached_step: Option<(u32, String)> = None;
+    let mut cached_step: Option<(u32, u32, String, String, String)> = None;
 
     for attempt in 0..5 {
         if attempt > 0 {
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         }
 
-        let (step_id, node_addr) = if let Some(ref cached) = cached_step {
-            cached.clone()
-        } else {
-            let step_resp = match ctrl
-                .create_job_step(CreateJobStepRequest {
-                    job_id,
-                    command: command.clone(),
-                    num_tasks: 1,
-                    cpus_per_task: 1,
-                    overlap: true,
-                    pty: true,
-                    winsize: Some(winsize),
-                    node: node.clone(),
-                    user: user.to_string(),
-                })
-                .await
-            {
-                Ok(resp) => resp.into_inner(),
-                Err(status) if is_retryable_status(&status) && attempt < 4 => {
-                    last_err = Some(anyhow::anyhow!("CreateJobStep: {}", status.message()));
-                    continue;
-                }
-                Err(status) => {
-                    return Err(anyhow::anyhow!(
-                        "CreateJobStep failed: {}",
-                        status.message()
-                    ))
-                }
-            };
+        let (step_id, run_attempt, node_addr, submission_generation, worker_incarnation) =
+            if let Some(ref cached) = cached_step {
+                cached.clone()
+            } else {
+                let step_resp = match ctrl
+                    .create_job_step(CreateJobStepRequest {
+                        job_id,
+                        command: command.clone(),
+                        num_tasks: 1,
+                        cpus_per_task: 1,
+                        overlap: true,
+                        pty: true,
+                        winsize: Some(winsize),
+                        node: node.clone(),
+                        user: user.to_string(),
+                    })
+                    .await
+                {
+                    Ok(resp) => resp.into_inner(),
+                    Err(status) if is_retryable_status(&status) && attempt < 4 => {
+                        last_err = Some(anyhow::anyhow!("CreateJobStep: {}", status.message()));
+                        continue;
+                    }
+                    Err(status) => {
+                        return Err(anyhow::anyhow!(
+                            "CreateJobStep failed: {}",
+                            status.message()
+                        ))
+                    }
+                };
 
-            if step_resp.node_addr.is_empty() {
-                anyhow::bail!(
-                    "controller did not return a node address for job {}",
-                    job_id
+                if step_resp.node_addr.is_empty() {
+                    anyhow::bail!(
+                        "controller did not return a node address for job {}",
+                        job_id
+                    );
+                }
+                let pair = (
+                    step_resp.step_id,
+                    step_resp.run_attempt,
+                    format!("http://{}", step_resp.node_addr),
+                    step_resp.submission_generation,
+                    step_resp.worker_incarnation,
                 );
-            }
-            let pair = (step_resp.step_id, format!("http://{}", step_resp.node_addr));
-            cached_step = Some(pair.clone());
-            pair
-        };
+                cached_step = Some(pair.clone());
+                pair
+            };
 
         let mut agent = crate::interactive::connect_agent(&node_addr).await?;
 
         match crate::interactive::open_interactive_session(
             &mut agent,
-            job_id,
-            step_id,
-            command.clone(),
-            winsize,
-            true,
+            crate::interactive::InteractiveSessionRequest {
+                job_id,
+                submission_generation: &submission_generation,
+                run_attempt,
+                worker_incarnation: &worker_incarnation,
+                step_id,
+                argv: command.clone(),
+                winsize,
+                overlap: true,
+            },
             user,
         )
         .await

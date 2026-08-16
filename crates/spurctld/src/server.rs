@@ -14,9 +14,7 @@ use tracing::{info, warn};
 use spur_core::job::NodeCompleteError;
 use spur_core::mpi::MPI_PMIX;
 use spur_core::reservation::Reservation;
-use spur_core::task_launch::{
-    batch_script_uses_step_launch, build_step_task_plan, step_needs_pmix_prepare,
-};
+use spur_core::task_launch::{build_step_task_plan, step_needs_pmix_prepare};
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::slurm_controller_server::SlurmController;
 use spur_proto::proto::*;
@@ -30,6 +28,25 @@ use crate::sched_stats::SchedStatsCollector;
 
 const FORWARDED_HEADER: &str = "x-spur-forwarded";
 const LEADER_HEADER: &str = "x-spur-leader";
+
+fn validate_worker_incarnation(worker_incarnation: &str) -> Result<(), Status> {
+    (!worker_incarnation.is_empty())
+        .then_some(())
+        .ok_or_else(|| Status::invalid_argument("worker incarnation must be nonempty"))
+}
+
+fn validate_signal_dispatch_ownership(job: &spur_core::job::Job) -> Result<(), Status> {
+    if job
+        .pending_dispatch
+        .as_ref()
+        .is_some_and(|dispatch| dispatch.phase != spur_core::job::PendingDispatchPhase::Published)
+    {
+        return Err(Status::failed_precondition(
+            "job dispatch has not reached exact Published ownership",
+        ));
+    }
+    Ok(())
+}
 
 /// Resolve the comm address for an agent registration.
 ///
@@ -230,32 +247,40 @@ impl ControllerService {
 
     /// Re-send a terminal-job cancel to a node still reporting it on heartbeat,
     /// freeing an allocation whose terminal cancel never landed. Spawned, best-effort.
-    fn reclaim_stale_agent_jobs(&self, node: &str, reported: &[RunningJobStatus]) {
-        let stale = stale_reported_jobs(&self.cluster, reported);
+    fn reclaim_stale_agent_jobs(
+        &self,
+        node: &str,
+        worker_incarnation: &str,
+        reported: &[RunningJobStatus],
+    ) {
+        let stale = stale_reported_jobs(&self.cluster, node, worker_incarnation, reported);
         if stale.is_empty() {
             return;
         }
-        let cluster = self.cluster.clone();
+        let Some(registered) = self.cluster.get_node(node) else {
+            return;
+        };
+        if registered.incarnation != worker_incarnation {
+            return;
+        }
+        let Ok(agent_addr) = node_comm_http_url(&registered, node) else {
+            return;
+        };
         let node = node.to_string();
+        let worker_incarnation = worker_incarnation.to_string();
         tokio::spawn(async move {
-            for job_id in stale {
-                // Re-check: a requeue since the snapshot above would otherwise
-                // send an unguarded cancel into the job's new run.
-                if !is_still_terminal(&cluster, job_id) {
-                    continue;
-                }
+            for reported in stale {
                 warn!(
-                    job_id,
+                    job_id = reported.job_id,
+                    generation = %reported.submission_generation,
+                    run_attempt = reported.run_attempt,
                     node = %node,
-                    "agent still holds a terminal job — re-sending cancel to reclaim its allocation"
+                    "agent reports an execution the controller no longer owns — reclaiming exact execution"
                 );
-                // Signal 0 = graceful release, no-op on an unknown id. Not
-                // epoch-gated — a requeue racing this send is still possible.
-                crate::scheduler_loop::cancel_job_on_nodes(
-                    &cluster,
-                    job_id,
-                    std::slice::from_ref(&node),
-                    0,
+                crate::scheduler_loop::terminate_reported_execution(
+                    agent_addr.clone(),
+                    reported,
+                    worker_incarnation.clone(),
                 )
                 .await;
             }
@@ -394,18 +419,40 @@ fn is_k0s_admin(cache: &crate::association_cache::AssociationCache, caller: &str
     caller.is_empty() || caller == "root" || cache.is_admin(caller)
 }
 
-/// Whether the controller still considers `job_id` terminal right now — guards
-/// the spawned reclaim loop against a requeue landing after its stale snapshot.
-fn is_still_terminal(cluster: &ClusterManager, job_id: u32) -> bool {
-    cluster.job_state(job_id).is_some_and(|s| s.is_terminal())
-}
-
-/// Reported ids the controller's own record marks terminal. Non-terminal (incl.
-/// Pending mid-dispatch) and unknown ids are spared, so no live job is reclaimed.
-fn stale_reported_jobs(cluster: &ClusterManager, reported: &[RunningJobStatus]) -> Vec<u32> {
+/// Reported executions that are not the controller's exact live owner. The
+/// comparison includes generation, attempt, and worker process incarnation;
+/// an unknown ID and an old run behind a reused ID are both safe to reclaim.
+pub(crate) fn stale_reported_jobs(
+    cluster: &ClusterManager,
+    node: &str,
+    worker_incarnation: &str,
+    reported: &[RunningJobStatus],
+) -> Vec<RunningJobStatus> {
     reported
         .iter()
-        .filter_map(|r| is_still_terminal(cluster, r.job_id).then_some(r.job_id))
+        .filter(|status| {
+            let Some(job) = cluster.get_job(status.job_id) else {
+                return true;
+            };
+            if job.submission_generation.to_string() != status.submission_generation {
+                return true;
+            }
+            let pending_owner = job.pending_dispatch.as_ref().is_some_and(|dispatch| {
+                dispatch.submission_generation == job.submission_generation
+                    && dispatch.run_attempt == status.run_attempt
+                    && dispatch.target_incarnations.get(node).map(String::as_str)
+                        == Some(worker_incarnation)
+            });
+            let active_owner = job.state.is_active()
+                && job.run_attempt == status.run_attempt
+                && job
+                    .allocated_node_incarnations
+                    .get(node)
+                    .map(String::as_str)
+                    == Some(worker_incarnation);
+            !(pending_owner || active_owner)
+        })
+        .cloned()
         .collect()
 }
 
@@ -430,20 +477,28 @@ impl SlurmController for ControllerService {
             }
         }
 
+        let request = request.into_inner();
+        let submission_token =
+            (!request.submission_token.is_empty()).then_some(request.submission_token);
         let spec = request
-            .into_inner()
             .spec
             .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
 
         let core_spec = proto_to_job_spec(spec)?;
         let outcome = self
             .cluster
-            .submit_job(core_spec)
+            .submit_job_with_token(core_spec, submission_token)
             .map_err(submit_rpc_status)?;
+        let submission_generation = if outcome.submission_generation.is_nil() {
+            String::new()
+        } else {
+            outcome.submission_generation.to_string()
+        };
 
         Ok(Response::new(SubmitJobResponse {
             job_id: outcome.job_id,
             warnings: outcome.warnings,
+            submission_generation,
         }))
     }
 
@@ -504,21 +559,45 @@ impl SlurmController for ControllerService {
         let forward = self.read_should_forward(&request);
         let req = request.into_inner();
         if let Some(resp) = self
-            .forward_read_optional(forward.then_some(req), "get_job", |mut c, r| async move {
-                c.get_job(r).await
-            })
+            .forward_read_optional(
+                forward.then(|| req.clone()),
+                "get_job",
+                |mut c, r| async move { c.get_job(r).await },
+            )
             .await
         {
             return Ok(resp);
         }
 
         let job_id = req.job_id;
-        let job = self
-            .cluster
-            .get_job_for_display(job_id)
-            .ok_or_else(|| Status::not_found(format!("job {} not found", job_id)))?;
-
-        Ok(Response::new(job_to_proto(&job)))
+        if let Some(job) = self.cluster.get_job_for_display(job_id) {
+            if req.submission_token.is_empty()
+                || job.submission_token.as_deref() == Some(req.submission_token.as_str())
+            {
+                return Ok(Response::new(job_to_proto(&job)));
+            }
+        }
+        if !req.submission_token.is_empty() {
+            let terminal = self
+                .cluster
+                .terminal_submission_by_token(&req.submission_token, job_id)
+                .map_err(cluster_err_to_precondition_status)?;
+            if let Some(terminal) = terminal {
+                return Ok(Response::new(JobInfo {
+                    job_id: terminal.job_id,
+                    state: terminal.state.to_proto_i32(),
+                    exit_code: terminal.exit_code,
+                    run_attempt: terminal.run_attempt,
+                    submission_generation: terminal.submission_generation.to_string(),
+                    submission_token: req.submission_token,
+                    ..Default::default()
+                }));
+            }
+            return Err(Status::failed_precondition(
+                "exact tokened submission is not available and has no terminal receipt",
+            ));
+        }
+        Err(Status::not_found(format!("job {} not found", job_id)))
     }
 
     async fn cancel_job(&self, request: Request<CancelJobRequest>) -> Result<Response<()>, Status> {
@@ -539,16 +618,79 @@ impl SlurmController for ControllerService {
 
         let req = request.into_inner();
         let job_id = req.job_id;
+        let expected_generation = if req.expected_submission_generation.is_empty() {
+            None
+        } else {
+            Some(
+                uuid::Uuid::parse_str(&req.expected_submission_generation).map_err(|_| {
+                    Status::invalid_argument("expected submission generation must be a UUID")
+                })?,
+            )
+        };
+
+        if req.signal != 0 {
+            let job = self
+                .cluster
+                .job_for_signal(job_id, &req.user)
+                .map_err(cluster_err_to_status)?;
+            if expected_generation.is_some_and(|expected| job.submission_generation != expected) {
+                return Err(Status::failed_precondition(
+                    "signal targets a different submission generation",
+                ));
+            }
+            validate_signal_dispatch_ownership(&job)?;
+            if !crate::scheduler_loop::send_signal_to_agents(&self.cluster, &job, req.signal).await
+            {
+                return Err(Status::unavailable(
+                    "one or more exact worker targets did not acknowledge the signal",
+                ));
+            }
+            return Ok(Response::new(()));
+        }
+
+        // Snapshot and generation-check a standalone owner atomically. A reused
+        // numeric ID can therefore never cause a worker RPC to target the
+        // replacement submission.
+        if let Some(job) = self
+            .cluster
+            .standalone_job_for_cancel(job_id, &req.user, expected_generation)
+            .map_err(cluster_err_to_status)?
+        {
+            if !crate::scheduler_loop::send_cancel_to_agents(&self.cluster, &job, 0).await {
+                return Err(Status::unavailable(
+                    "one or more exact worker targets did not acknowledge TERMINATE_AND_REAP; \
+                     the standalone allocation remains active",
+                ));
+            }
+            self.cluster
+                .cancel_standalone_job_after_reap(job_id, job.submission_generation)
+                .map_err(cluster_err_to_status)?;
+            return Ok(Response::new(()));
+        }
+
+        // Exact reconciler cancellation only writes a durable outbox entry.
+        // Cleanup and acknowledgement belong to the finalization reconciler;
+        // this response must never launch a second, generation-blind side effect.
+        if let Some(expected) = expected_generation {
+            self.cluster
+                .cancel_job_exact(job_id, expected, &req.user)
+                .map_err(cluster_err_to_status)?;
+            return Ok(Response::new(()));
+        }
 
         // Snapshot the job before cancelling so we have allocated_nodes
         let job = self.cluster.get_job(job_id);
 
-        self.cluster
+        let cleanup_deferred = self
+            .cluster
             .cancel_job(job_id, &req.user)
             .map_err(cluster_err_to_status)?;
 
-        // Send cancel signal to agents so the process is actually killed
-        if let Some(job) = job {
+        // Legacy executions do not have retained exact ownership.
+        if !cleanup_deferred {
+            let Some(job) = job else {
+                return Ok(Response::new(()));
+            };
             let cluster = self.cluster.clone();
             tokio::spawn(async move {
                 crate::scheduler_loop::send_cancel_to_agents(&cluster, &job, 0).await;
@@ -556,6 +698,46 @@ impl SlurmController for ControllerService {
         }
 
         Ok(Response::new(()))
+    }
+
+    async fn cancel_job_by_submission_token(
+        &self,
+        request: Request<CancelJobBySubmissionTokenRequest>,
+    ) -> Result<Response<CancelJobBySubmissionTokenResponse>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let mut forwarded = Request::new(request.into_inner());
+                    *forwarded.metadata_mut() = Self::forwarded_metadata();
+                    return client.cancel_job_by_submission_token(forwarded).await;
+                }
+                Err(error) => {
+                    warn!("failed to forward cancel_job_by_submission_token to leader: {error}");
+                    return Err(status);
+                }
+            }
+        }
+
+        let token = request.into_inner().submission_token;
+        if token.is_empty() || token.len() > 256 {
+            return Err(Status::invalid_argument(
+                "submission_token must contain 1 to 256 bytes",
+            ));
+        }
+        let outcome = self
+            .cluster
+            .cancel_job_by_submission_token(&token)
+            .map_err(cluster_err_to_status)?;
+        Ok(Response::new(CancelJobBySubmissionTokenResponse {
+            job_id: outcome.job_id,
+            submission_generation: if outcome.submission_generation.is_nil() {
+                String::new()
+            } else {
+                outcome.submission_generation.to_string()
+            },
+            cleanup_complete: outcome.cleanup_complete,
+        }))
     }
 
     async fn complete_job(
@@ -873,9 +1055,20 @@ impl SlurmController for ControllerService {
         if let Some(state) = req.state {
             let node_state = spur_core::node::NodeState::from_proto_i32(state)
                 .ok_or_else(|| Status::invalid_argument("invalid node state"))?;
-            self.cluster
-                .update_node_state(&req.name, node_state, req.reason)
-                .map_err(|e| Status::internal(e.to_string()))?;
+            if req.expected_worker_incarnation.is_empty() {
+                self.cluster
+                    .update_node_state(&req.name, node_state, req.reason)
+                    .map_err(|e| Status::internal(e.to_string()))?;
+            } else {
+                self.cluster
+                    .update_node_state_exact(
+                        &req.name,
+                        &req.expected_worker_incarnation,
+                        node_state,
+                        req.reason,
+                    )
+                    .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            }
         }
         if !req.labels.is_empty() || !req.remove_labels.is_empty() {
             self.cluster
@@ -924,6 +1117,17 @@ impl SlurmController for ControllerService {
             }
         }
         let req = request.into_inner();
+        if !req.worker_incarnation.is_empty() {
+            let node = self
+                .cluster
+                .get_node(&req.name)
+                .ok_or_else(|| Status::not_found(format!("node {} not found", req.name)))?;
+            if node.incarnation != req.worker_incarnation {
+                return Err(Status::failed_precondition(
+                    "drain request targets a stale worker incarnation",
+                ));
+            }
+        }
         let reason = if req.reason.is_empty() {
             None
         } else {
@@ -932,10 +1136,13 @@ impl SlurmController for ControllerService {
         if self.cluster.get_node(&req.name).is_none() {
             return Err(Status::not_found(format!("node {} not found", req.name)));
         }
-        let (actual_state, running_jobs) = self
-            .cluster
-            .drain_node(&req.name, reason)
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let (actual_state, running_jobs) = if req.worker_incarnation.is_empty() {
+            self.cluster.drain_node(&req.name, reason)
+        } else {
+            self.cluster
+                .drain_node_exact(&req.name, &req.worker_incarnation, reason)
+        }
+        .map_err(|e| Status::failed_precondition(e.to_string()))?;
         Ok(Response::new(spur_proto::proto::DrainNodeResponse {
             actual_state: actual_state.to_string(),
             running_jobs,
@@ -999,6 +1206,7 @@ impl SlurmController for ControllerService {
             }
         }
         let req = request.into_inner();
+        validate_worker_incarnation(&req.worker_incarnation)?;
 
         if matches!(
             self.cluster.config().admission.mode,
@@ -1015,19 +1223,21 @@ impl SlurmController for ControllerService {
             }
         }
 
-        if self.cluster.get_node(&req.hostname).is_none() {
+        let Some(node) = self.cluster.get_node(&req.hostname) else {
             return Ok(Response::new(()));
+        };
+        if node.incarnation != req.worker_incarnation {
+            return Err(Status::failed_precondition(
+                "deregister targets a stale worker incarnation",
+            ));
         }
-        let evicted = self
-            .cluster
-            .remove_node(
+        self.cluster
+            .remove_node_exact(
                 &req.hostname,
-                true,
+                &req.worker_incarnation,
                 Some(req.reason.clone()).filter(|r| !r.is_empty()),
             )
-            .map_err(|e| Status::internal(e.to_string()))?;
-        self.spawn_cancel_for_evicted(&evicted);
-        self.cluster.complete_evicted_steps(&evicted);
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
         Ok(Response::new(()))
     }
 
@@ -1201,6 +1411,11 @@ impl SlurmController for ControllerService {
             .unwrap_or_default();
 
         let req = request.into_inner();
+        // Native workers currently generate UUIDs; virtual workers use their
+        // provider's immutable opaque object identity (for Kubernetes, the
+        // Node metadata.uid). The protocol contract is exact nonempty equality,
+        // not one particular textual encoding.
+        validate_worker_incarnation(&req.worker_incarnation)?;
         let resources = req.resources.map(proto_to_resource_set).unwrap_or_default();
 
         let reject_loopback = self.cluster.config().network.reject_loopback_comm_addr;
@@ -1217,7 +1432,7 @@ impl SlurmController for ControllerService {
 
         let source = spur_core::node::node_source_from_registration(&req.version, &req.labels);
         self.cluster
-            .register_node(
+            .register_node_exact(
                 // NodeName and NodeHostname are the same until agents can supply both.
                 req.hostname.clone(),
                 req.hostname.clone(),
@@ -1228,6 +1443,7 @@ impl SlurmController for ControllerService {
                 req.version,
                 source,
                 req.labels,
+                req.worker_incarnation,
             )
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -1258,6 +1474,12 @@ impl SlurmController for ControllerService {
         }
 
         let req = request.into_inner();
+        if req.worker_incarnation.is_empty() {
+            return Err(Status::invalid_argument("missing worker incarnation"));
+        }
+        if req.submission_generation.is_empty() {
+            return Err(Status::invalid_argument("missing submission generation"));
+        }
         let state = spur_core::job::JobState::from_proto_i32(req.state)
             .ok_or_else(|| Status::invalid_argument("invalid job state"))?;
 
@@ -1266,69 +1488,27 @@ impl SlurmController for ControllerService {
         // `Job::derived_completion`.
         let completion_result = if !req.reporting_node.is_empty() {
             validate_completion_report_state_for_rpc(state, req.exit_code)?;
-            Some(self.cluster.node_complete(
+            Some(self.cluster.node_complete_exact_with_drain(
                 req.job_id,
+                &req.submission_generation,
+                &req.submission_token,
                 &req.reporting_node,
+                &req.worker_incarnation,
                 req.exit_code,
                 req.signal,
                 req.run_attempt,
+                req.drain_node.then_some(req.drain_reason.clone()),
             ))
         } else {
             None
         };
 
-        if req.drain_node && !req.reporting_node.is_empty() {
-            warn!(
-                node = %req.reporting_node,
-                reason = %req.drain_reason,
-                job_id = req.job_id,
-                "agent requested node drain"
-            );
-            if let Err(e) = self.cluster.update_node_state(
-                &req.reporting_node,
-                spur_core::node::NodeState::Drain,
-                Some(req.drain_reason),
-            ) {
-                warn!(
-                    node = %req.reporting_node,
-                    error = %e,
-                    "failed to drain node on agent request"
-                );
-            }
-        }
-
         use crate::cluster::NodeCompleteResult;
 
         match completion_result {
+            Some(Ok(NodeCompleteResult::Buffered)) => Ok(Response::new(())),
             Some(Ok(NodeCompleteResult::AllDone { .. })) => Ok(Response::new(())),
-            Some(Ok(NodeCompleteResult::Completing)) => {
-                if let Some(job) = self.cluster.get_job(req.job_id) {
-                    if job
-                        .spec
-                        .script
-                        .as_deref()
-                        .is_some_and(batch_script_uses_step_launch)
-                    {
-                        let missing: Vec<String> = job
-                            .allocated_nodes
-                            .iter()
-                            .filter(|node| !job.node_completions.contains_key(*node))
-                            .cloned()
-                            .collect();
-                        if !missing.is_empty() {
-                            let cluster = self.cluster.clone();
-                            let job_id = req.job_id;
-                            tokio::spawn(async move {
-                                crate::scheduler_loop::cancel_job_on_nodes(
-                                    &cluster, job_id, &missing, 15,
-                                )
-                                .await;
-                            });
-                        }
-                    }
-                }
-                Ok(Response::new(()))
-            }
+            Some(Ok(NodeCompleteResult::Completing { .. })) => Ok(Response::new(())),
             Some(Ok(NodeCompleteResult::AlreadyTerminal)) => {
                 warn!(
                     job_id = req.job_id,
@@ -1380,6 +1560,19 @@ impl SlurmController for ControllerService {
 
         let req = request.into_inner();
 
+        if req.worker_incarnation.is_empty() {
+            return Err(Status::invalid_argument("missing worker incarnation"));
+        }
+        if req
+            .running_jobs
+            .iter()
+            .any(|status| status.submission_generation.is_empty())
+        {
+            return Err(Status::invalid_argument(
+                "heartbeat running job is missing submission generation",
+            ));
+        }
+
         if matches!(
             self.cluster.config().admission.mode,
             spur_core::config::AdmissionMode::Token
@@ -1395,10 +1588,12 @@ impl SlurmController for ControllerService {
             }
         }
 
-        if self
-            .cluster
-            .update_heartbeat(&req.hostname, req.cpu_load, req.free_memory_mb)
-        {
+        if self.cluster.update_heartbeat_exact(
+            &req.hostname,
+            &req.worker_incarnation,
+            req.cpu_load,
+            req.free_memory_mb,
+        ) {
             // Learn a mesh key that appeared/changed after registration so the node joins ApplyMesh
             // without a restart. Only meaningful once the node is known (heartbeat accepted).
             if self
@@ -1407,7 +1602,11 @@ impl SlurmController for ControllerService {
             {
                 info!(node = %req.hostname, "learned updated WireGuard mesh key from heartbeat");
             }
-            self.reclaim_stale_agent_jobs(&req.hostname, &req.running_jobs);
+            self.reclaim_stale_agent_jobs(
+                &req.hostname,
+                &req.worker_incarnation,
+                &req.running_jobs,
+            );
             if let Some(k0s) = &req.k0s_status {
                 self.record_k0s_node_status(&req.hostname, k0s);
             }
@@ -1574,6 +1773,21 @@ impl SlurmController for ControllerService {
         let node = self.cluster.get_node(target_node).ok_or_else(|| {
             Status::unavailable(format!("node {target_node} is not currently registered"))
         })?;
+        let worker_incarnation = job
+            .allocated_node_incarnations
+            .get(target_node)
+            .filter(|incarnation| !incarnation.is_empty())
+            .cloned()
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "job {job_id} has no persisted worker identity for node {target_node}"
+                ))
+            })?;
+        if node.incarnation != worker_incarnation {
+            return Err(Status::failed_precondition(format!(
+                "node {target_node} worker changed while job {job_id} still owns the old execution"
+            )));
+        }
         let node_addr = node_comm_socket(&node, target_node)?;
 
         let existing_steps = self.cluster.get_steps(job_id);
@@ -1581,10 +1795,13 @@ impl SlurmController for ControllerService {
             .iter()
             .filter(|s| s.step_id < 0xFFFF_FFF0)
             .count() as u32;
+        let run_attempt = job.run_attempt;
 
         let step = spur_core::step::JobStep {
             job_id,
+            submission_generation: job.submission_generation,
             step_id,
+            run_attempt,
             name: req.command.join(" "),
             state: spur_core::step::StepState::Running,
             num_tasks: req.num_tasks.max(1),
@@ -1601,7 +1818,13 @@ impl SlurmController for ControllerService {
             .create_step(step)
             .map_err(|e| Status::internal(format!("failed to create job step: {e}")))?;
 
-        Ok(Response::new(CreateJobStepResponse { step_id, node_addr }))
+        Ok(Response::new(CreateJobStepResponse {
+            step_id,
+            node_addr,
+            run_attempt,
+            submission_generation: job.submission_generation.to_string(),
+            worker_incarnation,
+        }))
     }
 
     async fn create_partition(
@@ -2062,6 +2285,23 @@ impl SlurmController for ControllerService {
             .cluster
             .get_node(&node_name)
             .ok_or_else(|| Status::not_found(format!("node {} not found", node_name)))?;
+        let worker_incarnation = job
+            .allocated_node_incarnations
+            .get(&node_name)
+            .filter(|incarnation| !incarnation.is_empty())
+            .cloned()
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "job {} has no persisted worker identity for node {}",
+                    job_id, node_name
+                ))
+            })?;
+        if node.incarnation != worker_incarnation {
+            return Err(Status::failed_precondition(format!(
+                "node {} worker changed while job {} still owns the old execution",
+                node_name, job_id
+            )));
+        }
         let agent_addr = node_comm_http_url(&node, &node_name)?;
 
         let mut agent = SlurmAgentClient::connect(agent_addr.clone())
@@ -2077,6 +2317,9 @@ impl SlurmController for ControllerService {
                 job_id,
                 command: req.command,
                 user: req.user,
+                submission_generation: job.submission_generation.to_string(),
+                run_attempt: job.run_attempt,
+                worker_incarnation,
             })
             .await
             .map_err(|e| Status::internal(format!("exec failed: {}", e)))?;
@@ -2141,6 +2384,10 @@ impl SlurmController for ControllerService {
         let uid = req.uid;
         let gid = req.gid;
         let step_id = req.step_id;
+        let run_attempt = job.run_attempt;
+        let submission_generation = job.submission_generation.to_string();
+        let pmix_prepare_token =
+            pmix_dispatch::step_prepare_token(&submission_generation, run_attempt, step_id);
         let label = req.label;
         let job_mpi = job.spec.mpi.as_deref().unwrap_or(spur_core::mpi::MPI_NONE);
         let mpi = spur_core::mpi::resolve_step_mpi(req.mpi.as_str(), job_mpi).to_string();
@@ -2152,6 +2399,7 @@ impl SlurmController for ControllerService {
         struct NodeDispatch {
             node_name: String,
             agent_addr: String,
+            worker_incarnation: String,
             node_tasks: spur_core::task_launch::NodeStepTasks,
         }
 
@@ -2175,6 +2423,24 @@ impl SlurmController for ControllerService {
                 dispatch_errors.push(format!("node {node_name} not found"));
                 continue;
             };
+            let Some(worker_incarnation) = job
+                .allocated_node_incarnations
+                .get(&node_name)
+                .filter(|expected| !expected.is_empty())
+                .cloned()
+            else {
+                dispatch_errors.push(format!(
+                    "job {job_id} has no persisted worker incarnation for {node_name}"
+                ));
+                continue;
+            };
+            if node.incarnation != worker_incarnation {
+                dispatch_errors.push(format!(
+                    "node {node_name} worker changed (expected {worker_incarnation}, got {})",
+                    node.incarnation
+                ));
+                continue;
+            }
             let agent_addr = match node_comm_http_url(&node, &node_name) {
                 Ok(url) => url,
                 Err(e) => {
@@ -2185,6 +2451,7 @@ impl SlurmController for ControllerService {
             dispatches.push(NodeDispatch {
                 node_name,
                 agent_addr,
+                worker_incarnation,
                 node_tasks,
             });
         }
@@ -2223,8 +2490,6 @@ impl SlurmController for ControllerService {
                 job.spec.script.as_deref(),
             )
         });
-        let run_attempt = job.run_attempt;
-
         let dispatch_pmix_plans: Vec<Option<spur_proto::proto::PmixLaunchPlan>> =
             if let Some(peers) = pmix_peers.as_ref() {
                 dispatches
@@ -2277,6 +2542,7 @@ impl SlurmController for ControllerService {
                     Ok(PmixPrepareNode {
                         node_name: node_dispatch.node_name.clone(),
                         agent_addr: node_dispatch.agent_addr.clone(),
+                        worker_incarnation: node_dispatch.worker_incarnation.clone(),
                         pmix_plan: pmix_plan.clone().ok_or_else(|| {
                             Status::failed_precondition("job is not configured for PMIx")
                         })?,
@@ -2288,15 +2554,31 @@ impl SlurmController for ControllerService {
                     "multi-node PMIx step missing launch plan for one or more nodes",
                 ));
             }
-            if let Err(detail) =
-                pmix_dispatch::prepare_pmix_on_nodes(job_id, run_attempt, prepare_nodes).await
+            if let Err(detail) = pmix_dispatch::prepare_pmix_on_nodes(
+                job_id,
+                &submission_generation,
+                run_attempt,
+                &pmix_prepare_token,
+                prepare_nodes,
+                true,
+            )
+            .await
             {
                 return Err(Status::failed_precondition(format!(
                     "PMIx prepare failed: {detail}"
                 )));
             }
-            let addrs: Vec<String> = dispatches.iter().map(|d| d.agent_addr.clone()).collect();
-            pmix_prepare_guard = Some(pmix_dispatch::PmixPreparedReleaseGuard::new(job_id, addrs));
+            let agents: Vec<(String, String)> = dispatches
+                .iter()
+                .map(|d| (d.agent_addr.clone(), d.worker_incarnation.clone()))
+                .collect();
+            pmix_prepare_guard = Some(pmix_dispatch::PmixPreparedReleaseGuard::new(
+                job_id,
+                submission_generation.clone(),
+                run_attempt,
+                pmix_prepare_token.clone(),
+                agents,
+            ));
         }
 
         let mut set = tokio::task::JoinSet::new();
@@ -2308,6 +2590,9 @@ impl SlurmController for ControllerService {
             let work_dir = work_dir.clone();
             let environment = environment.clone();
             let step_mpi = mpi.clone();
+            let pmix_prepare_token = pmix_prepare_token.clone();
+            let submission_generation = submission_generation.clone();
+            let worker_incarnation = dispatch.worker_incarnation.clone();
             set.spawn(async move {
                 let mut agent = SlurmAgentClient::connect(agent_addr.clone())
                     .await
@@ -2333,6 +2618,10 @@ impl SlurmController for ControllerService {
                         pmix_plan,
                         mpi: step_mpi.clone(),
                         pmix_prepared: needs_pmix_prepare,
+                        pmix_prepare_token,
+                        run_attempt,
+                        submission_generation,
+                        worker_incarnation,
                     })
                     .await
                     .map_err(|e| {
@@ -2368,6 +2657,7 @@ impl SlurmController for ControllerService {
                         crate::scheduler_loop::cancel_step_on_nodes(
                             &self.cluster,
                             job_id,
+                            run_attempt,
                             step_id,
                             &step_node_names,
                             15,
@@ -2384,6 +2674,7 @@ impl SlurmController for ControllerService {
                         crate::scheduler_loop::cancel_step_on_nodes(
                             &self.cluster,
                             job_id,
+                            run_attempt,
                             step_id,
                             &step_node_names,
                             15,
@@ -2406,11 +2697,27 @@ impl SlurmController for ControllerService {
             if let Some(guard) = pmix_prepare_guard.as_mut() {
                 guard.disarm();
             }
-            let addrs: Vec<String> = dispatches.iter().map(|d| d.agent_addr.clone()).collect();
-            pmix_dispatch::release_pmix_on_agents(&addrs, job_id).await;
+            let agents: Vec<(String, String)> = dispatches
+                .iter()
+                .map(|d| (d.agent_addr.clone(), d.worker_incarnation.clone()))
+                .collect();
+            pmix_dispatch::release_pmix_on_agents(
+                &agents,
+                job_id,
+                &submission_generation,
+                run_attempt,
+                &pmix_prepare_token,
+            )
+            .await;
         }
 
-        if let Err(e) = self.cluster.record_step_complete(job_id, step_id, max_exit) {
+        if let Err(e) = self.cluster.record_step_complete(
+            job_id,
+            &job.submission_generation.to_string(),
+            run_attempt,
+            step_id,
+            max_exit,
+        ) {
             warn!(
                 job_id,
                 step_id,
@@ -3065,6 +3372,9 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         srun_step_dispatch: job.srun_step_dispatch,
         req_gpus: spur_core::job::effective_gpus(&job.spec, job.spec.num_nodes) as u32,
         req_gpus_detail: requested_gpus_detail(&job.spec),
+        run_attempt: job.run_attempt,
+        submission_generation: job.submission_generation.to_string(),
+        submission_token: job.submission_token.clone().unwrap_or_default(),
     }
 }
 
@@ -3121,6 +3431,7 @@ fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
         reservation_maint: false,
         features: node.features.clone(),
         external_gpu_ids: node.external_gpu_ids.clone(),
+        worker_incarnation: node.incarnation.clone(),
     }
 }
 
@@ -3351,6 +3662,7 @@ fn node_complete_to_status(err: NodeCompleteError) -> Status {
     let code = match err {
         NodeCompleteError::JobNotFound { .. } => Code::NotFound,
         NodeCompleteError::NodeNotAllocated { .. } => Code::InvalidArgument,
+        NodeCompleteError::ReceiptConflict { .. } => Code::FailedPrecondition,
         NodeCompleteError::RaftPropose { .. } => Code::Unavailable,
     };
     Status::new(code, message)
@@ -3372,6 +3684,55 @@ mod tests {
     use spur_core::job::{JobState, NodeCompleteError};
     use spur_core::reservation::ReservationFlags;
     use tonic::Code;
+
+    #[test]
+    fn worker_incarnation_accepts_opaque_provider_uid() {
+        validate_worker_incarnation("kubernetes-node-uid/opaque:identity")
+            .expect("incarnations are opaque nonempty strings");
+        assert_eq!(
+            validate_worker_incarnation("").unwrap_err().code(),
+            Code::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn signal_dispatch_gate_accepts_only_exact_published_ownership() {
+        use spur_core::job::{Job, JobSpec, JobState, PendingDispatch, PendingDispatchPhase};
+
+        let mut job = Job::new(7, JobSpec::default());
+        job.state = JobState::Running;
+        job.run_attempt = 1;
+        job.pending_dispatch = Some(PendingDispatch {
+            submission_generation: job.submission_generation,
+            run_attempt: 1,
+            target_nodes: vec!["n1".into()],
+            target_incarnations: [("n1".into(), "worker-a".into())].into_iter().collect(),
+            phase: PendingDispatchPhase::Published,
+            resources: Default::default(),
+            per_node_alloc: Default::default(),
+            early_completions: Default::default(),
+            terminal_after_cleanup: None,
+            backoff_after_cleanup: None,
+            preempt_requeue_after_cleanup: None,
+            preempt_finalization_after_cleanup: None,
+        });
+        validate_signal_dispatch_ownership(&job)
+            .expect("a Running Published dispatch has exact signal ownership");
+
+        for phase in [
+            PendingDispatchPhase::Launching,
+            PendingDispatchPhase::Committed,
+            PendingDispatchPhase::Aborting,
+        ] {
+            job.pending_dispatch.as_mut().unwrap().phase = phase;
+            assert_eq!(
+                validate_signal_dispatch_ownership(&job)
+                    .expect_err("unpublished or aborting ownership must fail closed")
+                    .code(),
+                Code::FailedPrecondition
+            );
+        }
+    }
 
     #[test]
     fn resolve_registration_comm_addr_normalizes_explicit_ip() {
@@ -3553,6 +3914,7 @@ mod tests {
             &WalOperation::JobSubmit {
                 job_id: 1,
                 spec: Box::new(spec),
+                metadata: None,
             },
         );
 
@@ -3596,17 +3958,45 @@ mod tests {
         assert_eq!(status.message(), "partition 'gpu' not found");
     }
 
-    /// Only a controller-terminal job is stale; Pending (mid-dispatch), Running,
-    /// and unknown ids are all spared.
-    #[tokio::test]
-    async fn stale_reported_jobs_selects_only_terminal_jobs() {
+    /// Heartbeat reconciliation is fenced by the full execution identity. An
+    /// exact pre-publication dispatch and an exact Running owner are retained;
+    /// a reused job id/generation, a different attempt, an unknown id, and a
+    /// terminal owner are reclaimed directly from the reporting worker.
+    #[test]
+    fn stale_reported_jobs_compares_exact_execution_identity() {
         use crate::raft::StateMachineApply;
-        use spur_core::job::{JobSpec, JobState};
+        use spur_core::job::JobSpec;
+        use spur_core::node::NodeSource;
+        use spur_core::resource::{ResourceAllocations, ResourceSet};
         use spur_core::wal::WalOperation;
 
         let dir = tempfile::TempDir::new().unwrap();
         let cluster =
             Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
+        let apply = |op: &WalOperation| {
+            <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+                cluster.as_ref(),
+                op,
+            )
+        };
+        for (name, incarnation) in [("n1", "incarnation-a"), ("n2", "incarnation-b")] {
+            apply(&WalOperation::NodeRegister {
+                name: name.into(),
+                hostname: name.into(),
+                incarnation: incarnation.into(),
+                resources: ResourceSet {
+                    cpus: 4,
+                    memory_mb: 8_000,
+                    ..Default::default()
+                },
+                address: "127.0.0.1".into(),
+                port: 6818,
+                wg_pubkey: String::new(),
+                version: String::new(),
+                labels: Default::default(),
+                source: NodeSource::NativeHost,
+            });
+        }
 
         let submit = |job_id: u32, name: &str| WalOperation::JobSubmit {
             job_id,
@@ -3619,151 +4009,117 @@ mod tests {
                 work_dir: "/tmp".into(),
                 ..Default::default()
             }),
+            metadata: None,
         };
-        let apply = |op: &WalOperation| {
-            <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
-                cluster.as_ref(),
-                op,
-            );
-        };
+        apply(&submit(10, "launching"));
+        apply(&submit(11, "running"));
 
-        // 10 Pending, 11 Running, 12 terminal, and the non-Running active states
-        // that must also be spared: 13 Completing, 14 Suspended, 15 Preempted.
-        apply(&submit(10, "pending"));
-        for id in [11, 12, 13, 14, 15] {
-            apply(&submit(id, "job"));
-        }
-
-        let res = spur_core::resource::ResourceAllocations {
-            cpus: 1,
-            memory_mb: 0,
-            devices: std::collections::HashMap::new(),
-        };
-        let mut per_node = std::collections::HashMap::new();
-        per_node.insert("n1".to_string(), res.clone());
-        for id in [11, 12, 13, 14, 15] {
-            apply(&WalOperation::job_start(
-                id,
-                vec!["n1".into()],
-                res.clone(),
-                per_node.clone(),
-            ));
-            apply(&WalOperation::job_state_change(
-                id,
-                JobState::Pending,
-                JobState::Running,
-            ));
-        }
-        apply(&WalOperation::job_state_change(
-            12,
-            JobState::Running,
-            JobState::Cancelled,
-        ));
-        apply(&WalOperation::job_state_change(
-            13,
-            JobState::Running,
-            JobState::Completing,
-        ));
-        apply(&WalOperation::job_state_change(
-            14,
-            JobState::Running,
-            JobState::Suspended,
-        ));
-        apply(&WalOperation::job_state_change(
-            15,
-            JobState::Running,
-            JobState::Preempted,
-        ));
-
-        assert_eq!(cluster.job_state(10), Some(JobState::Pending));
-        assert_eq!(cluster.job_state(11), Some(JobState::Running));
-        assert!(cluster.job_state(12).unwrap().is_terminal());
-        assert_eq!(cluster.job_state(13), Some(JobState::Completing));
-        assert_eq!(cluster.job_state(14), Some(JobState::Suspended));
-        assert_eq!(cluster.job_state(15), Some(JobState::Preempted));
-
-        let reported: Vec<RunningJobStatus> = [10, 11, 12, 13, 14, 15, 999]
-            .into_iter()
-            .map(|job_id| RunningJobStatus {
+        let allocation = ResourceAllocations::with_scalar(1, 1_000);
+        let reserve = |job_id: u32, node: &str, incarnation: &str| {
+            let generation = cluster.get_job(job_id).unwrap().submission_generation;
+            let per_node = [(node.to_string(), allocation.clone())]
+                .into_iter()
+                .collect();
+            let target_incarnations = [(node.to_string(), incarnation.to_string())]
+                .into_iter()
+                .collect();
+            apply(&WalOperation::JobDispatchBegin {
                 job_id,
-                ..Default::default()
-            })
+                submission_generation: generation,
+                expected_run_attempt: 0,
+                run_attempt: 1,
+                target_nodes: vec![node.into()],
+                target_incarnations,
+                resources: allocation.clone(),
+                per_node_alloc: per_node,
+            });
+            generation
+        };
+        let launching_generation = reserve(10, "n1", "incarnation-a");
+        let running_generation = reserve(11, "n2", "incarnation-b");
+        let running_per_node = [("n2".to_string(), allocation.clone())]
+            .into_iter()
             .collect();
-
-        let stale = stale_reported_jobs(&cluster, &reported);
-        assert_eq!(
-            stale,
-            vec![12],
-            "only the terminal job is reclaimed; Pending/Running/Completing/Suspended/Preempted/unknown are spared"
-        );
-    }
-
-    /// GATE: a job requeued (Timeout -> Pending) between the reclaim snapshot
-    /// and the spawned loop's send must fail the re-check, not just the snapshot.
-    #[tokio::test]
-    async fn is_still_terminal_false_after_requeue_race() {
-        use crate::raft::StateMachineApply;
-        use spur_core::job::{JobSpec, JobState};
-        use spur_core::wal::WalOperation;
-
-        let dir = tempfile::TempDir::new().unwrap();
-        let cluster =
-            Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
-        let apply = |op: &WalOperation| {
-            <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
-                cluster.as_ref(),
-                op,
-            );
-        };
-
-        apply(&WalOperation::JobSubmit {
-            job_id: 77,
-            spec: Box::new(JobSpec {
-                name: "interactive".into(),
-                user: "alice".into(),
-                num_nodes: 1,
-                num_tasks: 1,
-                cpus_per_task: 1,
-                work_dir: "/tmp".into(),
-                requeue: true,
-                ..Default::default()
-            }),
+        apply(&WalOperation::JobDispatchCommit {
+            job_id: 11,
+            submission_generation: running_generation,
+            nodes: vec!["n2".into()],
+            resources: allocation,
+            per_node_alloc: running_per_node,
+            run_attempt: 1,
         });
-        let res = spur_core::resource::ResourceAllocations {
-            cpus: 1,
-            memory_mb: 0,
-            devices: std::collections::HashMap::new(),
+        apply(&WalOperation::JobDispatchPublish {
+            job_id: 11,
+            submission_generation: running_generation,
+            run_attempt: 1,
+        });
+
+        let exact_launching = RunningJobStatus {
+            job_id: 10,
+            submission_generation: launching_generation.to_string(),
+            run_attempt: 1,
+            ..Default::default()
         };
-        let mut per_node = std::collections::HashMap::new();
-        per_node.insert("n1".to_string(), res.clone());
-        apply(&WalOperation::job_start(
-            77,
-            vec!["n1".into()],
-            res,
-            per_node,
-        ));
-        apply(&WalOperation::job_state_change(
-            77,
-            JobState::Pending,
-            JobState::Running,
-        ));
-        apply(&WalOperation::job_state_change(
-            77,
-            JobState::Running,
-            JobState::Timeout,
-        ));
-        assert!(is_still_terminal(&cluster, 77), "snapshot sees Timeout");
+        let wrong_generation = RunningJobStatus {
+            submission_generation: "generation-a".into(),
+            ..exact_launching.clone()
+        };
+        let unknown = RunningJobStatus {
+            job_id: 999,
+            submission_generation: "generation-b".into(),
+            run_attempt: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            stale_reported_jobs(
+                &cluster,
+                "n1",
+                "incarnation-a",
+                &[exact_launching, wrong_generation.clone(), unknown.clone()],
+            ),
+            vec![wrong_generation, unknown]
+        );
 
-        // Concurrent requeue lands before the reclaim loop's re-check.
-        apply(&WalOperation::job_state_change(
-            77,
-            JobState::Timeout,
-            JobState::Pending,
-        ));
+        let exact_running = RunningJobStatus {
+            job_id: 11,
+            submission_generation: running_generation.to_string(),
+            run_attempt: 1,
+            ..Default::default()
+        };
+        let wrong_attempt = RunningJobStatus {
+            run_attempt: 2,
+            ..exact_running.clone()
+        };
+        assert_eq!(
+            stale_reported_jobs(
+                &cluster,
+                "n2",
+                "incarnation-b",
+                &[exact_running.clone(), wrong_attempt.clone()],
+            ),
+            vec![wrong_attempt]
+        );
 
-        assert!(
-            !is_still_terminal(&cluster, 77),
-            "re-check must skip a job requeued since the snapshot"
+        let completion = apply(&WalOperation::JobNodeComplete {
+            job_id: 11,
+            submission_generation: running_generation,
+            worker_incarnation: "incarnation-b".into(),
+            node_name: "n2".into(),
+            exit_code: 0,
+            signal: 0,
+            drain_reason: None,
+            run_attempt: 1,
+            submission_token: None,
+        });
+        assert_eq!(completion.jobs_finalized.len(), 1);
+        assert_eq!(
+            stale_reported_jobs(
+                &cluster,
+                "n2",
+                "incarnation-b",
+                std::slice::from_ref(&exact_running),
+            ),
+            vec![exact_running]
         );
     }
 
@@ -3878,17 +4234,72 @@ mod tests {
         }
     }
 
-    // A step must NOT be created when the target node is allocated but unregistered: address
-    // resolution runs first and returns a retryable Unavailable, so the client's retries can't
-    // each leak a step.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn create_job_step_unregistered_target_creates_no_step() {
+    async fn submit_response_returns_exact_generation_without_breaking_array_parents() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let make_spec = |name: &str, array_spec: &str| JobSpec {
+            name: name.into(),
+            user: "u".into(),
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            array_spec: array_spec.into(),
+            ..Default::default()
+        };
+
+        let scalar = svc
+            .submit_job(Request::new(SubmitJobRequest {
+                spec: Some(make_spec("scalar", "")),
+                submission_token: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let scalar_job = svc.cluster.get_job(scalar.job_id).unwrap();
+        assert_eq!(
+            scalar.submission_generation,
+            scalar_job.submission_generation.to_string()
+        );
+
+        let array = svc
+            .submit_job(Request::new(SubmitJobRequest {
+                spec: Some(make_spec("array", "0-1")),
+                submission_token: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            array.submission_generation.is_empty(),
+            "a synthetic parent must not borrow one task's exact identity"
+        );
+        assert!(svc.cluster.get_job(array.job_id).is_none());
+        let task_generations: Vec<_> = svc
+            .cluster
+            .get_jobs(&[], None, None, None, None, &[])
+            .into_iter()
+            .filter(|job| job.spec.array_job_id == Some(array.job_id))
+            .map(|job| job.submission_generation)
+            .collect();
+        assert_eq!(task_generations.len(), 2);
+        assert_ne!(task_generations[0], task_generations[1]);
+    }
+
+    // A step must NOT be created when the allocated target has no routable worker address:
+    // address resolution runs first and returns a retryable Unavailable, so the client's retries
+    // can't each leak a step.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_job_step_addressless_target_creates_no_step() {
+        use crate::raft::StateMachineApply;
         use spur_core::resource::{ResourceAllocations, ResourceSet};
+        use spur_core::wal::WalOperation;
         let dir = tempfile::TempDir::new().unwrap();
         let svc = test_service(&dir).await;
 
         svc.cluster
-            .register_node(
+            .register_node_exact(
                 "n1".into(),
                 "n1".into(),
                 ResourceSet {
@@ -3902,10 +4313,34 @@ mod tests {
                 String::new(),
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
+                "worker-incarnation-a".into(),
             )
             .unwrap();
+        // Persist an exact worker identity so the allocation can be published safely, while
+        // deliberately omitting its communication address to exercise the pre-step RPC gate.
+        svc.cluster.apply_operation(&WalOperation::NodeRegister {
+            name: "ghost".into(),
+            hostname: "ghost".into(),
+            incarnation: "worker-incarnation-ghost".into(),
+            resources: ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                ..Default::default()
+            },
+            address: String::new(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: std::collections::HashMap::new(),
+            source: spur_core::node::NodeSource::NativeHost,
+        });
         for _ in 0..200 {
-            if svc.cluster.get_node("n1").is_some() {
+            if svc.cluster.get_node("n1").is_some()
+                && svc
+                    .cluster
+                    .get_node("ghost")
+                    .is_some_and(|node| node.comm_addr().is_none())
+            {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -3922,7 +4357,7 @@ mod tests {
         };
         spec.srun_job = true;
         let job_id = svc.cluster.submit_job(spec).unwrap().job_id;
-        // Allocate to a real node plus a ghost node that is never registered.
+        // Allocate to a routable node plus the exact, address-less worker above.
         let res = ResourceAllocations::with_scalar(2, 4000);
         let per_node: std::collections::HashMap<_, _> = [
             ("n1".to_string(), res.clone()),
@@ -3993,6 +4428,14 @@ mod tests {
         let err = svc
             .exec_in_job(Request::new(ExecInJobRequest {
                 job_id,
+                submission_generation: svc
+                    .cluster
+                    .get_job(job_id)
+                    .unwrap()
+                    .submission_generation
+                    .to_string(),
+                run_attempt: 0,
+                worker_incarnation: String::new(),
                 command: vec!["hostname".into()],
                 user: "u".into(),
             }))
@@ -4035,6 +4478,100 @@ mod tests {
         assert_eq!(err.code(), Code::FailedPrecondition);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn standalone_cancel_keeps_resources_until_exact_worker_ack() {
+        use spur_core::resource::{ResourceAllocations, ResourceSet};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        svc.cluster
+            .register_node_exact(
+                "n1".into(),
+                "n1".into(),
+                ResourceSet {
+                    cpus: 8,
+                    memory_mb: 16_000,
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                1,
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                std::collections::HashMap::new(),
+                "worker-incarnation-a".into(),
+            )
+            .unwrap();
+        for _ in 0..200 {
+            if svc.cluster.get_node("n1").is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let mut spec = spur_core::job::JobSpec {
+            name: "standalone-cancel".into(),
+            user: "u".into(),
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            ..Default::default()
+        };
+        spec.srun_job = true;
+        spec.interactive = true;
+        let job_id = svc.cluster.submit_job(spec).unwrap().job_id;
+        for _ in 0..200 {
+            if svc.cluster.get_job(job_id).is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let generation = svc.cluster.get_job(job_id).unwrap().submission_generation;
+        let allocation = ResourceAllocations::with_scalar(1, 1_000);
+        let per_node: std::collections::HashMap<String, ResourceAllocations> =
+            [("n1".to_string(), allocation.clone())]
+                .into_iter()
+                .collect();
+        let (target_incarnations, dispatch_guard) = svc
+            .cluster
+            .begin_standalone_dispatch(
+                job_id,
+                vec!["n1".into()],
+                allocation.clone(),
+                per_node.clone(),
+            )
+            .unwrap();
+        svc.cluster
+            .start_standalone_job_after_registration(
+                job_id,
+                generation,
+                vec!["n1".into()],
+                allocation.clone(),
+                per_node,
+                target_incarnations,
+            )
+            .unwrap();
+        drop(dispatch_guard);
+
+        let error = svc
+            .cancel_job(Request::new(CancelJobRequest {
+                job_id,
+                signal: 0,
+                user: "u".into(),
+                expected_submission_generation: String::new(),
+            }))
+            .await
+            .expect_err("an unreachable exact worker must keep the allocation active");
+        assert_eq!(error.code(), Code::Unavailable);
+        let job = svc.cluster.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert_eq!(job.submission_generation, generation);
+        assert_eq!(job.run_attempt, 0);
+        assert_eq!(svc.cluster.get_node("n1").unwrap().alloc_resources.cpus, 1);
+    }
+
     /// Submit and start a single-node job owned by `owner`, returning its id.
     async fn running_job_owned_by(svc: &ControllerService, owner: &str) -> u32 {
         running_job_owned_by_inner(svc, owner, false).await
@@ -4054,7 +4591,7 @@ mod tests {
         use spur_core::resource::{ResourceAllocations, ResourceSet};
 
         svc.cluster
-            .register_node(
+            .register_node_exact(
                 "n1".into(),
                 "n1".into(),
                 ResourceSet {
@@ -4068,6 +4605,7 @@ mod tests {
                 String::new(),
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
+                "worker-incarnation-a".into(),
             )
             .unwrap();
         for _ in 0..200 {
@@ -4114,6 +4652,14 @@ mod tests {
         let err = svc
             .exec_in_job(Request::new(ExecInJobRequest {
                 job_id,
+                submission_generation: svc
+                    .cluster
+                    .get_job(job_id)
+                    .unwrap()
+                    .submission_generation
+                    .to_string(),
+                run_attempt: svc.cluster.get_job(job_id).unwrap().run_attempt,
+                worker_incarnation: svc.cluster.get_node("n1").unwrap().incarnation,
                 command: vec!["whoami".into()],
                 user: "rsikande".into(),
             }))
@@ -4134,6 +4680,14 @@ mod tests {
         let err = svc
             .exec_in_job(Request::new(ExecInJobRequest {
                 job_id,
+                submission_generation: svc
+                    .cluster
+                    .get_job(job_id)
+                    .unwrap()
+                    .submission_generation
+                    .to_string(),
+                run_attempt: svc.cluster.get_job(job_id).unwrap().run_attempt,
+                worker_incarnation: svc.cluster.get_node("n1").unwrap().incarnation,
                 command: vec!["whoami".into()],
                 user: "alice".into(),
             }))
@@ -4977,6 +5531,14 @@ mod tests {
                     node: "n1".into(),
                 },
                 Code::InvalidArgument,
+                false,
+            ),
+            (
+                NodeCompleteError::ReceiptConflict {
+                    job_id: 1,
+                    node: "n1".into(),
+                },
+                Code::FailedPrecondition,
                 false,
             ),
             (

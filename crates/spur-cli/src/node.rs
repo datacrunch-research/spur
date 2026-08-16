@@ -117,6 +117,7 @@ async fn cmd_label(controller: &str, node_pattern: String, label_args: Vec<Strin
                 labels: set_labels.clone(),
                 remove_labels: remove_labels.clone(),
                 external_gpus: None,
+                expected_worker_incarnation: String::new(),
             })
             .await
         {
@@ -156,6 +157,7 @@ async fn cmd_drain(controller: &str, node_pattern: String, reason: Option<String
             .drain_node(spur_proto::proto::DrainNodeRequest {
                 name: node.to_string(),
                 reason: reason.clone().unwrap_or_default(),
+                worker_incarnation: String::new(),
             })
             .await
         {

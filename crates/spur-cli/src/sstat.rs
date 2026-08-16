@@ -82,7 +82,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     for job_id in &job_ids {
         let response = client
-            .get_job(GetJobRequest { job_id: *job_id })
+            .get_job(GetJobRequest {
+                job_id: *job_id,
+                ..Default::default()
+            })
             .await
             .context(format!("failed to get job {}", job_id))?;
 

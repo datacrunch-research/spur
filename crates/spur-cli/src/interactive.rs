@@ -100,28 +100,38 @@ pub struct InteractiveSessionHandle {
     pub out_stream: tonic::Streaming<spur_proto::proto::InteractiveOutput>,
 }
 
+pub struct InteractiveSessionRequest<'a> {
+    pub job_id: u32,
+    pub submission_generation: &'a str,
+    pub run_attempt: u32,
+    pub worker_incarnation: &'a str,
+    pub step_id: u32,
+    pub argv: Vec<String>,
+    pub winsize: spur_proto::proto::WindowSize,
+    pub overlap: bool,
+}
+
 /// Open the InteractiveSession RPC, returning the raw handle.
 ///
 /// Returns `Err(tonic::Status)` on RPC failure.
 pub async fn open_interactive_session(
     agent: &mut SlurmAgentClient<tonic::transport::Channel>,
-    job_id: u32,
-    step_id: u32,
-    argv: Vec<String>,
-    winsize: spur_proto::proto::WindowSize,
-    overlap: bool,
+    request: InteractiveSessionRequest<'_>,
     user: &str,
 ) -> std::result::Result<InteractiveSessionHandle, tonic::Status> {
     let init = InteractiveInput {
         msg: Some(interactive_input::Msg::Init(InitSession {
-            job_id,
-            step_id,
-            overlap,
+            job_id: request.job_id,
+            step_id: request.step_id,
+            overlap: request.overlap,
             pty: true,
-            winsize: Some(winsize),
-            argv,
+            winsize: Some(request.winsize),
+            argv: request.argv,
             env: HashMap::new(),
             user: user.to_string(),
+            run_attempt: request.run_attempt,
+            submission_generation: request.submission_generation.to_string(),
+            worker_incarnation: request.worker_incarnation.to_string(),
         })),
     };
 
@@ -234,14 +244,10 @@ pub async fn drive_interactive_session(handle: InteractiveSessionHandle) -> Resu
 /// Returns the remote exit code.
 pub async fn run_interactive_session(
     agent: &mut SlurmAgentClient<tonic::transport::Channel>,
-    job_id: u32,
-    step_id: u32,
-    argv: Vec<String>,
-    winsize: spur_proto::proto::WindowSize,
-    overlap: bool,
+    request: InteractiveSessionRequest<'_>,
 ) -> Result<i32> {
     let user = current_user()?;
-    let handle = open_interactive_session(agent, job_id, step_id, argv, winsize, overlap, &user)
+    let handle = open_interactive_session(agent, request, &user)
         .await
         .map_err(|status| anyhow::anyhow!("InteractiveSession RPC failed: {}", status.message()))?;
     drive_interactive_session(handle).await

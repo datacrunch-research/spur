@@ -115,7 +115,7 @@ mod tests {
     #[test]
     fn t58_9_setenv_getenv_roundtrip() {
         use std::ffi::{CStr, CString};
-        use std::os::raw::c_int;
+        use std::os::raw::{c_char, c_int};
 
         let mut handle =
             SpankHandle::new(SpankContext::default(), std::collections::HashMap::new());
@@ -127,7 +127,7 @@ mod tests {
             ESPANK_SUCCESS
         );
 
-        let mut buf = [0i8; 32];
+        let mut buf = [0 as c_char; 32];
         assert_eq!(
             spank_getenv(
                 &mut handle,
@@ -146,14 +146,14 @@ mod tests {
     #[test]
     fn t58_10_seeded_env_visible_to_getenv() {
         use std::ffi::{CStr, CString};
-        use std::os::raw::c_int;
+        use std::os::raw::{c_char, c_int};
 
         let mut env = std::collections::HashMap::new();
         env.insert("SLURM_JOB_ID".to_string(), "4242".to_string());
         let mut handle = SpankHandle::new(SpankContext::default(), env);
 
         let var = CString::new("SLURM_JOB_ID").unwrap();
-        let mut buf = [0i8; 16];
+        let mut buf = [0 as c_char; 16];
         assert_eq!(
             spank_getenv(
                 &mut handle,

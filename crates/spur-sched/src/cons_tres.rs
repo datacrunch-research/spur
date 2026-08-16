@@ -11,6 +11,13 @@ use std::time::{Duration, Instant};
 
 use spur_core::resource::{GpuResource, ResourceSet};
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ExecutionIdentity {
+    pub job_id: u32,
+    pub submission_generation: String,
+    pub run_attempt: u32,
+}
+
 /// Why a reservation could not be made. Distinguished so the caller can map
 /// each to the right gRPC status instead of reporting every failure as GPU
 /// exhaustion.
@@ -45,6 +52,14 @@ pub struct NodeAllocation {
     /// orphans reconciled. Source of truth; the bitmaps above are a derived
     /// index for fast free-count queries.
     owners: HashMap<u32, AllocationResult>,
+    /// Launch epoch owning each allocation. Zero is reserved for legacy and
+    /// allocation-only callers. Attempt-scoped teardown prevents a delayed
+    /// cleanup for retry A from releasing retry B after the same job id is
+    /// reused.
+    owner_attempts: HashMap<u32, u32>,
+    /// Submission generation owning each job-id slot. Empty is reserved for
+    /// legacy callers; new batch and allocation-only execution uses a UUID.
+    owner_generations: HashMap<u32, String>,
     /// Reserved but not yet committed, with reserve time. Reconcile spares
     /// these until they exceed a TTL so a dropped launch can't pin resources.
     launching: HashMap<u32, Instant>,
@@ -62,6 +77,8 @@ impl NodeAllocation {
             gpu_allocated: vec![false; num_gpus],
             gpus: resources.gpus.clone(),
             owners: HashMap::new(),
+            owner_attempts: HashMap::new(),
+            owner_generations: HashMap::new(),
             launching: HashMap::new(),
         }
     }
@@ -96,6 +113,31 @@ impl NodeAllocation {
             .filter(|(_, alloc)| alloc.gpu_ids.iter().any(|g| device_ids.contains(g)))
             .map(|(id, _)| *id)
             .collect()
+    }
+
+    pub fn conflicting_owner_executions(&self, device_ids: &[u32]) -> Vec<ExecutionIdentity> {
+        self.conflicting_owners(device_ids)
+            .into_iter()
+            .filter_map(|job_id| self.owner_identity(job_id))
+            .collect()
+    }
+
+    pub fn owner_identity(&self, job_id: u32) -> Option<ExecutionIdentity> {
+        self.owners
+            .contains_key(&job_id)
+            .then(|| ExecutionIdentity {
+                job_id,
+                submission_generation: self
+                    .owner_generations
+                    .get(&job_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                run_attempt: self
+                    .owner_attempts
+                    .get(&job_id)
+                    .copied()
+                    .unwrap_or_default(),
+            })
     }
 
     /// Available GPU count (optionally filtered by type).
@@ -150,6 +192,31 @@ impl NodeAllocation {
         memory_mb: u64,
         gpu_device_ids: &[u32],
     ) -> Result<AllocationResult, AllocError> {
+        self.allocate_for_job_attempt(job_id, 0, cpus, memory_mb, gpu_device_ids)
+    }
+
+    /// Attempt-scoped form used by durably fenced batch launches.
+    pub fn allocate_for_job_attempt(
+        &mut self,
+        job_id: u32,
+        run_attempt: u32,
+        cpus: u32,
+        memory_mb: u64,
+        gpu_device_ids: &[u32],
+    ) -> Result<AllocationResult, AllocError> {
+        self.allocate_for_execution(job_id, "", run_attempt, cpus, memory_mb, gpu_device_ids)
+    }
+
+    /// Exact execution-scoped reservation used by worker RPCs.
+    pub fn allocate_for_execution(
+        &mut self,
+        job_id: u32,
+        submission_generation: &str,
+        run_attempt: u32,
+        cpus: u32,
+        memory_mb: u64,
+        gpu_device_ids: &[u32],
+    ) -> Result<AllocationResult, AllocError> {
         // A launch still in flight (reserved, not yet committed or released) is
         // a genuine concurrent duplicate: a second launch would double-count.
         if self.launching.contains_key(&job_id) {
@@ -161,6 +228,9 @@ impl NodeAllocation {
         // controller only re-issues LaunchJob after freeing the job, so this
         // reservation is stale — supersede it rather than reject, releasing it
         // first so CPU/memory stay symmetric and the owner entry is not orphaned.
+        if !submission_generation.is_empty() && self.owners.contains_key(&job_id) {
+            return Err(AllocError::DuplicateJob);
+        }
         self.release_job(job_id);
 
         let mut gpu_indices = Vec::with_capacity(gpu_device_ids.len());
@@ -195,6 +265,9 @@ impl NodeAllocation {
             memory_mb,
         };
         self.owners.insert(job_id, result.clone());
+        self.owner_attempts.insert(job_id, run_attempt);
+        self.owner_generations
+            .insert(job_id, submission_generation.to_string());
         self.launching.insert(job_id, Instant::now());
         Ok(result)
     }
@@ -204,6 +277,30 @@ impl NodeAllocation {
     /// longer exists — reconcile reclaimed it after the launch exceeded the TTL,
     /// so the caller must not treat the job as backed by an allocation.
     pub fn commit_job(&mut self, job_id: u32) -> bool {
+        self.commit_job_attempt(job_id, 0)
+    }
+
+    /// Commit only the allocation owned by `run_attempt`. Attempt zero retains
+    /// the legacy job-id-only behavior.
+    pub fn commit_job_attempt(&mut self, job_id: u32, run_attempt: u32) -> bool {
+        if run_attempt != 0 && self.owner_attempts.get(&job_id) != Some(&run_attempt) {
+            return false;
+        }
+        self.launching.remove(&job_id);
+        self.owners.contains_key(&job_id)
+    }
+
+    pub fn commit_execution(
+        &mut self,
+        job_id: u32,
+        submission_generation: &str,
+        run_attempt: u32,
+    ) -> bool {
+        if self.owner_generations.get(&job_id).map(String::as_str) != Some(submission_generation)
+            || self.owner_attempts.get(&job_id) != Some(&run_attempt)
+        {
+            return false;
+        }
         self.launching.remove(&job_id);
         self.owners.contains_key(&job_id)
     }
@@ -211,7 +308,39 @@ impl NodeAllocation {
     /// Release a job's allocation by id. Idempotent: releasing an unknown or
     /// already-released job is a no-op returning false.
     pub fn release_job(&mut self, job_id: u32) -> bool {
+        self.release_job_attempt(job_id, 0)
+    }
+
+    /// Release only the allocation owned by `run_attempt`. Attempt zero
+    /// retains legacy job-id-only behavior.
+    pub fn release_job_attempt(&mut self, job_id: u32, run_attempt: u32) -> bool {
+        if run_attempt != 0 && self.owner_attempts.get(&job_id) != Some(&run_attempt) {
+            return false;
+        }
         self.launching.remove(&job_id);
+        self.owner_attempts.remove(&job_id);
+        self.owner_generations.remove(&job_id);
+        let Some(alloc) = self.owners.remove(&job_id) else {
+            return false;
+        };
+        self.release(&alloc);
+        true
+    }
+
+    pub fn release_execution(
+        &mut self,
+        job_id: u32,
+        submission_generation: &str,
+        run_attempt: u32,
+    ) -> bool {
+        if self.owner_generations.get(&job_id).map(String::as_str) != Some(submission_generation)
+            || self.owner_attempts.get(&job_id) != Some(&run_attempt)
+        {
+            return false;
+        }
+        self.launching.remove(&job_id);
+        self.owner_attempts.remove(&job_id);
+        self.owner_generations.remove(&job_id);
         let Some(alloc) = self.owners.remove(&job_id) else {
             return false;
         };
@@ -246,6 +375,41 @@ impl NodeAllocation {
             .collect();
         for &id in &orphaned {
             self.release_job(id);
+        }
+        orphaned
+    }
+
+    /// Exact execution variant used by spurd. A stale snapshot for an older
+    /// generation cannot retain or release a replacement allocation that
+    /// reused the same numeric job ID.
+    pub fn reconcile_executions(
+        &mut self,
+        live: &HashSet<ExecutionIdentity>,
+        now: Instant,
+        launching_ttl: Duration,
+    ) -> Vec<ExecutionIdentity> {
+        let orphaned: Vec<ExecutionIdentity> = self
+            .owners
+            .keys()
+            .filter_map(|job_id| self.owner_identity(*job_id))
+            .filter(|identity| {
+                if live.contains(identity) {
+                    return false;
+                }
+                match self.launching.get(&identity.job_id) {
+                    Some(reserved_at) => {
+                        now.saturating_duration_since(*reserved_at) >= launching_ttl
+                    }
+                    None => true,
+                }
+            })
+            .collect();
+        for identity in &orphaned {
+            self.release_execution(
+                identity.job_id,
+                &identity.submission_generation,
+                identity.run_attempt,
+            );
         }
         orphaned
     }
@@ -554,6 +718,37 @@ mod tests {
             1,
             "reclaimed GPU stays free after the no-op commit"
         );
+    }
+
+    #[test]
+    fn stale_execution_release_cannot_free_reused_job_id() {
+        let mut node = make_node_with_ids(64, 256_000, vec![0, 1], "mi300x");
+
+        node.allocate_for_execution(7, "generation-a", 1, 4, 8_000, &[0])
+            .unwrap();
+        assert!(node.commit_execution(7, "generation-a", 1));
+        assert!(node.release_execution(7, "generation-a", 1));
+
+        node.allocate_for_execution(7, "generation-b", 2, 4, 8_000, &[1])
+            .unwrap();
+        assert!(node.commit_execution(7, "generation-b", 2));
+
+        assert!(
+            !node.release_execution(7, "generation-a", 1),
+            "late teardown for the old generation must be a no-op"
+        );
+        assert_eq!(
+            node.owner_identity(7),
+            Some(ExecutionIdentity {
+                job_id: 7,
+                submission_generation: "generation-b".into(),
+                run_attempt: 2,
+            })
+        );
+        assert_eq!(node.free_gpus(None), 1);
+        assert_eq!(node.allocated_gpu_ids(), vec![1]);
+        assert!(node.release_execution(7, "generation-b", 2));
+        assert_eq!(node.free_gpus(None), 2);
     }
 
     #[test]

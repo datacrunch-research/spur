@@ -88,6 +88,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                     job_id: *job_id,
                     signal,
                     user: user.clone(),
+                    expected_submission_generation: String::new(),
                 })
                 .await
             {
@@ -132,6 +133,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                     job_id: job.job_id,
                     signal,
                     user: user.clone(),
+                    expected_submission_generation: String::new(),
                 })
                 .await
             {

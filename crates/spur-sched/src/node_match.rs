@@ -98,6 +98,10 @@ impl<'a> NodePlacement<'a> {
             .is_some_and(|nodelist| nodelist.contains(name))
     }
 
+    pub fn listed_count(&self) -> usize {
+        self.nodelist.as_ref().map_or(0, HashSet::len)
+    }
+
     /// True if the node is in one of the job's requested partitions (or the job
     /// requested no partition).
     pub fn in_partition(&self, node: &Node) -> bool {
@@ -120,6 +124,11 @@ impl<'a> NodePlacement<'a> {
     /// features, reservation), ignoring node state and free capacity.
     pub fn eligible(&self, node: &Node, reservations: &[Reservation], now: DateTime<Utc>) -> bool {
         self.allows_name(&node.name)
+            && !self
+                .job
+                .transient_capacity_rejections
+                .get(&node.name)
+                .is_some_and(|rejection| rejection.rejects_node_at(now))
             && self.in_partition(node)
             && self.has_features(node)
             && self.reservation_ok(node, reservations, now)

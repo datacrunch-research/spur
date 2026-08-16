@@ -269,6 +269,9 @@ pub struct Node {
     /// OS hostname reported at agent registration (NodeHostname).
     #[serde(default)]
     pub hostname: String,
+    /// Identity of the currently registered spurd process.
+    #[serde(default)]
+    pub incarnation: String,
     pub state: NodeState,
     pub state_reason: Option<String>,
     /// When true, the current state was set by an operator (admin API, drain,
@@ -348,6 +351,7 @@ impl Node {
         Self {
             name,
             hostname: String::new(),
+            incarnation: String::new(),
             state: NodeState::Unknown,
             state_reason: None,
             admin_locked: false,
@@ -472,35 +476,39 @@ mod tests {
 
     #[test]
     fn external_gpu_overlay_reduces_only_gpu_capacity() {
-        let mut resources = ResourceSet::default();
-        resources.cpus = 4;
-        resources.gpus = vec![
-            crate::resource::GpuResource {
-                device_id: 0,
-                gpu_type: "gpu".into(),
-                memory_mb: 1,
-                peer_gpus: Vec::new(),
-                link_type: crate::resource::GpuLinkType::PCIe,
-            },
-            crate::resource::GpuResource {
-                device_id: 1,
-                gpu_type: "gpu".into(),
-                memory_mb: 1,
-                peer_gpus: Vec::new(),
-                link_type: crate::resource::GpuLinkType::PCIe,
-            },
-        ];
+        let resources = ResourceSet {
+            cpus: 4,
+            gpus: vec![
+                crate::resource::GpuResource {
+                    device_id: 0,
+                    gpu_type: "gpu".into(),
+                    memory_mb: 1,
+                    peer_gpus: Vec::new(),
+                    link_type: crate::resource::GpuLinkType::PCIe,
+                },
+                crate::resource::GpuResource {
+                    device_id: 1,
+                    gpu_type: "gpu".into(),
+                    memory_mb: 1,
+                    peer_gpus: Vec::new(),
+                    link_type: crate::resource::GpuLinkType::PCIe,
+                },
+            ],
+            ..Default::default()
+        };
         let mut node = Node::new("n1".into(), resources);
         node.external_gpu_ids = vec![0];
 
-        let mut one_gpu = ResourceSet::default();
-        one_gpu.gpus = vec![crate::resource::GpuResource {
-            device_id: 0,
-            gpu_type: "gpu".into(),
-            memory_mb: 0,
-            peer_gpus: Vec::new(),
-            link_type: crate::resource::GpuLinkType::PCIe,
-        }];
+        let one_gpu = ResourceSet {
+            gpus: vec![crate::resource::GpuResource {
+                device_id: 0,
+                gpu_type: "gpu".into(),
+                memory_mb: 0,
+                peer_gpus: Vec::new(),
+                link_type: crate::resource::GpuLinkType::PCIe,
+            }],
+            ..Default::default()
+        };
         let mut two_gpus = one_gpu.clone();
         two_gpus.gpus.push(one_gpu.gpus[0].clone());
 

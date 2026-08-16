@@ -24,6 +24,8 @@ use tonic::transport::{Channel, Endpoint};
 /// prove it is threaded into the follow-up `RunStep` rather than defaulted.
 pub(crate) const MOCK_STEP_ID: u32 = 4242;
 
+pub(crate) const MOCK_RUN_ATTEMPT: u32 = 17;
+
 /// Exit code the mock reports from `RunStep`.
 pub(crate) const MOCK_EXIT_CODE: i32 = 7;
 
@@ -103,6 +105,9 @@ mock_controller_impl! {
             Ok(tonic::Response::new(proto::CreateJobStepResponse {
                 step_id: MOCK_STEP_ID,
                 node_addr: String::new(),
+                run_attempt: MOCK_RUN_ATTEMPT,
+                submission_generation: "mock-generation".into(),
+                worker_incarnation: "mock-worker-incarnation".into(),
             }))
         }
 
@@ -139,6 +144,7 @@ mock_controller_impl! {
         get_jobs(proto::GetJobsRequest) -> proto::GetJobsResponse;
         get_job(proto::GetJobRequest) -> proto::JobInfo;
         cancel_job(proto::CancelJobRequest) -> ();
+        cancel_job_by_submission_token(proto::CancelJobBySubmissionTokenRequest) -> proto::CancelJobBySubmissionTokenResponse;
         complete_job(proto::CompleteJobRequest) -> ();
         job_keepalive(proto::JobKeepaliveRequest) -> proto::JobKeepaliveResponse;
         suspend_job(proto::SuspendJobRequest) -> ();

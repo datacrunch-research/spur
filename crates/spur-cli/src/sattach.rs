@@ -4,7 +4,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
-use spur_proto::proto::{GetJobRequest, JobState, StreamJobOutputRequest};
+use spur_proto::proto::{GetJobRequest, GetNodeRequest, JobState, StreamJobOutputRequest};
 use std::io::Write;
 
 /// Attach to a running job step's standard I/O.
@@ -53,7 +53,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     // Look up the job to find which node it is running on
     let job = client
-        .get_job(GetJobRequest { job_id })
+        .get_job(GetJobRequest {
+            job_id,
+            ..Default::default()
+        })
         .await
         .context("failed to get job info")?
         .into_inner();
@@ -74,13 +77,35 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     // Connect to the first node's agent
     let first_node = nodelist.split(',').next().unwrap_or(nodelist).trim();
+    let node = client
+        .get_node(GetNodeRequest {
+            name: first_node.to_string(),
+        })
+        .await
+        .context("failed to get node execution identity")?
+        .into_inner();
     let agent_addr = format!("http://{}:6818", first_node);
     let mut agent = crate::interactive::connect_agent(&agent_addr).await?;
 
     if args.output_only {
-        stream_output_only(&mut agent, job_id, &args.output).await
+        stream_output_only(
+            &mut agent,
+            job_id,
+            &args.output,
+            &job.submission_generation,
+            job.run_attempt,
+            &node.worker_incarnation,
+        )
+        .await
     } else {
-        let exit_code = interactive_attach(&mut agent, job_id).await?;
+        let exit_code = interactive_attach(
+            &mut agent,
+            job_id,
+            &job.submission_generation,
+            job.run_attempt,
+            &node.worker_incarnation,
+        )
+        .await?;
         std::process::exit(exit_code);
     }
 }
@@ -90,12 +115,18 @@ async fn stream_output_only(
     agent: &mut SlurmAgentClient<tonic::transport::Channel>,
     job_id: u32,
     stream_name: &str,
+    submission_generation: &str,
+    run_attempt: u32,
+    worker_incarnation: &str,
 ) -> Result<()> {
     let mut stream = agent
         .stream_job_output(StreamJobOutputRequest {
             job_id,
             stream: stream_name.to_string(),
             user: crate::interactive::current_user()?,
+            submission_generation: submission_generation.to_string(),
+            run_attempt,
+            worker_incarnation: worker_incarnation.to_string(),
         })
         .await
         .context("failed to start output stream")?
@@ -132,9 +163,25 @@ async fn stream_output_only(
 async fn interactive_attach(
     agent: &mut SlurmAgentClient<tonic::transport::Channel>,
     job_id: u32,
+    submission_generation: &str,
+    run_attempt: u32,
+    worker_incarnation: &str,
 ) -> Result<i32> {
     let winsize = crate::interactive::get_terminal_size();
-    crate::interactive::run_interactive_session(agent, job_id, 0, Vec::new(), winsize, true).await
+    crate::interactive::run_interactive_session(
+        agent,
+        crate::interactive::InteractiveSessionRequest {
+            job_id,
+            submission_generation,
+            run_attempt,
+            worker_incarnation,
+            step_id: 0,
+            argv: Vec::new(),
+            winsize,
+            overlap: true,
+        },
+    )
+    .await
 }
 
 fn state_name(state: i32) -> &'static str {

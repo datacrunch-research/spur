@@ -113,6 +113,30 @@ Scheduling is GPU-first: GPUs are requested with ``--gres=gpu:...`` (or the
 ``--gpus`` shorthand), and the agent sets ``ROCR_VISIBLE_DEVICES`` and
 ``CUDA_VISIBLE_DEVICES`` for the allocated devices at launch.
 
+Batch dispatch safety
+~~~~~~~~~~~~~~~~~~~~~
+
+Before a batch job is published as running, the controller durably records its
+dispatch attempt and complete target-node set, then waits for every agent to
+confirm launch. A partial or response-ambiguous launch is cancelled with that
+exact attempt number on every target. A replacement attempt cannot reuse the
+same number, so a delayed launch or cancel cannot cross into the replacement.
+
+Recovery is intentionally fail-closed for the affected resources. After
+controller failover, the current Raft leader must receive an attempt-scoped
+cancel acknowledgement from every persisted target before it clears the
+dispatch intent. An unreachable worker or a prelaunch hook that never returns
+therefore retains that job's exact provisional node/GPU slices until the worker
+restarts, connectivity is restored, or an operator remediates the node;
+unrelated capacity continues scheduling. Spur does not yet impose a general
+timeout on arbitrary prelaunch hooks, so site preflight hooks should be bounded
+and fast.
+
+Node names and agent addresses are part of the cleanup identity in this
+revision. Do not reuse either for replacement hardware while a dispatch intent
+is unresolved: fence the old host/process externally first. A durable agent
+incarnation token is planned to make this fencing native.
+
 See Also
 --------
 

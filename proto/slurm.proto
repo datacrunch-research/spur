@@ -242,6 +242,13 @@ message JobInfo {
   // "gpu:2/task".
   uint32 req_gpus = 55;
   string req_gpus_detail = 56;
+  // Current durable batch epoch; zero identifies a standalone-srun allocation.
+  uint32 run_attempt = 57;
+  // Exact submission identity used by agent-bound execution control.
+  string submission_generation = 58;
+  // Durable idempotency token supplied by an external reconciler. Empty for
+  // ordinary CLI submissions and legacy jobs.
+  string submission_token = 59;
 }
 
 message NodeInfo {
@@ -271,6 +278,8 @@ message NodeInfo {
   // Device IDs currently occupied by work not managed by Spur. These devices
   // remain part of node inventory but are excluded from scheduler placement.
   repeated uint32 external_gpu_ids = 54;
+  // Process identity for the currently registered native worker.
+  string worker_incarnation = 55;
 }
 
 message PartitionInfo {
@@ -311,6 +320,11 @@ service SlurmController {
   rpc GetJobs(GetJobsRequest) returns (GetJobsResponse);
   rpc GetJob(GetJobRequest) returns (JobInfo);
   rpc CancelJob(CancelJobRequest) returns (google.protobuf.Empty);
+  // Permanently fence a caller-generated submission token and cancel the
+  // exact submission already bound to it, if any. The fence and cancellation
+  // intent are committed in one Raft entry, so a delayed SubmitJob cannot
+  // create work after this call succeeds.
+  rpc CancelJobBySubmissionToken(CancelJobBySubmissionTokenRequest) returns (CancelJobBySubmissionTokenResponse);
   // Finish a standalone srun allocation after its step completes.
   rpc CompleteJob(CompleteJobRequest) returns (google.protobuf.Empty);
   // Keepalive from an interactive client so an abandoned allocation can be reaped.
@@ -465,11 +479,18 @@ service SlurmAccounting {
 
 message SubmitJobRequest {
   JobSpec spec = 1;
+  // Caller-generated idempotency key. Retries with the same token must carry
+  // the exact same user/spec and return the original submission identity.
+  string submission_token = 2;
 }
 
 message SubmitJobResponse {
   uint32 job_id = 1;
   repeated string warnings = 2;
+  // Immutable identity of this submission, persisted by external reconcilers
+  // so delayed cleanup cannot target a reused numeric job ID. Empty only for
+  // a synthetic array-parent response (array tasks have distinct identities).
+  string submission_generation = 3;
 }
 
 message GetJobsRequest {
@@ -487,12 +508,33 @@ message GetJobsResponse {
 
 message GetJobRequest {
   uint32 job_id = 1;
+  // Optional exact external-reconciler identity. When the live Job has been
+  // evicted, the controller can return its permanent terminal token receipt.
+  string submission_token = 2;
 }
 
 message CancelJobRequest {
   uint32 job_id = 1;
   int32 signal = 2;  // 0 = cancel, else signal number
   string user = 3;   // For authorization
+  // Optional exact-submission fence. Empty preserves trusted CLI behavior;
+  // reconcilers must set it before performing asynchronous cleanup.
+  string expected_submission_generation = 4;
+}
+
+message CancelJobBySubmissionTokenRequest {
+  string submission_token = 1;
+}
+
+message CancelJobBySubmissionTokenResponse {
+  // Zero/empty when cancellation won the Raft order before submission. The
+  // durable token tombstone still prevents a later SubmitJob from creating.
+  uint32 job_id = 1;
+  string submission_generation = 2;
+  // True only after the exact execution has no remaining durable worker
+  // cleanup/finalization work. A finalizer must retain its CR provenance until
+  // this is true.
+  bool cleanup_complete = 3;
 }
 
 message CompleteJobRequest {
@@ -554,11 +596,17 @@ message UpdateNodeRequest {
   // Comma-separated GPU device IDs occupied by external work. Presence matters:
   // omitted leaves the overlay unchanged; an empty value clears it.
   optional string external_gpus = 6;
+  // Optional exact-worker fence for asynchronous infrastructure events.
+  // Empty preserves administrative scontrol behavior.
+  string expected_worker_incarnation = 7;
 }
 
 message DrainNodeRequest {
   string name = 1;
   string reason = 2;
+  // An agent-initiated drain is accepted only from this exact spurd process.
+  // Empty is reserved for trusted administrative callers.
+  string worker_incarnation = 3;
 }
 
 message DrainNodeResponse {
@@ -580,6 +628,7 @@ message DeregisterAgentRequest {
   string hostname = 1;
   string node_token = 2;
   string reason = 3;
+  string worker_incarnation = 4;
 }
 
 message GetPartitionsRequest {
@@ -677,6 +726,7 @@ message RegisterAgentRequest {
   string wg_pubkey = 6;      // WireGuard public key (for mesh setup)
   map<string, string> labels = 7;  // Node labels for partition routing (pool, rack, etc.)
   string join_token = 8;     // Admission token for token-based admission
+  string worker_incarnation = 9;
 }
 
 message RegisterAgentResponse {
@@ -697,6 +747,7 @@ message HeartbeatRequest {
   string wg_pubkey = 6;
   // k0s supervision status; present only when the node runs a k0s unit ([cluster].enabled).
   optional K0sNodeStatus k0s_status = 7;
+  string worker_incarnation = 8;
 }
 
 // Per-node k0s supervision status, reported on the heartbeat for spur_k8s_node_* metrics.
@@ -711,6 +762,8 @@ message RunningJobStatus {
   uint32 job_id = 1;
   JobState state = 2;
   int32 exit_code = 3;
+  string submission_generation = 4;
+  uint32 run_attempt = 5;
 }
 
 message HeartbeatResponse {}
@@ -767,6 +820,15 @@ message LaunchJobRequest {
   bool task_fanout = 11;
   // When true, PMIx was prepared via PreparePmix; LaunchJob must not re-init the server.
   bool pmix_prepared = 12;
+  // Exact opaque identity returned by the controller's prepare phase. Batch
+  // dispatches use `batch:{submission_generation}:{run_attempt}`; the agent
+  // joins only this token.
+  string pmix_prepare_token = 13;
+  string submission_generation = 14;
+  string worker_incarnation = 15;
+  // Durable submission token used by the Kubernetes virtual agent to resolve
+  // exactly one owning SpurJob rather than routing by a reusable numeric ID.
+  string submission_token = 16;
 }
 
 // Why a launch was rejected, when the controller's response depends on it.
@@ -784,6 +846,12 @@ message PreparePmixRequest {
   uint32 job_id = 1;
   PmixLaunchPlan pmix_plan = 2;
   uint32 run_attempt = 3;
+  // Exact opaque prepare identity. Batch uses
+  // `batch:{submission_generation}:{run_attempt}` and srun steps use
+  // `step:{submission_generation}:{run_attempt}:{step_id}`.
+  string prepare_token = 4;
+  string submission_generation = 5;
+  string worker_incarnation = 6;
 }
 
 message PreparePmixResponse {
@@ -793,6 +861,12 @@ message PreparePmixResponse {
 
 message ReleasePmixRequest {
   uint32 job_id = 1;
+  // Owning job run epoch. It is never a wildcard; prepare_token is the exact
+  // identity used for cleanup.
+  uint32 run_attempt = 2;
+  string prepare_token = 3;
+  string submission_generation = 4;
+  string worker_incarnation = 5;
 }
 
 message ReleasePmixResponse {}
@@ -808,11 +882,30 @@ message LaunchJobResponse {
 message AgentCancelJobRequest {
   uint32 job_id = 1;
   int32 signal = 2;
+  // Exact launch epoch. Zero is valid only for the explicitly modeled
+  // standalone-srun allocation; it is never a wildcard.
+  uint32 run_attempt = 3;
+  string submission_generation = 4;
+  string worker_incarnation = 5;
+  AgentJobControlMode control_mode = 6;
+}
+
+enum AgentJobControlMode {
+  AGENT_JOB_CONTROL_UNSPECIFIED = 0;
+  // Deliver the requested signal to the exact live execution, retaining its
+  // process tracking and resource ownership.
+  AGENT_JOB_CONTROL_SIGNAL_ONLY = 1;
+  // Establish exact process absence, release resources, and ACK only after
+  // synchronous hard-kill/reap cleanup completes.
+  AGENT_JOB_CONTROL_TERMINATE_AND_REAP = 2;
 }
 
 message AgentSuspendJobRequest {
   uint32 job_id = 1;
   bool resume = 2;   // false = SIGSTOP (suspend), true = SIGCONT (resume)
+  string submission_generation = 3;
+  uint32 run_attempt = 4;
+  string worker_incarnation = 5;
 }
 
 message NodeResourcesResponse {
@@ -824,6 +917,9 @@ message ExecInJobRequest {
   uint32 job_id = 1;
   repeated string command = 2;  // Command to exec inside the container
   string user = 3;              // Requesting user; must own the job (empty/root bypasses)
+  string submission_generation = 4;
+  uint32 run_attempt = 5;
+  string worker_incarnation = 6;
 }
 
 message ExecInJobResponse {
@@ -1017,6 +1113,14 @@ message RunCommandRequest {
   string mpi = 13;             // Resolved step MPI type: "none" or "pmix"
   // When true, PMIx was prepared via PreparePmix on the controller before RunCommand.
   bool pmix_prepared = 14;
+  // Exact opaque step prepare identity:
+  // `step:{submission_generation}:{run_attempt}:{step_id}`.
+  string pmix_prepare_token = 15;
+  // Exact owning batch epoch. Zero is the explicit standalone-srun exception
+  // until allocation registration gains a durable pre-fanout reservation.
+  uint32 run_attempt = 16;
+  string submission_generation = 17;
+  string worker_incarnation = 18;
 }
 
 // Register a srun-only allocation on an agent without starting a batch process.
@@ -1033,6 +1137,11 @@ message RegisterJobAllocationRequest {
   string mpi = 10;
   string work_dir = 11;
   string user = 12;  // Job owner; the agent gates exec/attach on it
+  // Zero is the standalone-srun epoch; generation and worker incarnation
+  // fence job-id and worker-process reuse.
+  uint32 run_attempt = 13;
+  string submission_generation = 14;
+  string worker_incarnation = 15;
 }
 
 message RegisterJobAllocationResponse {}
@@ -1047,12 +1156,19 @@ message CancelStepRequest {
   uint32 job_id = 1;
   uint32 step_id = 2;
   int32 signal = 3;  // 0 = SIGTERM, 9 = SIGKILL, etc.
+  // Exact owning batch epoch; zero identifies a standalone-srun allocation.
+  uint32 run_attempt = 4;
+  string submission_generation = 5;
+  string worker_incarnation = 6;
 }
 
 message StreamJobOutputRequest {
   uint32 job_id = 1;
   string stream = 2;  // "stdout" or "stderr"
   string user = 3;    // Requesting user; must own the job (empty/root bypasses)
+  string submission_generation = 4;
+  uint32 run_attempt = 5;
+  string worker_incarnation = 6;
 }
 
 message StreamJobOutputChunk {
@@ -1078,6 +1194,10 @@ message InitSession {
   repeated string argv = 6;  // Command to run (empty = default shell)
   map<string, string> env = 7;
   string user = 8;           // Requesting user; must own the job (empty/root bypasses)
+  // Exact owning batch epoch; zero identifies a standalone-srun allocation.
+  uint32 run_attempt = 9;
+  string submission_generation = 10;
+  string worker_incarnation = 11;
 }
 
 message InteractiveInput {
@@ -1108,6 +1228,7 @@ message RecordJobStartRequest {
   string reservation = 7;
   string name = 8;
   google.protobuf.Timestamp submit_time = 9;
+  uint32 run_attempt = 10;      // Durable execution epoch for idempotency
 }
 
 message RecordJobEndRequest {
@@ -1117,6 +1238,7 @@ message RecordJobEndRequest {
   google.protobuf.Timestamp end_time = 4;
   int32 exit_signal = 5;        // Terminating signal of primary node (0 = none)
   int32 derived_exit_code = 6;  // Running max over srun step exit codes (0 if no steps)
+  uint32 run_attempt = 7;       // Durable execution epoch for idempotency
 }
 
 message GetJobHistoryRequest {
@@ -1185,6 +1307,12 @@ message ReportJobStatusRequest {
   // Echoed from LaunchJobRequest.run_attempt; controller drops this report if
   // older than the job's current epoch. 0 = unset (legacy), check off.
   uint32 run_attempt = 9;
+  string submission_generation = 10;
+  string worker_incarnation = 11;
+  // Durable token for idempotent completion acknowledgement after the
+  // terminal Job itself has been evicted. Empty preserves native-agent
+  // compatibility but cannot provide post-eviction acknowledgement.
+  string submission_token = 12;
 }
 
 // ============================================================
@@ -1352,6 +1480,10 @@ message CreateJobStepRequest {
 message CreateJobStepResponse {
   uint32 step_id = 1;
   string node_addr = 2;        // Address of the selected node (-w target, else first allocated); host:port for agent
+  // Current durable batch epoch; zero identifies a standalone-srun allocation.
+  uint32 run_attempt = 3;
+  string submission_generation = 4;
+  string worker_incarnation = 5;
 }
 
 // ============================================================

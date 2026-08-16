@@ -5,18 +5,19 @@
 //! Receives job launch/cancel requests from spurctld.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use tokio_stream::wrappers::ReceiverStream;
 
 use spur_proto::proto::slurm_agent_server::SlurmAgent;
 use spur_proto::proto::*;
 
-use spur_sched::cons_tres::{AllocError, AllocationResult, NodeAllocation};
+use spur_sched::cons_tres::{AllocError, AllocationResult, ExecutionIdentity, NodeAllocation};
 
 use spur_spank::{SpankContext, SpankHandle, SpankHook, SpankHost};
 
@@ -56,6 +57,7 @@ pub(crate) struct TrackedJob {
     mpi: String,
     /// Run epoch; echoed on completion and guards the grace-period SIGKILL.
     run_attempt: u32,
+    submission_generation: String,
 }
 
 struct CompletedJob {
@@ -63,6 +65,7 @@ struct CompletedJob {
     exit_code: i32,
     signal: i32,
     run_attempt: u32,
+    submission_generation: String,
     rootfs_mode: crate::container::RootfsMode,
     cgroup: Option<std::path::PathBuf>,
     work_dir: String,
@@ -85,11 +88,46 @@ async fn cleanup_completed_job_mpi(job_id: u32, mpi: &str, mpi_host: &MpiPluginH
 }
 
 /// Job ids this node holds, shared with the reporter so heartbeats carry them.
-pub(crate) type RunningJobs = Arc<Mutex<HashMap<u32, TrackedJob>>>;
+pub(crate) struct RunningJobsInner(Mutex<HashMap<u32, TrackedJob>>);
+
+impl std::ops::Deref for RunningJobsInner {
+    type Target = Mutex<HashMap<u32, TrackedJob>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl crate::reporter::HeldJobs for RunningJobsInner {
+    fn held_jobs(&self) -> Vec<spur_proto::proto::RunningJobStatus> {
+        match self.try_lock() {
+            Ok(jobs) => jobs
+                .iter()
+                .map(|(&job_id, tracked)| spur_proto::proto::RunningJobStatus {
+                    job_id,
+                    submission_generation: tracked.submission_generation.clone(),
+                    run_attempt: tracked.run_attempt,
+                    ..Default::default()
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
+pub(crate) type RunningJobs = Arc<RunningJobsInner>;
 
 /// Build an empty running-jobs map to share between the reporter and the agent.
 pub(crate) fn new_running_jobs() -> RunningJobs {
-    Arc::new(Mutex::new(HashMap::new()))
+    Arc::new(RunningJobsInner(Mutex::new(HashMap::new())))
+}
+
+fn tracked_job_matches_execution(
+    tracked: &TrackedJob,
+    submission_generation: &str,
+    run_attempt: u32,
+) -> bool {
+    tracked.submission_generation == submission_generation && tracked.run_attempt == run_attempt
 }
 
 type PmixLaunchSetup = (
@@ -102,21 +140,14 @@ fn start_pmix_launch(
     mpi_host: Arc<MpiPluginHost>,
     proto_plan: &spur_proto::proto::PmixLaunchPlan,
     pmix_prepared: bool,
+    pmix_prepare_token: &str,
     task_offset: u32,
     tasks_on_node: u32,
 ) -> Result<PmixLaunchSetup, Status> {
     let plan = mpi_plugin::plan_from_proto(proto_plan).map_err(Status::failed_precondition)?;
     let guard = if pmix_prepared {
-        match PmixLaunchGuard::join_prepared(mpi_host.clone(), &plan) {
-            Ok(guard) => guard,
-            Err(err) if err.contains("PMIx was not prepared") => {
-                // Step inside a running `--mpi=pmix` batch job: the batch
-                // launch already started/joined this namespace via start().
-                PmixLaunchGuard::start(mpi_host.clone(), &plan)
-                    .map_err(Status::failed_precondition)?
-            }
-            Err(err) => return Err(Status::failed_precondition(err)),
-        }
+        PmixLaunchGuard::join_prepared(mpi_host.clone(), &plan, pmix_prepare_token)
+            .map_err(Status::failed_precondition)?
     } else {
         PmixLaunchGuard::start(mpi_host.clone(), &plan).map_err(Status::failed_precondition)?
     };
@@ -137,6 +168,53 @@ fn start_pmix_launch(
     Ok((guard, plan, per_local_rank_env))
 }
 
+fn batch_pmix_prepare_token(submission_generation: &str, run_attempt: u32) -> String {
+    format!("batch:{submission_generation}:{run_attempt}")
+}
+
+fn step_pmix_prepare_token(submission_generation: &str, run_attempt: u32, step_id: u32) -> String {
+    format!("step:{submission_generation}:{run_attempt}:{step_id}")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PmixPrepareScope {
+    Batch,
+    Step,
+}
+
+fn validate_pmix_prepare_token(
+    submission_generation: &str,
+    run_attempt: u32,
+    prepare_token: &str,
+) -> Result<PmixPrepareScope, Status> {
+    if prepare_token == batch_pmix_prepare_token(submission_generation, run_attempt) {
+        return Ok(PmixPrepareScope::Batch);
+    }
+    let prefix = format!("step:{submission_generation}:{run_attempt}:");
+    let Some(step_id) = prepare_token.strip_prefix(&prefix) else {
+        return Err(Status::invalid_argument(format!(
+            "PMIx prepare token does not belong to run attempt {run_attempt}"
+        )));
+    };
+    let step_id = step_id
+        .parse::<u32>()
+        .map_err(|_| Status::invalid_argument("invalid PMIx step prepare token"))?;
+    if prepare_token != step_pmix_prepare_token(submission_generation, run_attempt, step_id) {
+        return Err(Status::invalid_argument(
+            "non-canonical PMIx step prepare token",
+        ));
+    }
+    Ok(PmixPrepareScope::Step)
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum ActiveProcessKind {
+    Step(u32),
+    Exec(u64),
+}
+
+type ActiveProcessKey = (u32, String, u32, ActiveProcessKind);
+
 #[derive(Debug, Default)]
 struct ActiveStep {
     cancel_requested: bool,
@@ -144,14 +222,34 @@ struct ActiveStep {
 }
 
 struct ActiveStepGuard {
-    steps: Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
-    key: (u32, u32),
+    steps: Arc<Mutex<HashMap<ActiveProcessKey, ActiveStep>>>,
+    changed: Arc<tokio::sync::Notify>,
+    key: ActiveProcessKey,
 }
 
 impl Drop for ActiveStepGuard {
     fn drop(&mut self) {
         if let Ok(mut steps) = self.steps.try_lock() {
             steps.remove(&self.key);
+            self.changed.notify_waiters();
+            return;
+        }
+
+        // Drop cannot await. Defer removal instead of silently leaking the
+        // entry when another task momentarily holds the map lock.
+        let steps = self.steps.clone();
+        let changed = self.changed.clone();
+        let key = self.key.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                steps.lock().await.remove(&key);
+                changed.notify_waiters();
+            });
+        } else {
+            std::thread::spawn(move || {
+                steps.blocking_lock().remove(&key);
+                changed.notify_waiters();
+            });
         }
     }
 }
@@ -182,14 +280,134 @@ fn signal_step_process_group(pid: u32, signal: i32) {
 }
 
 async fn step_cancel_requested(
-    steps: &Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
-    key: (u32, u32),
+    steps: &Arc<Mutex<HashMap<ActiveProcessKey, ActiveStep>>>,
+    key: &ActiveProcessKey,
 ) -> bool {
     steps
         .lock()
         .await
-        .get(&key)
+        .get(key)
         .is_some_and(|step| step.cancel_requested)
+}
+
+async fn request_active_process_termination_shared(
+    active_steps: &Arc<Mutex<HashMap<ActiveProcessKey, ActiveStep>>>,
+    job_id: u32,
+    submission_generation: &str,
+    run_attempt: u32,
+) {
+    let pids = {
+        let mut active = active_steps.lock().await;
+        active
+            .iter_mut()
+            .filter_map(|((active_job, generation, attempt, _), process)| {
+                (*active_job == job_id
+                    && generation == submission_generation
+                    && *attempt == run_attempt)
+                    .then(|| {
+                        process.cancel_requested = true;
+                        process.pid
+                    })
+                    .flatten()
+            })
+            .collect::<Vec<_>>()
+    };
+    for pid in pids {
+        signal_step_process_group(pid, nix::sys::signal::Signal::SIGKILL as i32);
+    }
+}
+
+async fn wait_for_active_process_absence_shared(
+    active_steps: &Arc<Mutex<HashMap<ActiveProcessKey, ActiveStep>>>,
+    active_step_changed: &Arc<tokio::sync::Notify>,
+    job_id: u32,
+    submission_generation: &str,
+    run_attempt: u32,
+) -> Result<(), Status> {
+    tokio::time::timeout(tokio::time::Duration::from_secs(30), async {
+        loop {
+            // Arm before checking. If the last guard exits between these two
+            // operations the notification is retained by this waiter.
+            let changed = active_step_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let remains = active_steps.lock().await.keys().any(
+                |(active_job, generation, attempt, _)| {
+                    *active_job == job_id
+                        && generation == submission_generation
+                        && *attempt == run_attempt
+                },
+            );
+            if !remains {
+                return;
+            }
+            changed.await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        Status::deadline_exceeded(format!(
+            "timed out reaping active processes for job {job_id} execution {submission_generation}/{run_attempt}"
+        ))
+    })
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum StandaloneAllocationEpoch {
+    #[default]
+    NeverSeen,
+    Registered,
+    Cancelled,
+}
+
+#[derive(Debug, Default)]
+struct BatchLaunchEpochState {
+    submission_generation: String,
+    /// Highest launch or guarded-cancel epoch accepted for this job ID.
+    /// A cancel of an absent epoch advances this tombstone so a delayed equal
+    /// LaunchJob cannot appear after cleanup was acknowledged.
+    latest_attempt: u32,
+    /// Exact epoch with a prepared-but-not-yet-joined PMIx namespace. Launch
+    /// may consume equality once; other equal launches remain duplicates.
+    prepared_attempt: Option<u32>,
+    /// Standalone allocations use attempt zero, so the numeric attempt cannot
+    /// distinguish a fresh generation from one whose cleanup already ACKed.
+    standalone: StandaloneAllocationEpoch,
+}
+
+type BatchLaunchEpoch = Arc<Mutex<BatchLaunchEpochState>>;
+type BatchLaunchEpochMap = Arc<StdMutex<HashMap<u32, BatchLaunchEpoch>>>;
+
+fn batch_launch_epoch_from(epochs: &BatchLaunchEpochMap, job_id: u32) -> BatchLaunchEpoch {
+    let mut epochs = epochs
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    epochs
+        .entry(job_id)
+        .or_insert_with(|| Arc::new(Mutex::new(BatchLaunchEpochState::default())))
+        .clone()
+}
+
+/// Tear down a process that launched after its local reservation was reclaimed.
+///
+/// Rootfs and spool paths are keyed only by numeric job ID, so the lifecycle
+/// guard is an explicit argument: callers cannot accidentally move this work to
+/// a detached task that may outlive the fence and delete a replacement run's
+/// files.
+async fn cleanup_reclaimed_launch_under_epoch(
+    _launch_epoch_guard: &mut tokio::sync::MutexGuard<'_, BatchLaunchEpochState>,
+    job_id: u32,
+    mut job: executor::RunningJob,
+    rootfs_mode: &crate::container::RootfsMode,
+) {
+    let _ = job.kill_signal(nix::sys::signal::Signal::SIGKILL);
+    let cgroup = job.take_cgroup();
+    if let Some(ref cgroup) = cgroup {
+        crate::executor::cleanup_cgroup(cgroup);
+    }
+    reap_killed_job(job).await;
+    crate::container::cleanup_rootfs(job_id, rootfs_mode);
+    crate::executor::cleanup_job_spool(job_id);
 }
 
 pub struct AgentService {
@@ -206,11 +424,33 @@ pub struct AgentService {
     device_registry: Arc<Mutex<DeviceRegistry>>,
     /// RPC-driven owner of this node's k0s systemd unit.
     k0s: Arc<crate::cluster::K0sAgent>,
-    /// In-flight srun steps keyed by `(job_id, step_id)`.
-    active_steps: Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
+    /// In-flight srun steps keyed by exact execution and step identity.
+    active_steps: Arc<Mutex<HashMap<ActiveProcessKey, ActiveStep>>>,
+    /// Notified after every active-process removal. Waiters arm a notification
+    /// before checking the map so no completion edge can be lost.
+    active_step_changed: Arc<tokio::sync::Notify>,
+    next_exec_id: AtomicU64,
+    #[cfg(test)]
+    active_step_registered: Arc<tokio::sync::Notify>,
+    /// Persistent per-job launch/cancel fences. The outer map lock is held only
+    /// long enough to clone an Arc; every await and process reap happens under
+    /// the individual job's async mutex, never a fleet-wide lock. State lives
+    /// until spurd restarts; systemd then kills the daemon cgroup and drops old
+    /// RPC connections, so in-memory tombstones are sufficient.
+    batch_launch_epochs: BatchLaunchEpochMap,
 }
 
 impl AgentService {
+    fn require_worker_incarnation(&self, incarnation: &str) -> Result<(), Status> {
+        if incarnation == self.reporter.worker_incarnation {
+            Ok(())
+        } else {
+            Err(Status::failed_precondition(
+                "request targets a different worker incarnation",
+            ))
+        }
+    }
+
     /// Construct with default k0s settings (pinned version, `/usr/local/bin/k0s`). Test-only; the
     /// binary uses `with_cluster_config` to honor the operator's `[cluster]` settings.
     #[cfg(test)]
@@ -305,6 +545,11 @@ impl AgentService {
             device_registry,
             k0s: Arc::new(crate::cluster::K0sAgent::from_config(cluster)),
             active_steps: Arc::new(Mutex::new(HashMap::new())),
+            active_step_changed: Arc::new(tokio::sync::Notify::new()),
+            next_exec_id: AtomicU64::new(1),
+            #[cfg(test)]
+            active_step_registered: Arc::new(tokio::sync::Notify::new()),
+            batch_launch_epochs: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -320,67 +565,121 @@ impl AgentService {
         let spank = self.spank.clone();
         let mpi_host = self.mpi_host.clone();
         let hooks = self.hooks.clone();
+        let worker_incarnation = self.reporter.worker_incarnation.clone();
+        let active_steps = self.active_steps.clone();
+        let active_step_changed = self.active_step_changed.clone();
+        let batch_launch_epochs = self.batch_launch_epochs.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
             loop {
                 interval.tick().await;
-                let mut jobs = running.lock().await;
                 let mut completed: Vec<CompletedJob> = Vec::new();
 
-                for (job_id, tracked) in jobs.iter_mut() {
-                    match tracked.job.try_wait() {
-                        Ok(Some((exit_code, mut signal))) => {
-                            // Disambiguate an OOM kill (cgroup memory.events) from
-                            // a plain SIGKILL by OR'ing a sentinel into the reported
-                            // signal; read before cleanup_cgroup removes the dir.
-                            let cgroup = tracked.job.take_cgroup();
-                            if let Some(ref cg) = cgroup {
-                                if crate::executor::cgroup_oom_killed(cg) {
-                                    warn!(job_id, "job OOM-killed (cgroup oom_kill > 0)");
-                                    signal |= spur_core::job::OOM_SIGNAL_FLAG;
+                // Poll under each numeric job ID's lifecycle fence. Cleanup
+                // paths are keyed by job ID, so the same fence must remain held
+                // until every descendant is reaped and rootfs/spool teardown is
+                // complete; only then may a replacement launch reuse the ID.
+                let job_ids: Vec<u32> = running.lock().await.keys().copied().collect();
+                for job_id in job_ids {
+                    let launch_epoch = batch_launch_epoch_from(&batch_launch_epochs, job_id);
+                    let _launch_epoch_guard = launch_epoch.lock().await;
+
+                    let finished = {
+                        let mut jobs = running.lock().await;
+                        let status = match jobs.get_mut(&job_id) {
+                            Some(tracked) => match tracked.job.try_wait() {
+                                Ok(status) => status,
+                                Err(error) => {
+                                    warn!(job_id, %error, "failed to check job status");
+                                    None
                                 }
-                            }
-                            info!(job_id, exit_code, signal, "job finished");
-                            completed.push(CompletedJob {
-                                job_id: *job_id,
-                                exit_code,
-                                signal,
-                                run_attempt: tracked.run_attempt,
-                                rootfs_mode: tracked.rootfs_mode.clone(),
-                                cgroup,
-                                work_dir: tracked.work_dir.clone(),
-                                uid: tracked.uid,
-                                gid: tracked.gid,
-                                partition: tracked.partition.clone(),
-                                gpu_devices: tracked.gpu_devices.clone(),
-                                cpus: tracked.cpus,
-                                memory_mb: tracked.memory_mb,
-                                nodelist: tracked.nodelist.clone(),
-                                mpi: tracked.mpi.clone(),
-                            });
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            warn!(job_id, error = %e, "failed to check job status");
+                            },
+                            None => None,
+                        };
+                        status.and_then(|(exit_code, signal)| {
+                            jobs.remove(&job_id)
+                                .map(|tracked| (tracked, exit_code, signal))
+                        })
+                    };
+
+                    let Some((mut tracked, exit_code, mut signal)) = finished else {
+                        continue;
+                    };
+
+                    let cgroup = tracked.job.take_cgroup();
+                    if let Some(ref cg) = cgroup {
+                        // Read OOM state before cleanup removes the cgroup.
+                        if crate::executor::cgroup_oom_killed(cg) {
+                            warn!(job_id, "job OOM-killed (cgroup oom_kill > 0)");
+                            signal |= spur_core::job::OOM_SIGNAL_FLAG;
                         }
                     }
-                }
+                    info!(job_id, exit_code, signal, "job finished");
 
-                for c in &completed {
-                    jobs.remove(&c.job_id);
-                    crate::container::cleanup_rootfs(c.job_id, &c.rootfs_mode);
-                    crate::executor::cleanup_job_spool(c.job_id);
+                    let c = CompletedJob {
+                        job_id,
+                        exit_code,
+                        signal,
+                        run_attempt: tracked.run_attempt,
+                        submission_generation: tracked.submission_generation.clone(),
+                        rootfs_mode: tracked.rootfs_mode.clone(),
+                        cgroup,
+                        work_dir: tracked.work_dir.clone(),
+                        uid: tracked.uid,
+                        gid: tracked.gid,
+                        partition: tracked.partition.clone(),
+                        gpu_devices: tracked.gpu_devices.clone(),
+                        cpus: tracked.cpus,
+                        memory_mb: tracked.memory_mb,
+                        nodelist: tracked.nodelist.clone(),
+                        mpi: tracked.mpi.clone(),
+                    };
+
+                    request_active_process_termination_shared(
+                        &active_steps,
+                        job_id,
+                        &c.submission_generation,
+                        c.run_attempt,
+                    )
+                    .await;
                     if let Some(ref cgroup) = c.cgroup {
+                        // Cgroup kill is the backstop for descendants that
+                        // escaped their original process group.
                         crate::executor::cleanup_cgroup(cgroup);
                     }
-                    allocation.lock().await.release_job(c.job_id);
+                    if let Err(error) = wait_for_active_process_absence_shared(
+                        &active_steps,
+                        &active_step_changed,
+                        job_id,
+                        &c.submission_generation,
+                        c.run_attempt,
+                    )
+                    .await
+                    {
+                        error!(job_id, %error, "job descendants did not reap; retaining allocation");
+                        // Preserve an exact tombstone so orphan reconciliation
+                        // cannot release capacity while a child owner remains.
+                        tracked.job = executor::RunningJob::AllocationOnly;
+                        running.lock().await.insert(job_id, tracked);
+                        continue;
+                    }
+
+                    crate::container::cleanup_rootfs(c.job_id, &c.rootfs_mode);
+                    crate::executor::cleanup_job_spool(c.job_id);
+                    allocation.lock().await.release_execution(
+                        c.job_id,
+                        &c.submission_generation,
+                        c.run_attempt,
+                    );
                     cleanup_completed_job_mpi(c.job_id, &c.mpi, &mpi_host).await;
+                    completed.push(c);
                 }
 
                 // Self-heal backstop: reclaim allocations with no tracked,
                 // non-launching job. `jobs` is held so the live set is a
                 // consistent snapshot that can't race a committing launch
                 // (commit_job takes the running lock first).
+                let jobs = running.lock().await;
                 reconcile_orphaned_allocations(&jobs, &mut *allocation.lock().await);
 
                 // Release lock BEFORE network I/O — holding the lock during
@@ -417,6 +716,14 @@ impl AgentService {
                                 "epilog hook failed — requesting node drain"
                             );
                             drain_jobs.insert(c.job_id);
+                            request_node_drain(
+                                &controller_addr,
+                                &local_hostname,
+                                "epilog script failed",
+                                c.job_id,
+                                &worker_incarnation,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -440,7 +747,7 @@ impl AgentService {
                     }
                 }
 
-                for c in &completed {
+                for c in completed {
                     let drain = if drain_jobs.contains(&c.job_id) {
                         Some(DrainRequest {
                             reason: "epilog script failed".into(),
@@ -448,16 +755,23 @@ impl AgentService {
                     } else {
                         None
                     };
-                    report_completion(
-                        &controller_addr,
-                        c.job_id,
-                        c.exit_code,
-                        c.signal,
-                        c.run_attempt,
-                        &local_hostname,
-                        drain.as_ref(),
-                    )
-                    .await;
+                    let controller_addr = controller_addr.clone();
+                    let worker_incarnation = worker_incarnation.clone();
+                    let reporting_node = local_hostname.clone();
+                    tokio::spawn(async move {
+                        report_completion(CompletionReport {
+                            controller_addr: &controller_addr,
+                            job_id: c.job_id,
+                            exit_code: c.exit_code,
+                            signal: c.signal,
+                            run_attempt: c.run_attempt,
+                            submission_generation: &c.submission_generation,
+                            worker_incarnation: &worker_incarnation,
+                            reporting_node: &reporting_node,
+                            drain: drain.as_ref(),
+                        })
+                        .await;
+                    });
                 }
             }
         });
@@ -466,6 +780,18 @@ impl AgentService {
 
 struct DrainRequest {
     reason: String,
+}
+
+struct CompletionReport<'a> {
+    controller_addr: &'a str,
+    job_id: u32,
+    exit_code: i32,
+    signal: i32,
+    run_attempt: u32,
+    submission_generation: &'a str,
+    worker_incarnation: &'a str,
+    reporting_node: &'a str,
+    drain: Option<&'a DrainRequest>,
 }
 
 /// Reclaim a launch reservation that never commits within this bound. Sized
@@ -481,8 +807,16 @@ fn reconcile_orphaned_allocations(
     running: &HashMap<u32, TrackedJob>,
     allocation: &mut NodeAllocation,
 ) {
-    let live: std::collections::HashSet<u32> = running.keys().copied().collect();
-    let reclaimed = allocation.reconcile(&live, std::time::Instant::now(), LAUNCHING_TTL);
+    let live: std::collections::HashSet<ExecutionIdentity> = running
+        .iter()
+        .map(|(&job_id, tracked)| ExecutionIdentity {
+            job_id,
+            submission_generation: tracked.submission_generation.clone(),
+            run_attempt: tracked.run_attempt,
+        })
+        .collect();
+    let reclaimed =
+        allocation.reconcile_executions(&live, std::time::Instant::now(), LAUNCHING_TTL);
     if !reclaimed.is_empty() {
         warn!(
             ?reclaimed,
@@ -497,14 +831,23 @@ fn reconcile_orphaned_allocations(
 struct LaunchReservationGuard {
     allocation: Arc<Mutex<NodeAllocation>>,
     job_id: u32,
+    run_attempt: u32,
+    submission_generation: String,
     armed: bool,
 }
 
 impl LaunchReservationGuard {
-    fn new(allocation: Arc<Mutex<NodeAllocation>>, job_id: u32) -> Self {
+    fn new(
+        allocation: Arc<Mutex<NodeAllocation>>,
+        job_id: u32,
+        submission_generation: String,
+        run_attempt: u32,
+    ) -> Self {
         Self {
             allocation,
             job_id,
+            run_attempt,
+            submission_generation,
             armed: true,
         }
     }
@@ -520,12 +863,18 @@ impl Drop for LaunchReservationGuard {
             return;
         }
         let job_id = self.job_id;
+        let run_attempt = self.run_attempt;
+        let submission_generation = self.submission_generation.clone();
         if let Ok(mut alloc) = self.allocation.try_lock() {
-            alloc.release_job(job_id);
+            alloc.release_execution(job_id, &submission_generation, run_attempt);
         } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let allocation = self.allocation.clone();
             handle.spawn(async move {
-                allocation.lock().await.release_job(job_id);
+                allocation.lock().await.release_execution(
+                    job_id,
+                    &submission_generation,
+                    run_attempt,
+                );
             });
         }
     }
@@ -541,6 +890,7 @@ fn controller_rpc_retryable(status: &tonic::Status) -> bool {
 
 const CONTROLLER_RPC_ATTEMPTS: u32 = 3;
 const CONTROLLER_RPC_RETRY_GAP: std::time::Duration = std::time::Duration::from_secs(1);
+const COMPLETION_RPC_MAX_RETRY_GAP: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A single failed attempt at a controller RPC.
 enum ControllerRpcError {
@@ -592,10 +942,36 @@ where
     }
 }
 
+/// Completion is an exact, idempotent state-machine report. Keep retrying a
+/// transport/transient controller failure for this worker process lifetime so a
+/// short outage cannot strand controller-side capacity. A permanent rejection
+/// still returns immediately because repeating malformed identity cannot help.
+async fn retry_completion_rpc<T, F, Fut>(mut attempt: F) -> Result<T, ControllerRpcError>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: std::future::Future<Output = Result<T, ControllerRpcError>>,
+{
+    let mut attempt_number = 1u32;
+    let mut retry_gap = CONTROLLER_RPC_RETRY_GAP;
+    loop {
+        match attempt(attempt_number).await {
+            Ok(value) => return Ok(value),
+            Err(error) if !error.retryable() => return Err(error),
+            Err(_) => {
+                tokio::time::sleep(retry_gap).await;
+                retry_gap = retry_gap
+                    .saturating_mul(2)
+                    .min(COMPLETION_RPC_MAX_RETRY_GAP);
+                attempt_number = attempt_number.saturating_add(1);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod controller_rpc_tests {
     use super::{
-        controller_rpc_retryable, retry_controller_rpc, ControllerRpcError,
+        controller_rpc_retryable, retry_completion_rpc, retry_controller_rpc, ControllerRpcError,
         CONTROLLER_RPC_ATTEMPTS, CONTROLLER_RPC_RETRY_GAP,
     };
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -688,6 +1064,29 @@ mod controller_rpc_tests {
             (CONTROLLER_RPC_ATTEMPTS - 1) * CONTROLLER_RPC_RETRY_GAP
         );
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn completion_retry_survives_more_than_three_transient_failures() {
+        let calls = AtomicU32::new(0);
+        let start = tokio::time::Instant::now();
+        let result = retry_completion_rpc(|_| {
+            let call = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if call < 4 {
+                    Err(ControllerRpcError::Rpc(Status::unavailable(
+                        "controller unavailable",
+                    )))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+        assert_eq!(start.elapsed(), Duration::from_secs(1 + 2 + 4 + 8));
+    }
 }
 
 /// Reap an already-killed displaced run. Polls `try_wait` so both executor
@@ -696,6 +1095,9 @@ mod controller_rpc_tests {
 /// monitor loop no longer polls it, so without this a killed `Forked` run would
 /// linger as a zombie until spurd exits.
 async fn reap_killed_job(mut job: executor::RunningJob) {
+    if job.is_allocation_only() {
+        return;
+    }
     loop {
         match job.try_wait() {
             Ok(Some(_)) | Err(_) => break,
@@ -781,22 +1183,25 @@ fn inject_script_args(script: &str, args: &[String]) -> Result<String, Status> {
     Ok(format!("{set_line}\n{script}"))
 }
 
-async fn report_completion(
-    controller_addr: &str,
-    job_id: u32,
-    exit_code: i32,
-    signal: i32,
-    run_attempt: u32,
-    reporting_node: &str,
-    drain: Option<&DrainRequest>,
-) {
+async fn report_completion(report: CompletionReport<'_>) {
+    let CompletionReport {
+        controller_addr,
+        job_id,
+        exit_code,
+        signal,
+        run_attempt,
+        submission_generation,
+        worker_incarnation,
+        reporting_node,
+        drain,
+    } = report;
     // Wire `state` is derived from `exit_code` alone (advisory): a signaled job
     // reports Completed/0 because the controller's validator requires
     // state<->exit_code agreement. The controller rederives the true Failed /
     // RaisedSignal outcome from the reported `signal`.
     let state = spur_core::job::JobState::completion_state_for_exit_code(exit_code).to_proto_i32();
 
-    let result = retry_controller_rpc(move |attempt| async move {
+    let result = retry_completion_rpc(move |attempt| async move {
         let channel = spur_client::connect_channel(controller_addr)
             .await
             .map_err(|e| {
@@ -818,6 +1223,9 @@ async fn report_completion(
             drain_reason: drain.as_ref().map(|d| d.reason.clone()).unwrap_or_default(),
             reporting_node: reporting_node.to_string(),
             run_attempt,
+            submission_generation: submission_generation.to_string(),
+            worker_incarnation: worker_incarnation.to_string(),
+            submission_token: String::new(),
         };
         spur_proto::controller_client(channel)
             .report_job_status(req)
@@ -840,13 +1248,6 @@ async fn report_completion(
             exit_code,
             controller = %controller_addr,
             "reported completion to controller"
-        ),
-        Err(e) if e.retryable() => error!(
-            job_id,
-            exit_code,
-            attempts = CONTROLLER_RPC_ATTEMPTS,
-            error = %e,
-            "gave up reporting completion to controller"
         ),
         Err(e) => error!(
             job_id,
@@ -874,7 +1275,13 @@ fn warn_mpi_mpirun_skipped_affinity(job_id: u32, source: &HashMap<String, String
 /// Drain this node without reporting a job completion. The controller's dispatch
 /// path already owns the job's fate, so reporting an exit code here would race it
 /// and could finalize a still-retryable job to Failed, which no requeue recovers.
-async fn request_node_drain(controller_addr: &str, node_name: &str, reason: &str, job_id: u32) {
+async fn request_node_drain(
+    controller_addr: &str,
+    node_name: &str,
+    reason: &str,
+    job_id: u32,
+    worker_incarnation: &str,
+) {
     let result = retry_controller_rpc(move |attempt| async move {
         let channel = spur_client::connect_channel(controller_addr)
             .await
@@ -891,6 +1298,7 @@ async fn request_node_drain(controller_addr: &str, node_name: &str, reason: &str
         let req = DrainNodeRequest {
             name: node_name.to_string(),
             reason: reason.to_string(),
+            worker_incarnation: worker_incarnation.to_string(),
         };
         spur_proto::controller_client(channel)
             .drain_node(req)
@@ -950,9 +1358,34 @@ impl SlurmAgent for AgentService {
         let array_job_id = req.array_job_id;
         let array_task_id = req.array_task_id;
         let run_attempt = req.run_attempt;
+        self.require_worker_incarnation(&req.worker_incarnation)?;
+        if req.submission_generation.is_empty() {
+            return Err(Status::invalid_argument("missing submission generation"));
+        }
+        let submission_generation = req.submission_generation.clone();
+        if req.pmix_prepared
+            && req.pmix_prepare_token
+                != batch_pmix_prepare_token(&submission_generation, run_attempt)
+        {
+            return Err(Status::invalid_argument(format!(
+                "job {job_id} PMIx launch token does not match batch run attempt {run_attempt}"
+            )));
+        }
         let spec = req
             .spec
             .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
+        // Hold this exact job's fence until every success/error cleanup path
+        // returns. A retry observes either a fully tracked older launch or a
+        // fully released failed launch, never the in-between state.
+        let launch_epoch = self.batch_launch_epoch(job_id);
+        let mut launch_epoch_guard = launch_epoch.lock().await;
+        self.prepare_batch_launch_epoch(
+            job_id,
+            &submission_generation,
+            run_attempt,
+            &mut launch_epoch_guard,
+        )
+        .await?;
 
         info!(
             job_id,
@@ -1190,9 +1623,16 @@ impl SlurmAgent for AgentService {
                 self.mpi_host.clone(),
                 proto,
                 req.pmix_prepared,
+                &req.pmix_prepare_token,
                 task_offset,
                 tasks_per_node,
             )?;
+            if launch_epoch_guard.prepared_attempt == Some(run_attempt) {
+                // Consume the prepare only after the exact PMIx join succeeds.
+                // Earlier launch setup failures remain recoverable by an
+                // exact-attempt CancelJob.
+                launch_epoch_guard.prepared_attempt = None;
+            }
             pmix_guard = Some(guard);
             pmix_plan = Some(plan);
             pmix_per_local_rank_env = per_local_rank_env;
@@ -1236,13 +1676,24 @@ impl SlurmAgent for AgentService {
             };
 
         let (alloc_result, allocated_device_ids) = self
-            .allocate_local_resources(job_id, &spec, req.allocated.as_ref())
+            .allocate_local_resources(
+                job_id,
+                &submission_generation,
+                run_attempt,
+                &spec,
+                req.allocated.as_ref(),
+            )
             .await?;
         apply_cpu_allocation_environment(&mut env, &alloc_result);
 
         // Release the reservation on any exit before commit, including a
         // cancelled launch future; disarmed once committed to `running`.
-        let mut reservation_guard = LaunchReservationGuard::new(self.allocation.clone(), job_id);
+        let mut reservation_guard = LaunchReservationGuard::new(
+            self.allocation.clone(),
+            job_id,
+            submission_generation.clone(),
+            run_attempt,
+        );
 
         let injection = {
             let reg = self.device_registry.lock().await;
@@ -1363,14 +1814,18 @@ impl SlurmAgent for AgentService {
         };
 
         match executor::launch_job(&launch_cfg, (*self.spank).as_ref()).await {
-            Ok(mut result) => {
+            Ok(result) => {
                 pmix_guard.as_mut().map(PmixLaunchGuard::disarm);
                 let mut jobs = self.running.lock().await;
                 // Commit the reservation: the job now has a tracked process, so
                 // it is no longer exempt from reconcile. Take the running lock
                 // first so a job is never briefly absent from BOTH `running` and
                 // `launching` (which would let reconcile reclaim it).
-                let committed = self.allocation.lock().await.commit_job(job_id);
+                let committed = self.allocation.lock().await.commit_execution(
+                    job_id,
+                    &submission_generation,
+                    run_attempt,
+                );
                 reservation_guard.disarm();
 
                 // reconcile reclaimed the reservation mid-launch (launch exceeded
@@ -1387,25 +1842,18 @@ impl SlurmAgent for AgentService {
                     if let Err(e) = self.mpi_host.stop_pmix_server(job_id) {
                         warn!(job_id, error = %e, "PMIx stop failed after reclaimed reservation");
                     }
-                    let _ = result.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
-                    let cgroup = result.job.take_cgroup();
-                    let running = self.running.clone();
-                    tokio::spawn(async move {
-                        reap_killed_job(result.job).await;
-                        // rootfs/spool paths are derived from job_id, so the
-                        // controller re-dispatching the same id to this node
-                        // would reuse them. Skip that cleanup if a live run for
-                        // job_id reappeared, or this reap would delete its files.
-                        // The cgroup handle is this launch's own, so it is always
-                        // safe to release.
-                        if !running.lock().await.contains_key(&job_id) {
-                            crate::container::cleanup_rootfs(job_id, &rootfs_mode);
-                            crate::executor::cleanup_job_spool(job_id);
-                        }
-                        if let Some(ref cg) = cgroup {
-                            crate::executor::cleanup_cgroup(cg);
-                        }
-                    });
+                    // Rootfs and spool paths are keyed by numeric job ID, not
+                    // execution identity. Finish teardown synchronously while
+                    // this exact job's launch-epoch lock is still held. An
+                    // asynchronous reap could otherwise run after a replacement
+                    // launch and delete the replacement's files.
+                    cleanup_reclaimed_launch_under_epoch(
+                        &mut launch_epoch_guard,
+                        job_id,
+                        result.job,
+                        &rootfs_mode,
+                    )
+                    .await;
                     return Ok(Response::new(LaunchJobResponse {
                         success: false,
                         error: "reservation reclaimed during launch".into(),
@@ -1444,6 +1892,7 @@ impl SlurmAgent for AgentService {
                         nodelist: launch_cfg.nodelist,
                         mpi: spec.mpi.clone(),
                         run_attempt,
+                        submission_generation,
                     },
                 );
                 drop(jobs);
@@ -1480,8 +1929,16 @@ impl SlurmAgent for AgentService {
                 if let Some(drain_reason) = drain_reason {
                     let controller = self.reporter.controller_addr.clone();
                     let node_name = self.reporter.hostname.clone();
+                    let worker_incarnation = self.reporter.worker_incarnation.clone();
                     tokio::spawn(async move {
-                        request_node_drain(&controller, &node_name, &drain_reason, job_id).await;
+                        request_node_drain(
+                            &controller,
+                            &node_name,
+                            &drain_reason,
+                            job_id,
+                            &worker_incarnation,
+                        )
+                        .await;
                     });
                 }
 
@@ -1501,6 +1958,10 @@ impl SlurmAgent for AgentService {
         request: Request<PreparePmixRequest>,
     ) -> Result<Response<PreparePmixResponse>, Status> {
         let req = request.into_inner();
+        self.require_worker_incarnation(&req.worker_incarnation)?;
+        if req.submission_generation.is_empty() {
+            return Err(Status::invalid_argument("missing submission generation"));
+        }
         let plan = req
             .pmix_plan
             .as_ref()
@@ -1508,11 +1969,125 @@ impl SlurmAgent for AgentService {
             .and_then(|proto| {
                 mpi_plugin::plan_from_proto(proto).map_err(Status::invalid_argument)
             })?;
-        match self.mpi_host.prepare_pmix_server(&plan, req.run_attempt) {
-            Ok(()) => Ok(Response::new(PreparePmixResponse {
-                success: true,
-                error: String::new(),
-            })),
+        let scope = validate_pmix_prepare_token(
+            &req.submission_generation,
+            req.run_attempt,
+            &req.prepare_token,
+        )?;
+        if scope == PmixPrepareScope::Batch && req.run_attempt == 0 {
+            return Err(Status::invalid_argument(
+                "batch PMIx prepare requires a nonzero run attempt",
+            ));
+        }
+        if scope == PmixPrepareScope::Step {
+            // Step prepares have their own exact token and never consume the
+            // one-shot batch LaunchJob epoch. A different prepared token is a
+            // conflict rather than an implicit replacement.
+            let launch_epoch = self.batch_launch_epoch(req.job_id);
+            let _launch_epoch_guard = launch_epoch.lock().await;
+            let jobs = self.running.lock().await;
+            let tracked = jobs.get(&req.job_id).ok_or_else(|| {
+                Status::not_found(format!("job {} not running on this node", req.job_id))
+            })?;
+            if tracked.run_attempt != req.run_attempt
+                || tracked.submission_generation != req.submission_generation
+            {
+                return Err(Status::failed_precondition(format!(
+                    "job {} PMIx step prepare attempt {} is stale; worker owns {}",
+                    req.job_id, req.run_attempt, tracked.run_attempt
+                )));
+            }
+            drop(jobs);
+            return Ok(Response::new(
+                match self.mpi_host.prepare_pmix_server(&plan, &req.prepare_token) {
+                    Ok(()) => PreparePmixResponse {
+                        success: true,
+                        error: String::new(),
+                    },
+                    Err(error) => PreparePmixResponse {
+                        success: false,
+                        error,
+                    },
+                },
+            ));
+        }
+        let launch_epoch = self.batch_launch_epoch(req.job_id);
+        let mut epoch = launch_epoch.lock().await;
+        if epoch.submission_generation != req.submission_generation {
+            if self.running.lock().await.contains_key(&req.job_id) {
+                return Ok(Response::new(PreparePmixResponse {
+                    success: false,
+                    error: format!("job {} still has a different generation", req.job_id),
+                }));
+            }
+            if let Some(old_prepared) = epoch.prepared_attempt.take() {
+                let old_prepare_token =
+                    batch_pmix_prepare_token(&epoch.submission_generation, old_prepared);
+                if let Err(error) = self
+                    .mpi_host
+                    .release_prepared_pmix_token(req.job_id, &old_prepare_token)
+                {
+                    epoch.prepared_attempt = Some(old_prepared);
+                    return Ok(Response::new(PreparePmixResponse {
+                        success: false,
+                        error: format!("failed to release prior generation PMIx prepare: {error}"),
+                    }));
+                }
+            }
+            epoch.submission_generation = req.submission_generation.clone();
+            epoch.latest_attempt = 0;
+            epoch.prepared_attempt = None;
+            epoch.standalone = StandaloneAllocationEpoch::NeverSeen;
+        }
+        if req.run_attempt < epoch.latest_attempt
+            || (req.run_attempt == epoch.latest_attempt
+                && epoch.prepared_attempt != Some(req.run_attempt))
+        {
+            return Ok(Response::new(PreparePmixResponse {
+                success: false,
+                error: format!(
+                    "job {} PMIx prepare epoch {} is stale or already consumed",
+                    req.job_id, req.run_attempt
+                ),
+            }));
+        }
+        if req.run_attempt > epoch.latest_attempt {
+            if let Some(tracked_attempt) = self
+                .running
+                .lock()
+                .await
+                .get(&req.job_id)
+                .map(|tracked| tracked.run_attempt)
+            {
+                return Ok(Response::new(PreparePmixResponse {
+                    success: false,
+                    error: format!(
+                        "job {} still tracks launch epoch {}; cancel it before preparing {}",
+                        req.job_id, tracked_attempt, req.run_attempt
+                    ),
+                }));
+            }
+            if let Some(old_prepared) = epoch.prepared_attempt.take() {
+                let old_prepare_token =
+                    batch_pmix_prepare_token(&epoch.submission_generation, old_prepared);
+                if let Err(error) = self
+                    .mpi_host
+                    .release_prepared_pmix_token(req.job_id, &old_prepare_token)
+                {
+                    warn!(job_id = req.job_id, old_prepared, %error, "failed to replace PMIx prepare");
+                }
+            }
+        }
+
+        match self.mpi_host.prepare_pmix_server(&plan, &req.prepare_token) {
+            Ok(()) => {
+                epoch.latest_attempt = epoch.latest_attempt.max(req.run_attempt);
+                epoch.prepared_attempt = Some(req.run_attempt);
+                Ok(Response::new(PreparePmixResponse {
+                    success: true,
+                    error: String::new(),
+                }))
+            }
             Err(err) => Ok(Response::new(PreparePmixResponse {
                 success: false,
                 error: err,
@@ -1524,9 +2099,37 @@ impl SlurmAgent for AgentService {
         &self,
         request: Request<ReleasePmixRequest>,
     ) -> Result<Response<ReleasePmixResponse>, Status> {
-        let job_id = request.into_inner().job_id;
-        if let Err(err) = self.mpi_host.release_prepared_pmix(job_id) {
-            warn!(job_id, error = %err, "PMIx prepare release failed");
+        let req = request.into_inner();
+        self.require_worker_incarnation(&req.worker_incarnation)?;
+        if req.submission_generation.is_empty() {
+            return Err(Status::invalid_argument("missing submission generation"));
+        }
+        let job_id = req.job_id;
+        let scope = validate_pmix_prepare_token(
+            &req.submission_generation,
+            req.run_attempt,
+            &req.prepare_token,
+        )?;
+        if scope == PmixPrepareScope::Batch && req.run_attempt == 0 {
+            return Err(Status::invalid_argument(
+                "batch PMIx release requires a nonzero run attempt",
+            ));
+        }
+        self.mpi_host
+            .release_prepared_pmix_token(job_id, &req.prepare_token)
+            .map_err(Status::internal)?;
+        if scope == PmixPrepareScope::Batch {
+            let launch_epoch = self.batch_launch_epoch(job_id);
+            let mut epoch = launch_epoch.lock().await;
+            if epoch.submission_generation != req.submission_generation {
+                return Err(Status::failed_precondition(
+                    "PMIx release generation is stale",
+                ));
+            }
+            if epoch.prepared_attempt == Some(req.run_attempt) {
+                epoch.prepared_attempt = None;
+            }
+            epoch.latest_attempt = epoch.latest_attempt.max(req.run_attempt);
         }
         Ok(Response::new(ReleasePmixResponse {}))
     }
@@ -1536,28 +2139,118 @@ impl SlurmAgent for AgentService {
         request: Request<AgentCancelJobRequest>,
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
+        self.require_worker_incarnation(&req.worker_incarnation)?;
+        if req.submission_generation.is_empty() {
+            return Err(Status::invalid_argument("missing submission generation"));
+        }
         let job_id = req.job_id;
+        let launch_epoch = self.batch_launch_epoch(job_id);
+        let mut launch_epoch_guard = launch_epoch.lock().await;
 
-        if req.signal > 0 {
-            self.send_explicit_signal(job_id, req.signal).await;
+        let control_mode = AgentJobControlMode::try_from(req.control_mode)
+            .map_err(|_| Status::invalid_argument("invalid agent job control mode"))?;
+        if control_mode == AgentJobControlMode::AgentJobControlSignalOnly {
+            if req.signal <= 0 {
+                return Err(Status::invalid_argument(
+                    "SIGNAL_ONLY requires a positive signal",
+                ));
+            }
+            let jobs = self.running.lock().await;
+            let tracked = jobs.get(&job_id).ok_or_else(|| {
+                Status::not_found(format!("job {job_id} is not running on this worker"))
+            })?;
+            if tracked.submission_generation != req.submission_generation
+                || tracked.run_attempt != req.run_attempt
+            {
+                return Err(Status::failed_precondition(
+                    "signal targets a stale execution",
+                ));
+            }
+            if tracked.run_attempt == 0 || tracked.job.is_allocation_only() {
+                return Err(Status::failed_precondition(
+                    "SIGNAL_ONLY is not supported for standalone allocations",
+                ));
+            }
+            let signal = nix::sys::signal::Signal::try_from(req.signal)
+                .map_err(|_| Status::invalid_argument("invalid signal"))?;
+            tracked
+                .job
+                .kill_signal(signal)
+                .map_err(|error| Status::internal(error.to_string()))?;
+            return Ok(Response::new(()));
+        }
+        if control_mode != AgentJobControlMode::AgentJobControlTerminateAndReap {
+            return Err(Status::invalid_argument(
+                "exact cancel requires an explicit control mode",
+            ));
+        }
+        if !launch_epoch_guard.submission_generation.is_empty()
+            && launch_epoch_guard.submission_generation != req.submission_generation
+        {
+            return Err(Status::failed_precondition("cancel generation is stale"));
+        }
+        launch_epoch_guard.submission_generation = req.submission_generation.clone();
+        launch_epoch_guard.latest_attempt = launch_epoch_guard.latest_attempt.max(req.run_attempt);
+        if req.run_attempt == 0 {
+            launch_epoch_guard.standalone = StandaloneAllocationEpoch::Cancelled;
+        }
+        let batch_prepare_token =
+            batch_pmix_prepare_token(&req.submission_generation, req.run_attempt);
+        self.mpi_host
+            .release_prepared_pmix_token(job_id, &batch_prepare_token)
+            .map_err(Status::internal)?;
+        if launch_epoch_guard.prepared_attempt == Some(req.run_attempt) {
+            launch_epoch_guard.prepared_attempt = None;
+        }
+        let matching = {
+            let mut jobs = self.running.lock().await;
+            match jobs.get(&job_id) {
+                Some(tracked)
+                    if tracked.run_attempt == req.run_attempt
+                        && tracked.submission_generation == req.submission_generation =>
+                {
+                    jobs.remove(&job_id)
+                }
+                Some(tracked) => {
+                    launch_epoch_guard.latest_attempt =
+                        launch_epoch_guard.latest_attempt.max(tracked.run_attempt);
+                    debug!(
+                        job_id,
+                        requested_attempt = req.run_attempt,
+                        tracked_attempt = tracked.run_attempt,
+                        "ignoring guarded cancel for a different launch epoch"
+                    );
+                    None
+                }
+                None => None,
+            }
+        };
+        if let Some(tracked) = matching {
+            info!(
+                job_id,
+                run_attempt = req.run_attempt,
+                signal = req.signal,
+                "killing and reaping epoch before acknowledging guarded cancel"
+            );
+            self.kill_and_cleanup_tracked_job(job_id, tracked).await?;
         } else {
-            self.graceful_cancel(job_id).await;
+            self.terminate_and_reap_active_processes(
+                job_id,
+                &req.submission_generation,
+                req.run_attempt,
+            )
+            .await?;
+            self.allocation.lock().await.release_execution(
+                job_id,
+                &req.submission_generation,
+                req.run_attempt,
+            );
+            debug!(
+                job_id,
+                run_attempt = req.run_attempt,
+                "guarded cancel tombstoned an absent/different launch epoch"
+            );
         }
-
-        // The signal paths only act on a running job; release a still-launching
-        // reservation so a cancel-during-eviction doesn't strand it until the
-        // TTL. Hold the running lock across the release (matching launch_job's
-        // commit order) so this can't free a job that just became running.
-        let jobs = self.running.lock().await;
-        if !jobs.contains_key(&job_id) {
-            self.allocation.lock().await.release_job(job_id);
-        }
-        drop(jobs);
-
-        if let Err(err) = self.mpi_host.release_prepared_pmix(job_id) {
-            warn!(job_id, error = %err, "PMIx prepare release on cancel failed");
-        }
-
         Ok(Response::new(()))
     }
 
@@ -1566,7 +2259,31 @@ impl SlurmAgent for AgentService {
         request: Request<CancelStepRequest>,
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
-        let step_key = (req.job_id, req.step_id);
+        self.require_worker_incarnation(&req.worker_incarnation)?;
+        if req.submission_generation.is_empty() {
+            return Err(Status::invalid_argument("missing submission generation"));
+        }
+        let launch_epoch = self.batch_launch_epoch(req.job_id);
+        let _launch_epoch_guard = launch_epoch.lock().await;
+        let jobs = self.running.lock().await;
+        let tracked = jobs.get(&req.job_id).ok_or_else(|| {
+            Status::not_found(format!("job {} not running on this node", req.job_id))
+        })?;
+        if tracked.run_attempt != req.run_attempt
+            || tracked.submission_generation != req.submission_generation
+        {
+            return Err(Status::failed_precondition(format!(
+                "job {} step cancel attempt {} is stale; worker owns {}",
+                req.job_id, req.run_attempt, tracked.run_attempt
+            )));
+        }
+        drop(jobs);
+        let step_key = (
+            req.job_id,
+            req.submission_generation.clone(),
+            req.run_attempt,
+            ActiveProcessKind::Step(req.step_id),
+        );
         let signal = if req.signal > 0 {
             req.signal
         } else {
@@ -1593,7 +2310,30 @@ impl SlurmAgent for AgentService {
         request: Request<AgentSuspendJobRequest>,
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
-        self.suspend_signal(req.job_id, req.resume).await;
+        self.require_worker_incarnation(&req.worker_incarnation)?;
+        if req.submission_generation.is_empty() {
+            return Err(Status::invalid_argument("missing submission generation"));
+        }
+        let jobs = self.running.lock().await;
+        let tracked = jobs.get(&req.job_id).ok_or_else(|| {
+            Status::not_found(format!("job {} not running on this node", req.job_id))
+        })?;
+        if tracked.submission_generation != req.submission_generation
+            || tracked.run_attempt != req.run_attempt
+        {
+            return Err(Status::failed_precondition(
+                "suspend/resume targets a stale execution",
+            ));
+        }
+        let signal = if req.resume {
+            nix::sys::signal::Signal::SIGCONT
+        } else {
+            nix::sys::signal::Signal::SIGSTOP
+        };
+        tracked
+            .job
+            .kill_signal(signal)
+            .map_err(|error| Status::internal(error.to_string()))?;
         Ok(Response::new(()))
     }
 
@@ -1616,14 +2356,46 @@ impl SlurmAgent for AgentService {
     ) -> Result<Response<ExecInJobResponse>, Status> {
         let req = request.into_inner();
 
+        self.require_worker_incarnation(&req.worker_incarnation)?;
+        if req.submission_generation.is_empty() {
+            return Err(Status::invalid_argument("missing submission generation"));
+        }
+        if req.command.is_empty() {
+            return Err(Status::invalid_argument("no command specified"));
+        }
+
+        let launch_epoch = self.batch_launch_epoch(req.job_id);
+        let launch_epoch_guard = launch_epoch.lock().await;
+
         self.check_job_access(req.job_id, &req.user, "exec into")
             .await?;
 
         let entry = self.job_entry(req.job_id).await?;
-
-        if req.command.is_empty() {
-            return Err(Status::invalid_argument("no command specified"));
+        if entry.submission_generation != req.submission_generation
+            || entry.run_attempt != req.run_attempt
+        {
+            return Err(Status::failed_precondition(
+                "exec targets a stale execution",
+            ));
         }
+
+        let exec_key = (
+            req.job_id,
+            req.submission_generation.clone(),
+            req.run_attempt,
+            ActiveProcessKind::Exec(self.next_exec_id.fetch_add(1, Ordering::Relaxed)),
+        );
+        self.active_steps
+            .lock()
+            .await
+            .insert(exec_key.clone(), ActiveStep::default());
+        #[cfg(test)]
+        self.active_step_registered.notify_one();
+        let _active_exec_guard = ActiveStepGuard {
+            steps: self.active_steps.clone(),
+            changed: self.active_step_changed.clone(),
+            key: exec_key.clone(),
+        };
 
         info!(
             job_id = req.job_id,
@@ -1634,7 +2406,7 @@ impl SlurmAgent for AgentService {
 
         let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(entry.uid, entry.gid);
 
-        let mut cmd = if entry.has_namespaces() && entry.pid > 0 {
+        let (mut cmd, apply_priv_in_child) = if entry.has_namespaces() && entry.pid > 0 {
             let mut c = tokio::process::Command::new("nsenter");
             for arg in entry.nsenter_args() {
                 c.arg(arg);
@@ -1649,29 +2421,63 @@ impl SlurmAgent for AgentService {
             for arg in &req.command[1..] {
                 c.arg(arg);
             }
-            c
+            (c, false)
         } else {
             let mut c = tokio::process::Command::new(&req.command[0]);
             for arg in &req.command[1..] {
                 c.arg(arg);
             }
             c.current_dir(&entry.work_dir);
-            if let Some(pd) = priv_drop {
-                unsafe {
-                    c.pre_exec(move || {
-                        pd.apply()
-                            .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
-                        Ok(())
-                    });
-                }
-            }
-            c
+            (c, true)
         };
+        let child_priv_drop = apply_priv_in_child.then_some(priv_drop).flatten();
+        let cgroup_procs = entry
+            .cgroup_path
+            .as_deref()
+            .map(crate::cgroup::open_procs_path)
+            .transpose()
+            .map_err(|error| Status::internal(format!("open job cgroup.procs: {error:#}")))?;
+        use std::os::fd::AsRawFd;
+        let cgroup_procs_fd = cgroup_procs.as_ref().map(AsRawFd::as_raw_fd);
+        unsafe {
+            cmd.pre_exec(move || {
+                if let Some(procs) = cgroup_procs_fd {
+                    crate::cgroup::attach_current_process(procs)?;
+                }
+                if let Some(ref pd) = child_priv_drop {
+                    pd.apply()
+                        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+                }
+                Ok(())
+            });
+        }
+        cmd.process_group(0);
+        let mut child = cmd
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| Status::internal(format!("nsenter failed: {e}")))?;
+        if let Some(pid) = child.id() {
+            let cancel_now = {
+                let mut active = self.active_steps.lock().await;
+                if let Some(process) = active.get_mut(&exec_key) {
+                    process.pid = Some(pid);
+                    process.cancel_requested
+                } else {
+                    true
+                }
+            };
+            if cancel_now {
+                signal_step_process_group(pid, nix::sys::signal::Signal::SIGKILL as i32);
+                let _ = child.kill().await;
+            }
+        }
+        drop(launch_epoch_guard);
 
-        let output = cmd
-            .output()
+        let output = child
+            .wait_with_output()
             .await
-            .map_err(|e| Status::internal(format!("nsenter failed: {}", e)))?;
+            .map_err(|e| Status::internal(format!("nsenter failed: {e}")))?;
 
         Ok(Response::new(ExecInJobResponse {
             success: output.status.success(),
@@ -1688,8 +2494,57 @@ impl SlurmAgent for AgentService {
         request: Request<RegisterJobAllocationRequest>,
     ) -> Result<Response<RegisterJobAllocationResponse>, Status> {
         let req = request.into_inner();
+        self.require_worker_incarnation(&req.worker_incarnation)?;
         if req.job_id == 0 {
             return Err(Status::invalid_argument("job_id is required"));
+        }
+        if req.submission_generation.is_empty() {
+            return Err(Status::invalid_argument("missing submission generation"));
+        }
+        if req.run_attempt != 0 {
+            return Err(Status::invalid_argument(
+                "standalone allocation registration must use run attempt 0",
+            ));
+        }
+
+        // Serialize standalone registration with exact cancel and every process
+        // creation path. Attempt zero needs an explicit tombstone: a numeric
+        // max-attempt fence cannot distinguish "never registered" from "cleanup
+        // already acknowledged".
+        let launch_epoch = self.batch_launch_epoch(req.job_id);
+        let mut launch_epoch_guard = launch_epoch.lock().await;
+        if launch_epoch_guard.submission_generation != req.submission_generation {
+            if self
+                .active_steps
+                .lock()
+                .await
+                .keys()
+                .any(|(active_job, _, _, _)| *active_job == req.job_id)
+                || self.running.lock().await.contains_key(&req.job_id)
+            {
+                return Err(Status::failed_precondition(format!(
+                    "job {} still owns a different submission generation",
+                    req.job_id
+                )));
+            }
+            if let Some(prepared_attempt) = launch_epoch_guard.prepared_attempt.take() {
+                let old_prepare_token = batch_pmix_prepare_token(
+                    &launch_epoch_guard.submission_generation,
+                    prepared_attempt,
+                );
+                self.mpi_host
+                    .release_prepared_pmix_token(req.job_id, &old_prepare_token)
+                    .map_err(Status::internal)?;
+            }
+            launch_epoch_guard.submission_generation = req.submission_generation.clone();
+            launch_epoch_guard.latest_attempt = 0;
+            launch_epoch_guard.standalone = StandaloneAllocationEpoch::NeverSeen;
+        }
+        if launch_epoch_guard.standalone == StandaloneAllocationEpoch::Cancelled {
+            return Err(Status::failed_precondition(format!(
+                "job {} standalone allocation was already cancelled",
+                req.job_id
+            )));
         }
 
         let allocated = req.allocated.as_ref();
@@ -1712,16 +2567,67 @@ impl SlurmAgent for AgentService {
         // insert (running → allocation, as in commit) so the job is never
         // committed-but-absent-from-running, which the reclaim reads as stale.
         let mut jobs = self.running.lock().await;
-        if jobs.contains_key(&req.job_id) {
-            return Err(Status::already_exists(format!(
-                "job {} already registered on this node",
+        if let Some(existing) = jobs.get(&req.job_id) {
+            let mut existing_gpu_ids = existing.gpu_devices.clone();
+            existing_gpu_ids.sort_unstable();
+            let mut requested_gpu_ids = controller_gpu_ids.clone();
+            requested_gpu_ids.sort_unstable();
+            let exact_retry = existing.submission_generation == req.submission_generation
+                && existing.run_attempt == req.run_attempt
+                && matches!(&existing.job, executor::RunningJob::AllocationOnly)
+                && existing.cpus == cpus
+                && existing.memory_mb == memory_mb
+                && existing_gpu_ids == requested_gpu_ids
+                && existing.partition == req.partition
+                && existing.nodelist == req.nodelist
+                && existing.work_dir == req.work_dir
+                && existing.uid == req.uid
+                && existing.gid == req.gid
+                && existing.user == req.user
+                && existing.mpi == req.mpi;
+            if exact_retry {
+                let owner = self.allocation.lock().await.owner_identity(req.job_id);
+                if owner.as_ref().is_none_or(|identity| {
+                    identity.submission_generation != req.submission_generation
+                        || identity.run_attempt != req.run_attempt
+                }) {
+                    return Err(Status::failed_precondition(format!(
+                        "job {} tracked allocation has no matching resource owner",
+                        req.job_id
+                    )));
+                }
+                return Ok(Response::new(RegisterJobAllocationResponse {}));
+            }
+            if existing.submission_generation == req.submission_generation
+                && existing.run_attempt == req.run_attempt
+            {
+                return Err(Status::failed_precondition(format!(
+                    "job {} allocation retry does not match the registered payload",
+                    req.job_id
+                )));
+            }
+            return Err(Status::failed_precondition(format!(
+                "job {} is owned by a different execution",
+                req.job_id
+            )));
+        }
+        if launch_epoch_guard.standalone == StandaloneAllocationEpoch::Registered {
+            return Err(Status::failed_precondition(format!(
+                "job {} standalone registration lost its tracked allocation",
                 req.job_id
             )));
         }
         {
             let mut alloc = self.allocation.lock().await;
             alloc
-                .allocate_for_job(req.job_id, cpus, memory_mb, &controller_gpu_ids)
+                .allocate_for_execution(
+                    req.job_id,
+                    &req.submission_generation,
+                    req.run_attempt,
+                    cpus,
+                    memory_mb,
+                    &controller_gpu_ids,
+                )
                 .map_err(|e| match e {
                     AllocError::GpusUnavailable => Status::resource_exhausted(
                         "controller-allocated GPUs unavailable on this node",
@@ -1731,7 +2637,7 @@ impl SlurmAgent for AgentService {
                         req.job_id
                     )),
                 })?;
-            let _ = alloc.commit_job(req.job_id);
+            let _ = alloc.commit_execution(req.job_id, &req.submission_generation, req.run_attempt);
         }
 
         info!(
@@ -1763,11 +2669,11 @@ impl SlurmAgent for AgentService {
                 memory_mb,
                 nodelist: req.nodelist,
                 mpi: req.mpi,
-                // srun allocation-only jobs use their own cancel lifecycle;
-                // epoch 0 leaves the stale-report guard disabled for them.
-                run_attempt: 0,
+                run_attempt: req.run_attempt,
+                submission_generation: req.submission_generation,
             },
         );
+        launch_epoch_guard.standalone = StandaloneAllocationEpoch::Registered;
         drop(jobs);
 
         Ok(Response::new(RegisterJobAllocationResponse {}))
@@ -1781,6 +2687,10 @@ impl SlurmAgent for AgentService {
         request: Request<RunCommandRequest>,
     ) -> Result<Response<RunCommandResponse>, Status> {
         let req = request.into_inner();
+        self.require_worker_incarnation(&req.worker_incarnation)?;
+        if req.submission_generation.is_empty() {
+            return Err(Status::invalid_argument("missing submission generation"));
+        }
         if req.command.is_empty() {
             return Err(Status::invalid_argument("no command specified"));
         }
@@ -1795,6 +2705,7 @@ impl SlurmAgent for AgentService {
         if job_id == 0 {
             return Err(Status::invalid_argument("job_id is required"));
         }
+        let run_attempt = req.run_attempt;
 
         let num_tasks = req.num_tasks.max(1);
         let step_num_tasks = if req.step_num_tasks > 0 {
@@ -1803,27 +2714,26 @@ impl SlurmAgent for AgentService {
             num_tasks
         };
         let step_id = req.step_id;
-        let step_key = (job_id, step_id);
-        {
-            self.active_steps
-                .lock()
-                .await
-                .insert(step_key, ActiveStep::default());
-        }
-        let _active_step_guard = ActiveStepGuard {
-            steps: self.active_steps.clone(),
-            key: step_key,
-        };
+        let launch_epoch = self.batch_launch_epoch(job_id);
+        let launch_epoch_guard = launch_epoch.lock().await;
 
         // No retry on a miss: a step only reaches a Running job, i.e. one every
         // node already confirmed via LaunchJob (confirm_dispatch_on_nodes) — so a
         // miss is a wrong job/node pairing, not a launch race. The one uncovered
         // case is a spurd restart mid-job, which starts `running` empty.
-        let (gpu_devices, partition, cpus, memory_mb, nodelist, job_mpi) = {
+        let (gpu_devices, partition, cpus, memory_mb, nodelist, job_mpi, cgroup_path) = {
             let jobs = self.running.lock().await;
             let tracked = jobs.get(&job_id).ok_or_else(|| {
                 Status::not_found(format!("job {} not running on this node", job_id))
             })?;
+            if tracked.run_attempt != run_attempt
+                || tracked.submission_generation != req.submission_generation
+            {
+                return Err(Status::failed_precondition(format!(
+                    "job {job_id} run attempt {run_attempt} is stale; worker owns {}",
+                    tracked.run_attempt
+                )));
+            }
             let nodelist = if tracked.nodelist.is_empty() {
                 hostname::get()
                     .map(|h| h.to_string_lossy().to_string())
@@ -1838,8 +2748,40 @@ impl SlurmAgent for AgentService {
                 tracked.memory_mb,
                 nodelist,
                 tracked.mpi.clone(),
+                tracked.job.cgroup_path(),
             )
         };
+        if req.pmix_prepared
+            && req.pmix_prepare_token
+                != step_pmix_prepare_token(&req.submission_generation, run_attempt, step_id)
+        {
+            return Err(Status::invalid_argument(format!(
+                "job {job_id} step {step_id} PMIx token does not match run attempt {run_attempt}"
+            )));
+        }
+        let step_key = (
+            job_id,
+            req.submission_generation.clone(),
+            run_attempt,
+            ActiveProcessKind::Step(step_id),
+        );
+        {
+            let mut active_steps = self.active_steps.lock().await;
+            if active_steps.contains_key(&step_key) {
+                return Err(Status::already_exists(format!(
+                    "job {job_id} step {step_id} already has an active command"
+                )));
+            }
+            active_steps.insert(step_key.clone(), ActiveStep::default());
+        }
+        #[cfg(test)]
+        self.active_step_registered.notify_one();
+        let _active_step_guard = ActiveStepGuard {
+            steps: self.active_steps.clone(),
+            changed: self.active_step_changed.clone(),
+            key: step_key.clone(),
+        };
+        drop(launch_epoch_guard);
 
         let agent_hostname = self.reporter.hostname.clone();
         let node_names: Vec<&str> = nodelist.split(',').filter(|s| !s.is_empty()).collect();
@@ -1929,6 +2871,7 @@ impl SlurmAgent for AgentService {
                 self.mpi_host.clone(),
                 proto,
                 req.pmix_prepared,
+                &req.pmix_prepare_token,
                 req.task_offset,
                 num_tasks,
             )?;
@@ -1937,7 +2880,7 @@ impl SlurmAgent for AgentService {
             pmix_per_local_rank_env = per_local_rank_env;
         }
 
-        if step_cancel_requested(&self.active_steps, step_key).await {
+        if step_cancel_requested(&self.active_steps, &step_key).await {
             return Ok(Response::new(cancelled_step_response()));
         }
 
@@ -2038,7 +2981,7 @@ impl SlurmAgent for AgentService {
         }
         let _pmix_step_guard = pmix_step_guard;
 
-        if step_cancel_requested(&self.active_steps, step_key).await {
+        if step_cancel_requested(&self.active_steps, &step_key).await {
             return Ok(Response::new(cancelled_step_response()));
         }
 
@@ -2052,8 +2995,18 @@ impl SlurmAgent for AgentService {
 
         let memlock = self.memlock;
         let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(req.uid, req.gid);
+        let cgroup_procs = cgroup_path
+            .as_deref()
+            .map(crate::cgroup::open_procs_path)
+            .transpose()
+            .map_err(|error| Status::internal(format!("open job cgroup.procs: {error:#}")))?;
+        use std::os::fd::AsRawFd;
+        let cgroup_procs_fd = cgroup_procs.as_ref().map(AsRawFd::as_raw_fd);
         unsafe {
             cmd.pre_exec(move || {
+                if let Some(procs) = cgroup_procs_fd {
+                    crate::cgroup::attach_current_process(procs)?;
+                }
                 crate::executor::apply_memlock(memlock);
                 if let Some(ref pd) = priv_drop {
                     pd.apply()
@@ -2134,6 +3087,11 @@ impl SlurmAgent for AgentService {
         let req = request.into_inner();
         let job_id = req.job_id;
 
+        self.require_worker_incarnation(&req.worker_incarnation)?;
+        if req.submission_generation.is_empty() {
+            return Err(Status::invalid_argument("missing submission generation"));
+        }
+
         self.check_job_access(job_id, &req.user, "read output of")
             .await?;
 
@@ -2145,12 +3103,23 @@ impl SlurmAgent for AgentService {
         let file_path = {
             let jobs = self.running.lock().await;
             match jobs.get(&job_id) {
-                Some(tracked) => {
+                Some(tracked)
+                    if tracked_job_matches_execution(
+                        tracked,
+                        &req.submission_generation,
+                        req.run_attempt,
+                    ) =>
+                {
                     if req.stream == "stderr" {
                         tracked.stderr_path.clone()
                     } else {
                         tracked.stdout_path.clone()
                     }
+                }
+                Some(_) => {
+                    return Err(Status::failed_precondition(
+                        "output stream targets a stale execution",
+                    ));
                 }
                 None => {
                     return Err(Status::not_found(format!(
@@ -2163,6 +3132,8 @@ impl SlurmAgent for AgentService {
 
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         let running = self.running.clone();
+        let submission_generation = req.submission_generation;
+        let run_attempt = req.run_attempt;
 
         tokio::spawn(async move {
             // Wait for the output file to appear
@@ -2193,7 +3164,9 @@ impl SlurmAgent for AgentService {
                 }
 
                 // Check if job is still running
-                let still_running = running.lock().await.contains_key(&job_id);
+                let still_running = running.lock().await.get(&job_id).is_some_and(|tracked| {
+                    tracked_job_matches_execution(tracked, &submission_generation, run_attempt)
+                });
                 if !still_running {
                     // Final read to get any remaining output
                     if let Ok(data) = tokio::fs::read(&file_path).await {
@@ -2244,11 +3217,55 @@ impl SlurmAgent for AgentService {
                 ));
             }
         };
+        self.require_worker_incarnation(&init.worker_incarnation)?;
+        if init.submission_generation.is_empty() {
+            return Err(Status::invalid_argument("missing submission generation"));
+        }
+        let launch_epoch = self.batch_launch_epoch(init.job_id);
+        let launch_epoch_guard = launch_epoch.lock().await;
 
         self.check_job_access(init.job_id, &init.user, "attach to")
             .await?;
 
+        {
+            let jobs = self.running.lock().await;
+            let tracked = jobs.get(&init.job_id).ok_or_else(|| {
+                Status::not_found(format!("job {} not running on this node", init.job_id))
+            })?;
+            if tracked.run_attempt != init.run_attempt
+                || tracked.submission_generation != init.submission_generation
+            {
+                return Err(Status::failed_precondition(format!(
+                    "job {} interactive attempt {} is stale; worker owns {}",
+                    init.job_id, init.run_attempt, tracked.run_attempt
+                )));
+            }
+        }
+
         let entry = self.job_entry(init.job_id).await?;
+        let step_key = (
+            init.job_id,
+            init.submission_generation.clone(),
+            init.run_attempt,
+            ActiveProcessKind::Step(init.step_id),
+        );
+        {
+            let mut active_steps = self.active_steps.lock().await;
+            if active_steps.contains_key(&step_key) {
+                return Err(Status::already_exists(format!(
+                    "job {} step {} already has an active session",
+                    init.job_id, init.step_id
+                )));
+            }
+            active_steps.insert(step_key.clone(), ActiveStep::default());
+        }
+        #[cfg(test)]
+        self.active_step_registered.notify_one();
+        let active_step_guard = ActiveStepGuard {
+            steps: self.active_steps.clone(),
+            changed: self.active_step_changed.clone(),
+            key: step_key.clone(),
+        };
 
         let winsize = init.winsize.as_ref().map(|ws| PtyWinSize {
             rows: ws.rows as u16,
@@ -2261,6 +3278,10 @@ impl SlurmAgent for AgentService {
 
         let (master_fd, child, child_pid) =
             Self::spawn_pty_in_job(&entry, &argv, init.job_id, winsize.as_ref())?;
+        if let Some(active) = self.active_steps.lock().await.get_mut(&step_key) {
+            active.pid = Some(child_pid as u32);
+        }
+        drop(launch_epoch_guard);
 
         info!(
             job_id = init.job_id,
@@ -2272,7 +3293,12 @@ impl SlurmAgent for AgentService {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<InteractiveOutput, Status>>(64);
 
         tokio::spawn(Self::run_pty_bridge(
-            master_fd, child, child_pid, inbound, tx,
+            master_fd,
+            child,
+            child_pid,
+            inbound,
+            tx,
+            Some(active_step_guard),
         ));
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -2449,9 +3475,209 @@ impl SlurmAgent for AgentService {
 }
 
 impl AgentService {
+    /// Get the persistent per-job lifecycle fence without retaining the outer
+    /// map lock across an await.
+    fn batch_launch_epoch(&self, job_id: u32) -> Arc<Mutex<BatchLaunchEpochState>> {
+        batch_launch_epoch_from(&self.batch_launch_epochs, job_id)
+    }
+
+    /// Fence stale/equal launch RPCs and synchronously reap a tracked older
+    /// epoch before its job ID, spool, cgroup, PMIx state, or GPU allocation is
+    /// reused. The controller reserves epochs durably before fanout, so a retry
+    /// always arrives with a strictly newer nonzero value.
+    async fn prepare_batch_launch_epoch(
+        &self,
+        job_id: u32,
+        submission_generation: &str,
+        run_attempt: u32,
+        epoch: &mut BatchLaunchEpochState,
+    ) -> Result<(), Status> {
+        if run_attempt == 0 {
+            return Err(Status::invalid_argument(
+                "batch LaunchJob requires a nonzero run attempt",
+            ));
+        }
+
+        if self
+            .active_steps
+            .lock()
+            .await
+            .keys()
+            .any(|(active_job, _, _, _)| *active_job == job_id)
+        {
+            return Err(Status::failed_precondition(format!(
+                "job {job_id} still has an active step; cannot replace its allocation"
+            )));
+        }
+
+        if epoch.submission_generation != submission_generation {
+            if let Some(tracked) = self.running.lock().await.get(&job_id) {
+                return Err(Status::failed_precondition(format!(
+                    "job {job_id} still owns generation {}",
+                    tracked.submission_generation
+                )));
+            }
+            if let Some(prepared_attempt) = epoch.prepared_attempt.take() {
+                let old_prepare_token =
+                    batch_pmix_prepare_token(&epoch.submission_generation, prepared_attempt);
+                self.mpi_host
+                    .release_prepared_pmix_token(job_id, &old_prepare_token)
+                    .map_err(Status::internal)?;
+            }
+            epoch.submission_generation = submission_generation.to_string();
+            epoch.latest_attempt = 0;
+            epoch.standalone = StandaloneAllocationEpoch::NeverSeen;
+        }
+
+        if run_attempt == epoch.latest_attempt && epoch.prepared_attempt == Some(run_attempt) {
+            // PreparePmix established the exact epoch under this same gate.
+            // The caller consumes it only after the PMIx join succeeds.
+            return Ok(());
+        }
+        if run_attempt <= epoch.latest_attempt {
+            return Err(Status::already_exists(format!(
+                "job {job_id} launch epoch {run_attempt} is stale or duplicated"
+            )));
+        }
+        if let Some(prepared_attempt) = epoch.prepared_attempt.take() {
+            let prepare_token =
+                batch_pmix_prepare_token(&epoch.submission_generation, prepared_attempt);
+            if let Err(error) = self
+                .mpi_host
+                .release_prepared_pmix_token(job_id, &prepare_token)
+            {
+                warn!(job_id, prepared_attempt, %error, "failed to release older PMIx prepare");
+            }
+        }
+        epoch.latest_attempt = run_attempt;
+
+        let old = {
+            let mut running = self.running.lock().await;
+            match running.get(&job_id) {
+                Some(tracked) if tracked.run_attempt >= run_attempt => {
+                    epoch.latest_attempt = epoch.latest_attempt.max(tracked.run_attempt);
+                    return Err(Status::already_exists(format!(
+                        "job {job_id} already tracks launch epoch {}",
+                        tracked.run_attempt
+                    )));
+                }
+                Some(_) => running.remove(&job_id),
+                None => None,
+            }
+        };
+
+        if let Some(old) = old {
+            warn!(
+                job_id,
+                old_attempt = old.run_attempt,
+                new_attempt = run_attempt,
+                "synchronously replacing an older batch launch epoch"
+            );
+            self.kill_and_cleanup_tracked_job(job_id, old).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Synchronously establish absence of one tracked batch process. Callers
+    /// hold only this job's lifecycle gate, so a slow kernel/process teardown
+    /// stalls its own recovery but never unrelated launches on the worker.
+    async fn kill_and_cleanup_tracked_job(
+        &self,
+        job_id: u32,
+        mut tracked: TrackedJob,
+    ) -> Result<(), Status> {
+        let run_attempt = tracked.run_attempt;
+        let submission_generation = tracked.submission_generation.clone();
+        self.request_active_process_termination(job_id, &submission_generation, run_attempt)
+            .await;
+        let _ = tracked.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
+        let cgroup = tracked.job.take_cgroup();
+        let rootfs_mode = tracked.rootfs_mode.clone();
+        let mpi = tracked.mpi.clone();
+        // The cgroup is the backstop for descendants that daemonized into a
+        // different process group. Kill it before waiting for child owners.
+        if let Some(ref cg) = cgroup {
+            crate::executor::cleanup_cgroup(cg);
+        }
+        let job = std::mem::replace(&mut tracked.job, executor::RunningJob::AllocationOnly);
+        reap_killed_job(job).await;
+        if let Err(error) = self
+            .wait_for_active_process_absence(job_id, &submission_generation, run_attempt)
+            .await
+        {
+            // Keep an exact allocation-only tombstone so the monitor's orphan
+            // reconciler cannot free capacity after a failed cleanup ACK. A
+            // retry can finish the exact cleanup and release it.
+            self.running.lock().await.insert(job_id, tracked);
+            return Err(error);
+        }
+        crate::container::cleanup_rootfs(job_id, &rootfs_mode);
+        crate::executor::cleanup_job_spool(job_id);
+        self.allocation
+            .lock()
+            .await
+            .release_execution(job_id, &submission_generation, run_attempt);
+        cleanup_completed_job_mpi(job_id, &mpi, &self.mpi_host).await;
+        Ok(())
+    }
+
+    /// Synchronously terminate every step, interactive session, and auxiliary
+    /// exec owned by one exact execution. The per-job launch epoch is held by
+    /// the caller, preventing registration of a new process while this drains.
+    /// Allocation release and the cancel ACK must happen only after all child
+    /// owners have reaped and their guards have disappeared.
+    async fn request_active_process_termination(
+        &self,
+        job_id: u32,
+        submission_generation: &str,
+        run_attempt: u32,
+    ) {
+        request_active_process_termination_shared(
+            &self.active_steps,
+            job_id,
+            submission_generation,
+            run_attempt,
+        )
+        .await;
+    }
+
+    async fn wait_for_active_process_absence(
+        &self,
+        job_id: u32,
+        submission_generation: &str,
+        run_attempt: u32,
+    ) -> Result<(), Status> {
+        wait_for_active_process_absence_shared(
+            &self.active_steps,
+            &self.active_step_changed,
+            job_id,
+            submission_generation,
+            run_attempt,
+        )
+        .await
+    }
+
+    async fn terminate_and_reap_active_processes(
+        &self,
+        job_id: u32,
+        submission_generation: &str,
+        run_attempt: u32,
+    ) -> Result<(), Status> {
+        self.request_active_process_termination(job_id, submission_generation, run_attempt)
+            .await;
+        self.wait_for_active_process_absence(job_id, submission_generation, run_attempt)
+            .await
+    }
+
+    #[cfg(test)]
     async fn drop_tracked_job(&self, job_id: u32) {
-        if self.running.lock().await.remove(&job_id).is_some() {
-            self.allocation.lock().await.release_job(job_id);
+        if let Some(tracked) = self.running.lock().await.remove(&job_id) {
+            self.allocation.lock().await.release_execution(
+                job_id,
+                &tracked.submission_generation,
+                tracked.run_attempt,
+            );
             if let Err(e) = self.mpi_host.stop_pmix_server(job_id) {
                 warn!(job_id, error = %e, "PMIx stop failed on job drop");
             }
@@ -2462,6 +3688,8 @@ impl AgentService {
     async fn allocate_local_resources(
         &self,
         job_id: u32,
+        submission_generation: &str,
+        run_attempt: u32,
         spec: &JobSpec,
         allocated: Option<&ResourceAllocations>,
     ) -> Result<(AllocationResult, Vec<u32>), Status> {
@@ -2483,7 +3711,14 @@ impl AgentService {
         // Hold running across the reclaim (running-then-allocation, as in commit)
         // so a concurrent commit can't make a live owner look stale.
         let running = self.running.lock().await;
-        let live: std::collections::HashSet<u32> = running.keys().copied().collect();
+        let live: std::collections::HashSet<ExecutionIdentity> = running
+            .iter()
+            .map(|(&job_id, tracked)| ExecutionIdentity {
+                job_id,
+                submission_generation: tracked.submission_generation.clone(),
+                run_attempt: tracked.run_attempt,
+            })
+            .collect();
 
         let mut alloc = self.allocation.lock().await;
 
@@ -2492,8 +3727,10 @@ impl AgentService {
         } else {
             0
         };
-        let result = match alloc.allocate_for_job(
+        let result = match alloc.allocate_for_execution(
             job_id,
+            submission_generation,
+            run_attempt,
             cpus,
             spec.memory_per_node_mb,
             &controller_gpu_ids,
@@ -2502,8 +3739,8 @@ impl AgentService {
             Err(AllocError::GpusUnavailable) => {
                 // A conflicting owner absent from the live set is stale (the
                 // controller only re-launches after freeing it); reclaim and retry.
-                let stale: Vec<u32> = alloc
-                    .conflicting_owners(&controller_gpu_ids)
+                let stale: Vec<ExecutionIdentity> = alloc
+                    .conflicting_owner_executions(&controller_gpu_ids)
                     .into_iter()
                     .filter(|owner| !live.contains(owner))
                     .collect();
@@ -2515,11 +3752,17 @@ impl AgentService {
                         "reclaiming stale GPU owners no longer running, then retrying dispatch"
                     );
                     for owner in &stale {
-                        alloc.release_job(*owner);
+                        alloc.release_execution(
+                            owner.job_id,
+                            &owner.submission_generation,
+                            owner.run_attempt,
+                        );
                     }
                 }
-                match alloc.allocate_for_job(
+                match alloc.allocate_for_execution(
                     job_id,
+                    submission_generation,
+                    run_attempt,
                     cpus,
                     spec.memory_per_node_mb,
                     &controller_gpu_ids,
@@ -2576,6 +3819,7 @@ impl AgentService {
     }
 
     /// Send a user-specified signal to a running job.
+    #[cfg(test)]
     async fn send_explicit_signal(&self, job_id: u32, signal: i32) {
         let is_allocation_only = {
             let jobs = self.running.lock().await;
@@ -2598,6 +3842,7 @@ impl AgentService {
     }
 
     /// Freeze (SIGSTOP) or thaw (SIGCONT) a running job's process(es).
+    #[cfg(test)]
     async fn suspend_signal(&self, job_id: u32, resume: bool) {
         let jobs = self.running.lock().await;
         let Some(tracked) = jobs.get(&job_id) else {
@@ -2613,6 +3858,7 @@ impl AgentService {
     }
 
     /// SIGTERM now, escalate to SIGKILL after a 5-second grace period.
+    #[cfg(test)]
     async fn graceful_cancel(&self, job_id: u32) {
         let is_allocation_only = {
             let jobs = self.running.lock().await;
@@ -2689,6 +3935,9 @@ impl AgentService {
             uid: tracked.uid,
             gid: tracked.gid,
             work_dir: tracked.work_dir.clone(),
+            cgroup_path: tracked.job.cgroup_path(),
+            submission_generation: tracked.submission_generation.clone(),
+            run_attempt: tracked.run_attempt,
         })
     }
 
@@ -2700,6 +3949,7 @@ impl AgentService {
         child_pid: i32,
         mut inbound: S,
         tx: tokio::sync::mpsc::Sender<Result<InteractiveOutput, Status>>,
+        _active_step_guard: Option<ActiveStepGuard>,
     ) where
         S: tokio_stream::Stream<Item = Result<InteractiveInput, Status>> + Unpin + Send,
     {
@@ -2946,9 +4196,19 @@ impl AgentService {
             slave: slave.as_raw_fd(),
         };
         let priv_drop_for_child = if apply_priv_in_child { priv_drop } else { None };
+        let cgroup_procs = entry
+            .cgroup_path
+            .as_deref()
+            .map(crate::cgroup::open_procs_path)
+            .transpose()
+            .map_err(|error| Status::internal(format!("open job cgroup.procs: {error:#}")))?;
+        let cgroup_procs_fd = cgroup_procs.as_ref().map(AsRawFd::as_raw_fd);
         unsafe {
             cmd.pre_exec(move || {
                 raw.wire()?;
+                if let Some(procs) = cgroup_procs_fd {
+                    crate::cgroup::attach_current_process(procs)?;
+                }
                 if let Some(ref pd) = priv_drop_for_child {
                     pd.apply()
                         .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
@@ -3042,6 +4302,7 @@ impl TrackedJob {
             nodelist: String::new(),
             mpi: String::new(),
             run_attempt: 0,
+            submission_generation: "test-generation".into(),
         }
     }
 }
@@ -3056,9 +4317,20 @@ impl AgentService {
         self.allocation.lock().await.free_gpus(None)
     }
 
-    async fn register_test_step(&self, job_id: u32, step_id: u32, pid: Option<u32>) {
+    async fn register_test_step(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        step_id: u32,
+        pid: Option<u32>,
+    ) {
         self.active_steps.lock().await.insert(
-            (job_id, step_id),
+            (
+                job_id,
+                "test-generation".into(),
+                run_attempt,
+                ActiveProcessKind::Step(step_id),
+            ),
             ActiveStep {
                 cancel_requested: false,
                 pid,
@@ -3066,27 +4338,30 @@ impl AgentService {
         );
     }
 
-    async fn step_cancel_requested(&self, job_id: u32, step_id: u32) -> bool {
+    async fn step_cancel_requested(&self, job_id: u32, run_attempt: u32, step_id: u32) -> bool {
         self.active_steps
             .lock()
             .await
-            .get(&(job_id, step_id))
+            .get(&(
+                job_id,
+                "test-generation".into(),
+                run_attempt,
+                ActiveProcessKind::Step(step_id),
+            ))
             .is_some_and(|step| step.cancel_requested)
     }
 
-    async fn wait_for_active_step(&self, job_id: u32, step_id: u32) {
-        for _ in 0..100 {
-            if self
-                .active_steps
-                .lock()
-                .await
-                .contains_key(&(job_id, step_id))
-            {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        panic!("step ({job_id}, {step_id}) was not registered");
+    async fn wait_for_active_step(&self, job_id: u32, run_attempt: u32, step_id: u32) {
+        self.active_step_registered.notified().await;
+        assert!(
+            self.active_steps.lock().await.contains_key(&(
+                job_id,
+                "test-generation".into(),
+                run_attempt,
+                ActiveProcessKind::Step(step_id),
+            )),
+            "step ({job_id}, {run_attempt}, {step_id}) was not registered"
+        );
     }
 }
 
@@ -3178,6 +4453,15 @@ mod tests {
         (svc, job_id)
     }
 
+    fn exact_run_command_request(
+        svc: &AgentService,
+        mut request: RunCommandRequest,
+    ) -> Request<RunCommandRequest> {
+        request.submission_generation = "test-generation".into();
+        request.worker_incarnation = svc.reporter.worker_incarnation.clone();
+        Request::new(request)
+    }
+
     fn test_gpu_registry() -> DeviceRegistry {
         use spur_devices::cdi::cache::CdiCache;
         use spur_devices::{GresCache, GresEntry};
@@ -3249,6 +4533,9 @@ mod tests {
         let resp = svc
             .launch_job(Request::new(LaunchJobRequest {
                 job_id: 7,
+                submission_generation: "test-generation".into(),
+                run_attempt: 1,
+                worker_incarnation: svc.reporter.worker_incarnation.clone(),
                 spec: Some(JobSpec {
                     name: "prolog-fail".into(),
                     script: "#!/bin/bash\ntrue\n".into(),
@@ -3294,6 +4581,9 @@ mod tests {
         let resp = svc
             .launch_job(Request::new(LaunchJobRequest {
                 job_id: 8,
+                submission_generation: "test-generation".into(),
+                run_attempt: 1,
+                worker_incarnation: svc.reporter.worker_incarnation.clone(),
                 spec: Some(JobSpec {
                     name: "prolog-missing".into(),
                     script: "#!/bin/bash\ntrue\n".into(),
@@ -3336,6 +4626,9 @@ mod tests {
             job_id: 42,
             command: vec!["echo".into(), "hello".into()],
             user: "testuser".into(),
+            submission_generation: "test-generation".into(),
+            run_attempt: 0,
+            worker_incarnation: svc.reporter.worker_incarnation.clone(),
         });
 
         let result = svc.exec_in_job(req).await;
@@ -3355,6 +4648,9 @@ mod tests {
             job_id: 999,
             command: vec!["echo".into()],
             user: "testuser".into(),
+            submission_generation: "test-generation".into(),
+            run_attempt: 0,
+            worker_incarnation: svc.reporter.worker_incarnation.clone(),
         });
 
         let err = svc.exec_in_job(req).await.unwrap_err();
@@ -3377,6 +4673,9 @@ mod tests {
                 job_id: 43,
                 command: vec!["whoami".into()],
                 user: "intruder".into(),
+                submission_generation: "test-generation".into(),
+                run_attempt: 0,
+                worker_incarnation: svc.reporter.worker_incarnation.clone(),
             }))
             .await
             .expect_err("a non-owner must not exec inside another user's job");
@@ -3400,6 +4699,9 @@ mod tests {
                 job_id: 44,
                 stream: "stdout".into(),
                 user: "intruder".into(),
+                submission_generation: "test-generation".into(),
+                run_attempt: 0,
+                worker_incarnation: svc.reporter.worker_incarnation.clone(),
             }))
             .await
             .expect_err("a non-owner must not read another user's job output");
@@ -3425,12 +4727,99 @@ mod tests {
                 job_id: 45,
                 command: vec!["echo".into(), "hello".into()],
                 user: "testuser".into(),
+                submission_generation: "test-generation".into(),
+                run_attempt: 0,
+                worker_incarnation: svc.reporter.worker_incarnation.clone(),
             }))
             .await
             .err()
             .map(|e| e.code());
 
         assert_ne!(code, Some(tonic::Code::PermissionDenied));
+    }
+
+    #[tokio::test]
+    async fn terminate_and_reap_kills_and_awaits_long_lived_exec() {
+        let svc = Arc::new(AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(test_gpu_registry())),
+            spur_core::config::MemlockLimit::Unlimited,
+        ));
+        let job_id = 48;
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.gpu_devices = vec![0];
+        svc.insert_test_job(job_id, tracked).await;
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_execution(job_id, "test-generation", 0, 1, 0, &[0])
+            .expect("allocate GPU");
+        svc.allocation
+            .lock()
+            .await
+            .commit_execution(job_id, "test-generation", 0);
+
+        let exec = {
+            let svc = svc.clone();
+            tokio::spawn(async move {
+                svc.exec_in_job(Request::new(ExecInJobRequest {
+                    job_id,
+                    command: vec!["sleep".into(), "3600".into()],
+                    user: "testuser".into(),
+                    submission_generation: "test-generation".into(),
+                    run_attempt: 0,
+                    worker_incarnation: svc.reporter.worker_incarnation.clone(),
+                }))
+                .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let live_exec = svc.active_steps.lock().await.iter().any(|(key, process)| {
+                    matches!(key.3, ActiveProcessKind::Exec(_)) && process.pid.is_some()
+                });
+                if live_exec {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("exec must reach live-pid state");
+
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id,
+            signal: 9,
+            run_attempt: 0,
+            submission_generation: "test-generation".into(),
+            worker_incarnation: svc.reporter.worker_incarnation.clone(),
+            control_mode: AgentJobControlMode::AgentJobControlTerminateAndReap as i32,
+        }))
+        .await
+        .expect("cancel exact execution");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), exec)
+            .await
+            .expect("exec owner must reap before cancel ACK")
+            .expect("exec task join")
+            .expect("exec RPC completes after cancellation");
+        assert!(svc.active_steps.lock().await.is_empty());
+        assert_eq!(svc.free_gpu_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn output_stream_execution_predicate_ends_on_numeric_job_id_replacement() {
+        let old = TrackedJob::dummy(0);
+        assert!(tracked_job_matches_execution(&old, "test-generation", 0));
+
+        let mut replacement = TrackedJob::dummy(0);
+        replacement.submission_generation = "replacement-generation".into();
+        replacement.run_attempt = 1;
+        assert!(
+            !tracked_job_matches_execution(&replacement, "test-generation", 0),
+            "an old stream must EOF instead of following replacement output"
+        );
     }
 
     /// `interactive_session` (the `sattach` and `srun --pty` path) gates on
@@ -3498,15 +4887,18 @@ mod tests {
     #[tokio::test]
     async fn run_command_executes_simple_command() {
         let (svc, job_id) = run_command_test_setup().await;
-        let req = Request::new(RunCommandRequest {
-            command: vec!["echo".into(), "hello-from-agent".into()],
-            uid: 0,
-            gid: 0,
-            work_dir: String::new(),
-            environment: HashMap::new(),
-            job_id,
-            ..Default::default()
-        });
+        let req = exact_run_command_request(
+            &svc,
+            RunCommandRequest {
+                command: vec!["echo".into(), "hello-from-agent".into()],
+                uid: 0,
+                gid: 0,
+                work_dir: String::new(),
+                environment: HashMap::new(),
+                job_id,
+                ..Default::default()
+            },
+        );
         let resp = svc.run_command(req).await.unwrap().into_inner();
         assert_eq!(resp.exit_code, 0);
         assert_eq!(resp.stdout.trim(), "hello-from-agent");
@@ -3516,15 +4908,18 @@ mod tests {
     #[tokio::test]
     async fn run_command_propagates_nonzero_exit_code() {
         let (svc, job_id) = run_command_test_setup().await;
-        let req = Request::new(RunCommandRequest {
-            command: vec!["false".into()],
-            uid: 0,
-            gid: 0,
-            work_dir: String::new(),
-            environment: HashMap::new(),
-            job_id,
-            ..Default::default()
-        });
+        let req = exact_run_command_request(
+            &svc,
+            RunCommandRequest {
+                command: vec!["false".into()],
+                uid: 0,
+                gid: 0,
+                work_dir: String::new(),
+                environment: HashMap::new(),
+                job_id,
+                ..Default::default()
+            },
+        );
         let resp = svc.run_command(req).await.unwrap().into_inner();
         assert_eq!(resp.exit_code, 1, "false exits 1");
     }
@@ -3534,15 +4929,18 @@ mod tests {
         let (svc, job_id) = run_command_test_setup().await;
         let mut env = HashMap::new();
         env.insert("SPUR_TEST_VAR".into(), "step-dispatched".into());
-        let req = Request::new(RunCommandRequest {
-            command: vec!["/bin/sh".into(), "-c".into(), "echo $SPUR_TEST_VAR".into()],
-            uid: 0,
-            gid: 0,
-            work_dir: String::new(),
-            environment: env,
-            job_id,
-            ..Default::default()
-        });
+        let req = exact_run_command_request(
+            &svc,
+            RunCommandRequest {
+                command: vec!["/bin/sh".into(), "-c".into(), "echo $SPUR_TEST_VAR".into()],
+                uid: 0,
+                gid: 0,
+                work_dir: String::new(),
+                environment: env,
+                job_id,
+                ..Default::default()
+            },
+        );
         let resp = svc.run_command(req).await.unwrap().into_inner();
         assert_eq!(resp.exit_code, 0);
         assert_eq!(resp.stdout.trim(), "step-dispatched");
@@ -3556,15 +4954,18 @@ mod tests {
             Arc::new(Mutex::new(DeviceRegistry::new())),
             spur_core::config::MemlockLimit::Unlimited,
         );
-        let req = Request::new(RunCommandRequest {
-            command: vec![],
-            uid: 0,
-            gid: 0,
-            work_dir: String::new(),
-            environment: HashMap::new(),
-            job_id: 0,
-            ..Default::default()
-        });
+        let req = exact_run_command_request(
+            &svc,
+            RunCommandRequest {
+                command: vec![],
+                uid: 0,
+                gid: 0,
+                work_dir: String::new(),
+                environment: HashMap::new(),
+                job_id: 0,
+                ..Default::default()
+            },
+        );
         let err = svc.run_command(req).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
@@ -3577,15 +4978,18 @@ mod tests {
             Arc::new(Mutex::new(DeviceRegistry::new())),
             spur_core::config::MemlockLimit::Unlimited,
         );
-        let req = Request::new(RunCommandRequest {
-            command: vec!["echo".into(), "hi".into()],
-            uid: 0,
-            gid: 0,
-            work_dir: String::new(),
-            environment: HashMap::new(),
-            job_id: 0,
-            ..Default::default()
-        });
+        let req = exact_run_command_request(
+            &svc,
+            RunCommandRequest {
+                command: vec!["echo".into(), "hi".into()],
+                uid: 0,
+                gid: 0,
+                work_dir: String::new(),
+                environment: HashMap::new(),
+                job_id: 0,
+                ..Default::default()
+            },
+        );
         let err = svc.run_command(req).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
@@ -3598,17 +5002,51 @@ mod tests {
             Arc::new(Mutex::new(DeviceRegistry::new())),
             spur_core::config::MemlockLimit::Unlimited,
         );
-        let req = Request::new(RunCommandRequest {
-            command: vec!["echo".into(), "hi".into()],
-            uid: 0,
-            gid: 0,
-            work_dir: String::new(),
-            environment: HashMap::new(),
-            job_id: 999,
-            ..Default::default()
-        });
+        let req = exact_run_command_request(
+            &svc,
+            RunCommandRequest {
+                command: vec!["echo".into(), "hi".into()],
+                uid: 0,
+                gid: 0,
+                work_dir: String::new(),
+                environment: HashMap::new(),
+                job_id: 999,
+                ..Default::default()
+            },
+        );
         let err = svc.run_command(req).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn run_command_rejects_stale_job_attempt() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 101;
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = 2;
+        svc.insert_test_job(job_id, tracked).await;
+
+        let error = svc
+            .run_command(exact_run_command_request(
+                &svc,
+                RunCommandRequest {
+                    command: vec!["echo".into(), "must-not-run".into()],
+                    job_id,
+                    run_attempt: 1,
+                    step_id: 4,
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect_err("an old step RPC cannot enter the replacement run");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(svc.active_steps.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -3622,15 +5060,18 @@ mod tests {
         let tmp = std::env::temp_dir();
         // Resolve symlinks (e.g., macOS /tmp -> /private/tmp).
         let tmp_canonical = std::fs::canonicalize(&tmp).unwrap_or(tmp.clone());
-        let req = Request::new(RunCommandRequest {
-            command: vec!["pwd".into()],
-            uid: 0,
-            gid: 0,
-            work_dir: tmp_canonical.to_string_lossy().into_owned(),
-            environment: HashMap::new(),
-            job_id,
-            ..Default::default()
-        });
+        let req = exact_run_command_request(
+            &svc,
+            RunCommandRequest {
+                command: vec!["pwd".into()],
+                uid: 0,
+                gid: 0,
+                work_dir: tmp_canonical.to_string_lossy().into_owned(),
+                environment: HashMap::new(),
+                job_id,
+                ..Default::default()
+            },
+        );
         let resp = svc.run_command(req).await.unwrap().into_inner();
         assert_eq!(resp.exit_code, 0);
         let observed_canonical = std::fs::canonicalize(resp.stdout.trim()).unwrap();
@@ -3645,15 +5086,50 @@ mod tests {
             Arc::new(Mutex::new(DeviceRegistry::new())),
             spur_core::config::MemlockLimit::Unlimited,
         );
-        svc.register_test_step(10, 1, None).await;
+        svc.insert_test_job(10, TrackedJob::dummy(0)).await;
+        svc.register_test_step(10, 0, 1, None).await;
         svc.cancel_step(Request::new(CancelStepRequest {
             job_id: 10,
             step_id: 1,
             signal: 0,
+            run_attempt: 0,
+            submission_generation: "test-generation".into(),
+            worker_incarnation: svc.reporter.worker_incarnation.clone(),
         }))
         .await
         .unwrap();
-        assert!(svc.step_cancel_requested(10, 1).await);
+        assert!(svc.step_cancel_requested(10, 0, 1).await);
+    }
+
+    #[tokio::test]
+    async fn cancel_step_rejects_stale_job_attempt() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 11;
+        let step_id = 7;
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = 2;
+        svc.insert_test_job(job_id, tracked).await;
+        svc.register_test_step(job_id, 2, step_id, None).await;
+
+        let error = svc
+            .cancel_step(Request::new(CancelStepRequest {
+                job_id,
+                step_id,
+                signal: 9,
+                run_attempt: 1,
+                submission_generation: "test-generation".into(),
+                worker_incarnation: svc.reporter.worker_incarnation.clone(),
+            }))
+            .await
+            .expect_err("a delayed step cancel cannot touch the replacement run");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(!svc.step_cancel_requested(job_id, 2, step_id).await);
     }
 
     #[tokio::test]
@@ -3667,24 +5143,30 @@ mod tests {
         let svc_run = svc.clone();
         let run_handle = tokio::spawn(async move {
             svc_run
-                .run_command(Request::new(RunCommandRequest {
-                    command: vec!["sleep".into(), "60".into()],
-                    uid: 0,
-                    gid: 0,
-                    work_dir: String::new(),
-                    environment: HashMap::new(),
-                    job_id,
-                    step_id,
-                    ..Default::default()
-                }))
+                .run_command(exact_run_command_request(
+                    &svc_run,
+                    RunCommandRequest {
+                        command: vec!["sleep".into(), "60".into()],
+                        uid: 0,
+                        gid: 0,
+                        work_dir: String::new(),
+                        environment: HashMap::new(),
+                        job_id,
+                        step_id,
+                        ..Default::default()
+                    },
+                ))
                 .await
         });
 
-        svc.wait_for_active_step(job_id, step_id).await;
+        svc.wait_for_active_step(job_id, 0, step_id).await;
         svc.cancel_step(Request::new(CancelStepRequest {
             job_id,
             step_id,
             signal: 0,
+            run_attempt: 0,
+            submission_generation: "test-generation".into(),
+            worker_incarnation: svc.reporter.worker_incarnation.clone(),
         }))
         .await
         .unwrap();
@@ -3701,6 +5183,228 @@ mod tests {
             "expected cancelled step, got stderr={:?} exit={}",
             resp.stderr,
             resp.exit_code
+        );
+    }
+
+    #[tokio::test]
+    async fn active_process_guard_removes_entry_even_when_drop_contends_on_map_lock() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let key = (
+            501,
+            "test-generation".to_string(),
+            0,
+            ActiveProcessKind::Step(9),
+        );
+        svc.active_steps
+            .lock()
+            .await
+            .insert(key.clone(), ActiveStep::default());
+        let guard = ActiveStepGuard {
+            steps: svc.active_steps.clone(),
+            changed: svc.active_step_changed.clone(),
+            key: key.clone(),
+        };
+
+        let held = svc.active_steps.lock().await;
+        drop(guard);
+        assert!(
+            held.contains_key(&key),
+            "deferred removal has not acquired the lock"
+        );
+        drop(held);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let changed = svc.active_step_changed.notified();
+                if !svc.active_steps.lock().await.contains_key(&key) {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .expect("guard's deferred removal must never be lost");
+    }
+
+    #[tokio::test]
+    async fn terminate_and_reap_waits_for_pidless_handler_to_drop_its_guard() {
+        let svc = Arc::new(AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        ));
+        let job_id = 502;
+        svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
+            job_id,
+            submission_generation: "test-generation".into(),
+            worker_incarnation: svc.reporter.worker_incarnation.clone(),
+            cpus: 1,
+            ..Default::default()
+        }))
+        .await
+        .expect("register standalone allocation");
+
+        let key = (
+            job_id,
+            "test-generation".to_string(),
+            0,
+            ActiveProcessKind::Step(3),
+        );
+        let (registered_tx, registered_rx) = tokio::sync::oneshot::channel();
+        let handler_svc = svc.clone();
+        let handler_key = key.clone();
+        let handler = tokio::spawn(async move {
+            handler_svc
+                .active_steps
+                .lock()
+                .await
+                .insert(handler_key.clone(), ActiveStep::default());
+            let guard = ActiveStepGuard {
+                steps: handler_svc.active_steps.clone(),
+                changed: handler_svc.active_step_changed.clone(),
+                key: handler_key.clone(),
+            };
+            registered_tx.send(()).expect("test receiver alive");
+            loop {
+                if step_cancel_requested(&handler_svc.active_steps, &handler_key).await {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            drop(guard);
+        });
+        registered_rx.await.expect("handler registered");
+
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id,
+            signal: 9,
+            run_attempt: 0,
+            submission_generation: "test-generation".into(),
+            worker_incarnation: svc.reporter.worker_incarnation.clone(),
+            control_mode: AgentJobControlMode::AgentJobControlTerminateAndReap as i32,
+        }))
+        .await
+        .expect("cancel waits for pidless handler");
+
+        handler.await.expect("handler exits");
+        assert!(!svc.running.lock().await.contains_key(&job_id));
+        assert!(!svc.active_steps.lock().await.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn standalone_cancel_reaps_live_step_before_releasing_gpu_and_acknowledging() {
+        let svc = Arc::new(AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(test_gpu_registry())),
+            spur_core::config::MemlockLimit::Unlimited,
+        ));
+        let job_id = 503;
+        svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
+            job_id,
+            submission_generation: "test-generation".into(),
+            worker_incarnation: svc.reporter.worker_incarnation.clone(),
+            cpus: 1,
+            allocated: Some(gpu_alloc_request(&[0])),
+            ..Default::default()
+        }))
+        .await
+        .expect("register standalone allocation");
+
+        let runner = {
+            let svc = svc.clone();
+            tokio::spawn(async move {
+                svc.run_command(exact_run_command_request(
+                    &svc,
+                    RunCommandRequest {
+                        command: vec!["sleep".into(), "3600".into()],
+                        job_id,
+                        step_id: 8,
+                        uid: 0,
+                        gid: 0,
+                        ..Default::default()
+                    },
+                ))
+                .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if svc
+                    .active_steps
+                    .lock()
+                    .await
+                    .values()
+                    .any(|step| step.pid.is_some())
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("step must reach live-pid state");
+
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id,
+            signal: 9,
+            run_attempt: 0,
+            submission_generation: "test-generation".into(),
+            worker_incarnation: svc.reporter.worker_incarnation.clone(),
+            control_mode: AgentJobControlMode::AgentJobControlTerminateAndReap as i32,
+        }))
+        .await
+        .expect("exact standalone cancel");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), runner)
+            .await
+            .expect("run handler must finish before/with cancel ACK")
+            .expect("run task join")
+            .expect("run RPC completes after cancellation");
+        assert!(svc.active_steps.lock().await.is_empty());
+        assert!(!svc.running.lock().await.contains_key(&job_id));
+        assert_eq!(
+            svc.free_gpu_count().await,
+            1,
+            "GPU is released only after reap"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_execution_cleanup_does_not_touch_replacement_active_process() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let key = (
+            504,
+            "replacement-generation".to_string(),
+            1,
+            ActiveProcessKind::Step(1),
+        );
+        svc.active_steps
+            .lock()
+            .await
+            .insert(key.clone(), ActiveStep::default());
+
+        svc.terminate_and_reap_active_processes(504, "old-generation", 7)
+            .await
+            .expect("absent old execution is idempotent");
+
+        let active = svc.active_steps.lock().await;
+        assert!(
+            !active
+                .get(&key)
+                .expect("replacement remains")
+                .cancel_requested
         );
     }
 
@@ -3723,12 +5427,16 @@ mod tests {
             .spawn()
             .expect("failed to spawn process group");
         let pid = child.id().expect("spawned child should have pid");
-        svc.register_test_step(job_id, step_id, Some(pid)).await;
+        svc.insert_test_job(job_id, TrackedJob::dummy(0)).await;
+        svc.register_test_step(job_id, 0, step_id, Some(pid)).await;
 
         svc.cancel_step(Request::new(CancelStepRequest {
             job_id,
             step_id,
             signal: 0,
+            run_attempt: 0,
+            submission_generation: "test-generation".into(),
+            worker_incarnation: svc.reporter.worker_incarnation.clone(),
         }))
         .await
         .unwrap();
@@ -3738,7 +5446,7 @@ mod tests {
             .expect("process group did not exit after CancelStep")
             .expect("wait failed");
         assert!(!status.success());
-        assert!(svc.step_cancel_requested(job_id, step_id).await);
+        assert!(svc.step_cancel_requested(job_id, 0, step_id).await);
     }
 
     #[tokio::test]
@@ -3828,6 +5536,9 @@ mod tests {
 
         let req = Request::new(LaunchJobRequest {
             job_id: 65,
+            submission_generation: "test-generation".into(),
+            run_attempt: 1,
+            worker_incarnation: svc.reporter.worker_incarnation.clone(),
             spec: Some(JobSpec {
                 script: "#!/bin/sh\ntrue\n".into(),
                 cpus_per_task: 1,
@@ -3872,6 +5583,9 @@ mod tests {
 
         let req = Request::new(LaunchJobRequest {
             job_id: 77,
+            submission_generation: "test-generation".into(),
+            run_attempt: 1,
+            worker_incarnation: svc.reporter.worker_incarnation.clone(),
             spec: Some(JobSpec {
                 script: "#!/bin/sh\ntrue\n".into(),
                 cpus_per_task: 1,
@@ -3994,6 +5708,9 @@ mod tests {
 
         let req = Request::new(LaunchJobRequest {
             job_id: 5350,
+            submission_generation: "test-generation".into(),
+            run_attempt: 1,
+            worker_incarnation: svc.reporter.worker_incarnation.clone(),
             spec: Some(JobSpec {
                 script,
                 num_tasks: 4,
@@ -4050,6 +5767,9 @@ mod tests {
 
         let req = Request::new(LaunchJobRequest {
             job_id: 5351,
+            submission_generation: "test-generation".into(),
+            run_attempt: 1,
+            worker_incarnation: svc.reporter.worker_incarnation.clone(),
             spec: Some(JobSpec {
                 script,
                 num_tasks: 4,
@@ -4095,6 +5815,9 @@ mod tests {
 
         let req = Request::new(LaunchJobRequest {
             job_id: 5352,
+            submission_generation: "test-generation".into(),
+            run_attempt: 1,
+            worker_incarnation: svc.reporter.worker_incarnation.clone(),
             spec: Some(JobSpec {
                 script: "#!/bin/bash\ntrue\n".into(),
                 num_tasks: 4,
@@ -4140,6 +5863,9 @@ mod tests {
 
         let req = Request::new(LaunchJobRequest {
             job_id: 5353,
+            submission_generation: "test-generation".into(),
+            run_attempt: 1,
+            worker_incarnation: svc.reporter.worker_incarnation.clone(),
             spec: Some(JobSpec {
                 script: format!(
                     "#!/bin/bash\necho ran >> \"{}\"\nsrun true\n",
@@ -4194,10 +5920,14 @@ mod tests {
         // (simulating a teardown path that dropped the job without releasing).
         {
             let mut alloc = svc.allocation.lock().await;
-            alloc.allocate_for_job(1, 2, 0, &[0]).unwrap();
-            alloc.commit_job(1);
-            alloc.allocate_for_job(2, 2, 0, &[1]).unwrap();
-            alloc.commit_job(2);
+            alloc
+                .allocate_for_execution(1, "test-generation", 0, 2, 0, &[0])
+                .unwrap();
+            alloc.commit_execution(1, "test-generation", 0);
+            alloc
+                .allocate_for_execution(2, "orphan-generation", 0, 2, 0, &[1])
+                .unwrap();
+            alloc.commit_execution(2, "orphan-generation", 0);
         }
         assert_eq!(svc.free_gpu_count().await, 0);
 
@@ -4229,8 +5959,10 @@ mod tests {
         // (its completion report was force-finished by the controller).
         {
             let mut alloc = svc.allocation.lock().await;
-            alloc.allocate_for_job(99, 1, 0, &[0]).unwrap();
-            alloc.commit_job(99);
+            alloc
+                .allocate_for_execution(99, "test-generation", 0, 1, 0, &[0])
+                .unwrap();
+            alloc.commit_execution(99, "test-generation", 0);
         }
         assert_eq!(svc.free_gpu_count().await, 0);
 
@@ -4256,7 +5988,7 @@ mod tests {
         };
 
         let res = svc
-            .allocate_local_resources(100, &spec, Some(&allocated))
+            .allocate_local_resources(100, "new-generation", 0, &spec, Some(&allocated))
             .await;
         assert!(
             res.is_ok(),
@@ -4279,8 +6011,10 @@ mod tests {
         svc.insert_test_job(99, TrackedJob::dummy(0)).await;
         {
             let mut alloc = svc.allocation.lock().await;
-            alloc.allocate_for_job(99, 1, 0, &[0]).unwrap();
-            alloc.commit_job(99);
+            alloc
+                .allocate_for_execution(99, "test-generation", 0, 1, 0, &[0])
+                .unwrap();
+            alloc.commit_execution(99, "test-generation", 0);
         }
 
         let mut devices = std::collections::HashMap::new();
@@ -4305,7 +6039,7 @@ mod tests {
         };
 
         let res = svc
-            .allocate_local_resources(100, &spec, Some(&allocated))
+            .allocate_local_resources(100, "new-generation", 0, &spec, Some(&allocated))
             .await;
         let err = res.expect_err("must reject: the conflicting GPU owner is still running");
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
@@ -4350,7 +6084,7 @@ mod tests {
         };
 
         let res = svc
-            .allocate_local_resources(100, &spec, Some(&allocated))
+            .allocate_local_resources(100, "new-generation", 0, &spec, Some(&allocated))
             .await;
         let err = res.expect_err("must reject: the conflicting GPU owner is still launching");
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
@@ -4393,10 +6127,14 @@ mod tests {
 
         {
             let mut alloc = svc.allocation.lock().await;
-            alloc.allocate_for_job(98, 1, 0, &[0]).unwrap();
-            alloc.commit_job(98);
-            alloc.allocate_for_job(99, 1, 0, &[1]).unwrap();
-            alloc.commit_job(99);
+            alloc
+                .allocate_for_execution(98, "stale-generation", 0, 1, 0, &[0])
+                .unwrap();
+            alloc.commit_execution(98, "stale-generation", 0);
+            alloc
+                .allocate_for_execution(99, "test-generation", 0, 1, 0, &[1])
+                .unwrap();
+            alloc.commit_execution(99, "test-generation", 0);
         }
         assert_eq!(svc.free_gpu_count().await, 0);
 
@@ -4406,7 +6144,13 @@ mod tests {
             ..Default::default()
         };
         let res = svc
-            .allocate_local_resources(100, &spec, Some(&gpu_alloc_request(&[0, 1])))
+            .allocate_local_resources(
+                100,
+                "new-generation",
+                0,
+                &spec,
+                Some(&gpu_alloc_request(&[0, 1])),
+            )
             .await;
         assert!(
             res.is_ok(),
@@ -4429,10 +6173,14 @@ mod tests {
         svc.insert_test_job(99, TrackedJob::dummy(0)).await;
         {
             let mut alloc = svc.allocation.lock().await;
-            alloc.allocate_for_job(98, 1, 0, &[0]).unwrap();
-            alloc.commit_job(98);
-            alloc.allocate_for_job(99, 1, 0, &[1]).unwrap();
-            alloc.commit_job(99);
+            alloc
+                .allocate_for_execution(98, "stale-generation", 0, 1, 0, &[0])
+                .unwrap();
+            alloc.commit_execution(98, "stale-generation", 0);
+            alloc
+                .allocate_for_execution(99, "test-generation", 0, 1, 0, &[1])
+                .unwrap();
+            alloc.commit_execution(99, "test-generation", 0);
         }
 
         let spec = JobSpec {
@@ -4441,7 +6189,13 @@ mod tests {
             ..Default::default()
         };
         let res = svc
-            .allocate_local_resources(100, &spec, Some(&gpu_alloc_request(&[0, 1])))
+            .allocate_local_resources(
+                100,
+                "new-generation",
+                0,
+                &spec,
+                Some(&gpu_alloc_request(&[0, 1])),
+            )
             .await;
         let err = res.expect_err("must reject: GPU 1's owner is still running");
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
@@ -4470,6 +6224,8 @@ mod tests {
         );
         svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
             job_id: 55,
+            submission_generation: "test-generation".into(),
+            worker_incarnation: svc.reporter.worker_incarnation.clone(),
             cpus: 1,
             allocated: Some(ResourceAllocations {
                 cpus: 1,
@@ -4542,6 +6298,8 @@ mod tests {
 
         svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
             job_id: 77,
+            submission_generation: "test-generation".into(),
+            worker_incarnation: svc.reporter.worker_incarnation.clone(),
             cpus: 1,
             allocated: Some(ResourceAllocations {
                 cpus: 1,
@@ -4560,6 +6318,241 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn standalone_allocation_registration_rejects_nonzero_attempt() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let error = svc
+            .register_job_allocation(Request::new(RegisterJobAllocationRequest {
+                job_id: 78,
+                submission_generation: "test-generation".into(),
+                worker_incarnation: svc.reporter.worker_incarnation.clone(),
+                cpus: 1,
+                run_attempt: 1,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("standalone registration has no durable nonzero epoch");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(!svc.running.lock().await.contains_key(&78));
+    }
+
+    #[tokio::test]
+    async fn standalone_allocation_registration_is_exactly_idempotent() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let request = RegisterJobAllocationRequest {
+            job_id: 79,
+            submission_generation: "generation-a".into(),
+            worker_incarnation: svc.reporter.worker_incarnation.clone(),
+            cpus: 1,
+            partition: "experimental".into(),
+            nodelist: "test-node".into(),
+            work_dir: "/tmp".into(),
+            user: "testuser".into(),
+            ..Default::default()
+        };
+
+        svc.register_job_allocation(Request::new(request.clone()))
+            .await
+            .expect("initial registration");
+        svc.register_job_allocation(Request::new(request.clone()))
+            .await
+            .expect("an exact retry is idempotent");
+        assert_eq!(svc.running.lock().await.len(), 1);
+        assert_eq!(svc.allocation.lock().await.free_cpus(), 3);
+
+        let mut changed_payload = request.clone();
+        changed_payload.cpus = 2;
+        let error = svc
+            .register_job_allocation(Request::new(changed_payload))
+            .await
+            .expect_err("the same identity cannot change its allocation payload");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+
+        let mut stale_generation = request.clone();
+        stale_generation.submission_generation = "generation-stale".into();
+        let error = svc
+            .register_job_allocation(Request::new(stale_generation))
+            .await
+            .expect_err("a reused job id cannot replace a different generation");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+
+        let mut stale_incarnation = request;
+        stale_incarnation.worker_incarnation = "worker-stale".into();
+        let error = svc
+            .register_job_allocation(Request::new(stale_incarnation))
+            .await
+            .expect_err("a registration cannot target a different worker process");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(svc.running.lock().await.len(), 1);
+        assert_eq!(svc.allocation.lock().await.free_cpus(), 3);
+    }
+
+    fn standalone_registration_request(
+        service: &AgentService,
+        job_id: u32,
+        generation: &str,
+    ) -> RegisterJobAllocationRequest {
+        RegisterJobAllocationRequest {
+            job_id,
+            submission_generation: generation.into(),
+            worker_incarnation: service.reporter.worker_incarnation.clone(),
+            cpus: 1,
+            partition: "experimental".into(),
+            nodelist: "test-node".into(),
+            work_dir: "/tmp".into(),
+            user: "testuser".into(),
+            ..Default::default()
+        }
+    }
+
+    fn exact_reap_request(
+        service: &AgentService,
+        job_id: u32,
+        generation: &str,
+    ) -> AgentCancelJobRequest {
+        AgentCancelJobRequest {
+            job_id,
+            signal: 9,
+            run_attempt: 0,
+            submission_generation: generation.into(),
+            worker_incarnation: service.reporter.worker_incarnation.clone(),
+            control_mode: AgentJobControlMode::AgentJobControlTerminateAndReap as i32,
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_before_standalone_register_tombstones_attempt_zero() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 790;
+        let generation = "generation-cancelled-before-register";
+
+        svc.cancel_job(Request::new(exact_reap_request(&svc, job_id, generation)))
+            .await
+            .expect("absent exact cancellation establishes a tombstone");
+        let error = svc
+            .register_job_allocation(Request::new(standalone_registration_request(
+                &svc, job_id, generation,
+            )))
+            .await
+            .expect_err("an ACKed attempt-zero cancel permanently fences registration");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(!svc.running.lock().await.contains_key(&job_id));
+        assert_eq!(svc.allocation.lock().await.free_cpus(), 4);
+        assert_eq!(
+            svc.batch_launch_epoch(job_id).lock().await.standalone,
+            StandaloneAllocationEpoch::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_register_and_cancel_are_safe_in_both_serialized_orders() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 791;
+        let generation = "generation-register-cancel-race";
+
+        // Exercise the register-then-cancel serialization explicitly. The
+        // inverse ordering is covered by cancel_before_standalone_register_...
+        // above. Avoid relying on spawned-task polling order: Tokio mutexes are
+        // FIFO by lock-call order, but task polling does not establish that
+        // order deterministically.
+        svc.register_job_allocation(Request::new(standalone_registration_request(
+            &svc, job_id, generation,
+        )))
+        .await
+        .expect("registration owns the attempt-zero allocation");
+        svc.cancel_job(Request::new(exact_reap_request(&svc, job_id, generation)))
+            .await
+            .expect("cancel reaps the registered allocation before ACK");
+        assert!(!svc.running.lock().await.contains_key(&job_id));
+        assert_eq!(svc.allocation.lock().await.free_cpus(), 4);
+        assert_eq!(
+            svc.batch_launch_epoch(job_id).lock().await.standalone,
+            StandaloneAllocationEpoch::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_generation_does_not_fence_reused_job_id_generation() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 792;
+        svc.cancel_job(Request::new(exact_reap_request(
+            &svc,
+            job_id,
+            "generation-old",
+        )))
+        .await
+        .expect("old generation cancel");
+
+        svc.register_job_allocation(Request::new(standalone_registration_request(
+            &svc,
+            job_id,
+            "generation-new",
+        )))
+        .await
+        .expect("new immutable generation may reuse an absent numeric ID");
+        let tracked = svc.running.lock().await;
+        assert_eq!(
+            tracked.get(&job_id).unwrap().submission_generation,
+            "generation-new"
+        );
+    }
+
+    #[tokio::test]
+    async fn signal_only_rejects_standalone_allocation_instead_of_acking_noop() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 793;
+        let generation = "generation-signal";
+        svc.register_job_allocation(Request::new(standalone_registration_request(
+            &svc, job_id, generation,
+        )))
+        .await
+        .expect("register standalone allocation");
+
+        let mut request = exact_reap_request(&svc, job_id, generation);
+        request.signal = 15;
+        request.control_mode = AgentJobControlMode::AgentJobControlSignalOnly as i32;
+        let error = svc
+            .cancel_job(Request::new(request))
+            .await
+            .expect_err("standalone signal must not report success without signaling a process");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(svc.running.lock().await.contains_key(&job_id));
+        assert_eq!(svc.allocation.lock().await.free_cpus(), 3);
+    }
+
     // CancelJob must release a still-launching (never-committed) reservation,
     // else a cancel-during-eviction strands it until the TTL.
     #[tokio::test]
@@ -4574,7 +6567,9 @@ mod tests {
         // Reserve GPU 0 as a still-launching job (not committed, not in running).
         {
             let mut alloc = svc.allocation.lock().await;
-            alloc.allocate_for_job(7, 1, 0, &[0]).unwrap();
+            alloc
+                .allocate_for_execution(7, "test-generation", 0, 1, 0, &[0])
+                .unwrap();
         }
         assert_eq!(
             svc.free_gpu_count().await,
@@ -4585,6 +6580,10 @@ mod tests {
         svc.cancel_job(Request::new(AgentCancelJobRequest {
             job_id: 7,
             signal: 9,
+            run_attempt: 0,
+            submission_generation: "test-generation".into(),
+            worker_incarnation: svc.reporter.worker_incarnation.clone(),
+            control_mode: AgentJobControlMode::AgentJobControlTerminateAndReap as i32,
         }))
         .await
         .expect("cancel_job");
@@ -4594,6 +6593,390 @@ mod tests {
             1,
             "cancel must release a launching (never-committed) reservation"
         );
+    }
+
+    #[tokio::test]
+    async fn guarded_cancel_does_not_release_an_absent_launch_epoch() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        // A newer launch may have reserved resources but not entered `running`
+        // yet. A delayed cancel for an older epoch must not free that launch's
+        // reservation merely because no tracked process exists at this instant.
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_execution(8, "new-generation", 2, 1, 0, &[0])
+            .unwrap();
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id: 8,
+            signal: 9,
+            run_attempt: 1,
+            submission_generation: "old-generation".into(),
+            worker_incarnation: svc.reporter.worker_incarnation.clone(),
+            control_mode: AgentJobControlMode::AgentJobControlTerminateAndReap as i32,
+        }))
+        .await
+        .expect("guarded cancel");
+
+        assert_eq!(
+            svc.free_gpu_count().await,
+            0,
+            "an absent guarded epoch must leave in-flight resources untouched"
+        );
+        svc.allocation
+            .lock()
+            .await
+            .release_execution(8, "new-generation", 2);
+    }
+
+    #[tokio::test]
+    async fn exact_pmix_cleanup_cannot_release_a_different_prepare_token() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 81;
+        let batch_two = batch_pmix_prepare_token("test-generation", 2);
+        svc.mpi_host.set_prepared_token_for_test(job_id, &batch_two);
+        {
+            let launch_epoch = svc.batch_launch_epoch(job_id);
+            let mut epoch = launch_epoch.lock().await;
+            epoch.submission_generation = "test-generation".into();
+            epoch.latest_attempt = 2;
+            epoch.prepared_attempt = Some(2);
+        }
+
+        // A delayed step cleanup from run A is exact and cannot tear down the
+        // batch prepare for run B.
+        svc.release_pmix(Request::new(ReleasePmixRequest {
+            job_id,
+            run_attempt: 1,
+            prepare_token: step_pmix_prepare_token("test-generation", 1, 4),
+            submission_generation: "test-generation".into(),
+            worker_incarnation: svc.reporter.worker_incarnation.clone(),
+        }))
+        .await
+        .expect("delayed step release");
+        assert_eq!(
+            svc.mpi_host.prepared_token_for_test(job_id).as_deref(),
+            Some(batch_two.as_str())
+        );
+        assert_eq!(
+            svc.batch_launch_epoch(job_id).lock().await.prepared_attempt,
+            Some(2)
+        );
+
+        // An exact cancel for A derives batch:A, which is also a no-op against B.
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id,
+            signal: 9,
+            run_attempt: 1,
+            submission_generation: "test-generation".into(),
+            worker_incarnation: svc.reporter.worker_incarnation.clone(),
+            control_mode: AgentJobControlMode::AgentJobControlTerminateAndReap as i32,
+        }))
+        .await
+        .expect("stale exact cancel");
+        assert_eq!(
+            svc.mpi_host.prepared_token_for_test(job_id).as_deref(),
+            Some(batch_two.as_str())
+        );
+
+        // The matching exact cancel owns and releases batch B.
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id,
+            signal: 9,
+            run_attempt: 2,
+            submission_generation: "test-generation".into(),
+            worker_incarnation: svc.reporter.worker_incarnation.clone(),
+            control_mode: AgentJobControlMode::AgentJobControlTerminateAndReap as i32,
+        }))
+        .await
+        .expect("matching exact cancel");
+        assert!(svc.mpi_host.prepared_token_for_test(job_id).is_none());
+        assert_eq!(
+            svc.batch_launch_epoch(job_id).lock().await.prepared_attempt,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_pmix_prepare_rejects_stale_attempt_without_replacing_newer_prepare() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 82;
+        let batch_two = batch_pmix_prepare_token("test-generation", 2);
+        svc.mpi_host.set_prepared_token_for_test(job_id, &batch_two);
+        {
+            let launch_epoch = svc.batch_launch_epoch(job_id);
+            let mut epoch = launch_epoch.lock().await;
+            epoch.submission_generation = "test-generation".into();
+            epoch.latest_attempt = 2;
+            epoch.prepared_attempt = Some(2);
+        }
+        let plan = spur_core::mpi::plan_to_proto(PmixLaunchPlan::local_tasks(
+            job_id,
+            1,
+            0,
+            1,
+            "/tmp/pmix",
+            0,
+            0,
+            1,
+            0,
+            vec![],
+        ));
+
+        let response = svc
+            .prepare_pmix(Request::new(PreparePmixRequest {
+                job_id,
+                pmix_plan: Some(plan),
+                run_attempt: 1,
+                prepare_token: batch_pmix_prepare_token("test-generation", 1),
+                submission_generation: "test-generation".into(),
+                worker_incarnation: svc.reporter.worker_incarnation.clone(),
+            }))
+            .await
+            .expect("stale prepare is a classified response")
+            .into_inner();
+
+        assert!(!response.success);
+        assert!(response.error.contains("stale"));
+        assert_eq!(
+            svc.mpi_host.prepared_token_for_test(job_id).as_deref(),
+            Some(batch_two.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_pmix_generation_transition_releases_old_prepare_before_new_one() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 820;
+        let old_token = batch_pmix_prepare_token("generation-a", 3);
+        let new_token = batch_pmix_prepare_token("generation-b", 1);
+        svc.mpi_host.set_prepared_token_for_test(job_id, &old_token);
+        {
+            let launch_epoch = svc.batch_launch_epoch(job_id);
+            let mut epoch = launch_epoch.lock().await;
+            epoch.submission_generation = "generation-a".into();
+            epoch.latest_attempt = 3;
+            epoch.prepared_attempt = Some(3);
+        }
+        let plan = spur_core::mpi::plan_to_proto(PmixLaunchPlan::local_tasks(
+            job_id,
+            1,
+            0,
+            1,
+            "/tmp/pmix-generation-transition",
+            0,
+            0,
+            1,
+            0,
+            vec![],
+        ));
+        let new_request = || PreparePmixRequest {
+            job_id,
+            pmix_plan: Some(plan.clone()),
+            run_attempt: 1,
+            prepare_token: new_token.clone(),
+            submission_generation: "generation-b".into(),
+            worker_incarnation: svc.reporter.worker_incarnation.clone(),
+        };
+
+        // The test host has no PMIx plugin, so the first B prepare fails after
+        // the lifecycle transition. The important invariant is that A's token
+        // is gone rather than permanently colliding with B.
+        let first_b = svc
+            .prepare_pmix(Request::new(new_request()))
+            .await
+            .expect("classified prepare response")
+            .into_inner();
+        assert!(!first_b.success);
+        assert!(svc.mpi_host.prepared_token_for_test(job_id).is_none());
+
+        // Model the plugin accepting B, then retry the idempotent RPC.
+        svc.mpi_host.set_prepared_token_for_test(job_id, &new_token);
+        let second_b = svc
+            .prepare_pmix(Request::new(new_request()))
+            .await
+            .expect("B retry")
+            .into_inner();
+        assert!(
+            second_b.success,
+            "B can own the namespace after A is released"
+        );
+
+        let stale_release = svc
+            .release_pmix(Request::new(ReleasePmixRequest {
+                job_id,
+                run_attempt: 3,
+                prepare_token: old_token,
+                submission_generation: "generation-a".into(),
+                worker_incarnation: svc.reporter.worker_incarnation.clone(),
+            }))
+            .await
+            .expect_err("old generation release is fenced by lifecycle state");
+        assert_eq!(stale_release.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            svc.mpi_host.prepared_token_for_test(job_id).as_deref(),
+            Some(new_token.as_str()),
+            "delayed A release cannot tear down B"
+        );
+    }
+
+    #[tokio::test]
+    async fn step_pmix_prepare_rejects_stale_job_attempt() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 83;
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = 2;
+        svc.insert_test_job(job_id, tracked).await;
+        let plan = spur_core::mpi::plan_to_proto(PmixLaunchPlan::local_tasks(
+            job_id,
+            1,
+            0,
+            1,
+            "/tmp/pmix",
+            0,
+            0,
+            1,
+            0,
+            vec![],
+        ));
+
+        let error = svc
+            .prepare_pmix(Request::new(PreparePmixRequest {
+                job_id,
+                pmix_plan: Some(plan),
+                run_attempt: 1,
+                prepare_token: step_pmix_prepare_token("test-generation", 1, 4),
+                submission_generation: "test-generation".into(),
+                worker_incarnation: svc.reporter.worker_incarnation.clone(),
+            }))
+            .await
+            .expect_err("a delayed step prepare cannot enter the replacement run");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(svc.mpi_host.prepared_token_for_test(job_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn guarded_cancel_only_signals_the_matching_launch_epoch() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = 2;
+        svc.insert_test_job(9, tracked).await;
+
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id: 9,
+            signal: 9,
+            run_attempt: 1,
+            submission_generation: "test-generation".into(),
+            worker_incarnation: svc.reporter.worker_incarnation.clone(),
+            control_mode: AgentJobControlMode::AgentJobControlTerminateAndReap as i32,
+        }))
+        .await
+        .expect("stale cancel");
+        assert_eq!(
+            svc.running
+                .lock()
+                .await
+                .get(&9)
+                .map(|tracked| tracked.run_attempt),
+            Some(2),
+            "a stale cancel must preserve the replacement epoch"
+        );
+
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id: 9,
+            signal: 9,
+            run_attempt: 2,
+            submission_generation: "test-generation".into(),
+            worker_incarnation: svc.reporter.worker_incarnation.clone(),
+            control_mode: AgentJobControlMode::AgentJobControlTerminateAndReap as i32,
+        }))
+        .await
+        .expect("matching cancel");
+        assert!(!svc.running.lock().await.contains_key(&9));
+    }
+
+    #[tokio::test]
+    async fn batch_launch_epoch_rejects_duplicates_and_reaps_an_older_epoch() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let epoch = svc.batch_launch_epoch(10);
+        let mut epoch = epoch.lock().await;
+        svc.prepare_batch_launch_epoch(10, "test-generation", 1, &mut epoch)
+            .await
+            .expect("first epoch");
+        let duplicate = svc
+            .prepare_batch_launch_epoch(10, "test-generation", 1, &mut epoch)
+            .await
+            .expect_err("an equal epoch is never a second launch");
+        assert_eq!(duplicate.code(), tonic::Code::AlreadyExists);
+
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = 1;
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_execution(10, "test-generation", 1, 1, 0, &[0])
+            .unwrap();
+        svc.allocation
+            .lock()
+            .await
+            .commit_execution(10, "test-generation", 1);
+        svc.insert_test_job(10, tracked).await;
+
+        svc.prepare_batch_launch_epoch(10, "test-generation", 2, &mut epoch)
+            .await
+            .expect("newer epoch replaces old launch");
+        assert!(
+            !svc.running.lock().await.contains_key(&10),
+            "the old process must be synchronously reaped before launch proceeds"
+        );
+        assert_eq!(svc.free_gpu_count().await, 1);
+        assert_eq!(epoch.latest_attempt, 2);
+
+        for stale in [1, 2] {
+            let err = svc
+                .prepare_batch_launch_epoch(10, "test-generation", stale, &mut epoch)
+                .await
+                .expect_err("stale/equal launch must stay fenced");
+            assert_eq!(err.code(), tonic::Code::AlreadyExists);
+        }
     }
 
     // A launch that aborts before entering `running` must tear down its PMI
@@ -4640,9 +7023,10 @@ mod tests {
             svc.allocation
                 .lock()
                 .await
-                .allocate_for_job(9, 1, 0, &[0])
+                .allocate_for_execution(9, "test-generation", 1, 1, 0, &[0])
                 .unwrap();
-            let guard = LaunchReservationGuard::new(svc.allocation.clone(), 9);
+            let guard =
+                LaunchReservationGuard::new(svc.allocation.clone(), 9, "test-generation".into(), 1);
             assert_eq!(svc.free_gpu_count().await, 0, "reserved under guard");
             drop(guard);
         }
@@ -4657,10 +7041,18 @@ mod tests {
             svc.allocation
                 .lock()
                 .await
-                .allocate_for_job(10, 1, 0, &[0])
+                .allocate_for_execution(10, "test-generation", 1, 1, 0, &[0])
                 .unwrap();
-            svc.allocation.lock().await.commit_job(10);
-            let mut guard = LaunchReservationGuard::new(svc.allocation.clone(), 10);
+            svc.allocation
+                .lock()
+                .await
+                .commit_execution(10, "test-generation", 1);
+            let mut guard = LaunchReservationGuard::new(
+                svc.allocation.clone(),
+                10,
+                "test-generation".into(),
+                1,
+            );
             guard.disarm();
             drop(guard);
         }
@@ -4669,6 +7061,157 @@ mod tests {
             0,
             "a disarmed guard must leave the committed reservation intact"
         );
+    }
+
+    #[tokio::test]
+    async fn reclaimed_launch_cleanup_finishes_before_replacement_reuses_job_paths() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 4_000_000_000u32 + (std::process::id() % 100_000);
+        let spool = std::env::temp_dir()
+            .join("spur")
+            .join(format!("job{job_id}"));
+        std::fs::create_dir_all(&spool).expect("create old spool");
+        std::fs::write(spool.join("old-run"), b"old").expect("write old artifact");
+
+        let launch_epoch = svc.batch_launch_epoch(job_id);
+        let mut old_guard = launch_epoch.lock().await;
+        let replacement_epoch = launch_epoch.clone();
+        let replacement_spool = spool.clone();
+        let replacement = tokio::spawn(async move {
+            let _replacement_guard = replacement_epoch.lock().await;
+            assert!(
+                !replacement_spool.join("old-run").exists(),
+                "replacement may start only after old path cleanup"
+            );
+            std::fs::create_dir_all(&replacement_spool).expect("create replacement spool");
+            std::fs::write(replacement_spool.join("replacement-run"), b"new")
+                .expect("write replacement artifact");
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !replacement.is_finished(),
+            "replacement must wait on the old launch lifecycle fence"
+        );
+
+        cleanup_reclaimed_launch_under_epoch(
+            &mut old_guard,
+            job_id,
+            executor::RunningJob::AllocationOnly,
+            &crate::container::RootfsMode::Extracted,
+        )
+        .await;
+        assert!(!spool.exists(), "old cleanup is complete before unlock");
+        drop(old_guard);
+        replacement.await.expect("replacement task");
+
+        // A detached old cleanup used to race here and remove this file after
+        // the replacement acquired the same numeric job ID.
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(spool.join("replacement-run").exists());
+        crate::executor::cleanup_job_spool(job_id);
+    }
+
+    #[tokio::test]
+    async fn natural_completion_waits_for_pidless_child_before_releasing_gpu() {
+        let svc = Arc::new(AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(test_gpu_registry())),
+            spur_core::config::MemlockLimit::Unlimited,
+        ));
+        let job_id = 504;
+        let generation = "natural-completion-generation";
+        let run_attempt = 1;
+
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_execution(job_id, generation, run_attempt, 1, 0, &[0])
+            .expect("reserve GPU");
+        assert!(svc
+            .allocation
+            .lock()
+            .await
+            .commit_execution(job_id, generation, run_attempt));
+
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.submission_generation = generation.into();
+        tracked.run_attempt = run_attempt;
+        tracked.gpu_devices = vec![0];
+        let root_pid = tracked.job.pid().expect("root process pid");
+        svc.insert_test_job(job_id, tracked).await;
+
+        // Model a handler that has registered ownership but has not spawned a
+        // PID yet. Natural root completion must set its cancel flag and wait
+        // for the handler's guard before exposing the GPU as free.
+        let key = (
+            job_id,
+            generation.to_string(),
+            run_attempt,
+            ActiveProcessKind::Step(17),
+        );
+        let (registered_tx, registered_rx) = tokio::sync::oneshot::channel();
+        let (cancel_seen_tx, cancel_seen_rx) = tokio::sync::oneshot::channel();
+        let (allow_reap_tx, allow_reap_rx) = tokio::sync::oneshot::channel();
+        let handler_svc = svc.clone();
+        let handler_key = key.clone();
+        let handler = tokio::spawn(async move {
+            handler_svc
+                .active_steps
+                .lock()
+                .await
+                .insert(handler_key.clone(), ActiveStep::default());
+            let guard = ActiveStepGuard {
+                steps: handler_svc.active_steps.clone(),
+                changed: handler_svc.active_step_changed.clone(),
+                key: handler_key.clone(),
+            };
+            registered_tx.send(()).expect("registration receiver alive");
+            loop {
+                if step_cancel_requested(&handler_svc.active_steps, &handler_key).await {
+                    cancel_seen_tx.send(()).expect("cancel receiver alive");
+                    allow_reap_rx.await.expect("reap release sent");
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            drop(guard);
+        });
+        registered_rx.await.expect("child handler registered");
+
+        svc.start_monitor("http://127.0.0.1:1".into());
+        signal_step_process_group(root_pid, nix::sys::signal::Signal::SIGKILL as i32);
+        tokio::time::timeout(std::time::Duration::from_secs(5), cancel_seen_rx)
+            .await
+            .expect("monitor must cancel the child")
+            .expect("cancel signal delivered");
+
+        assert_eq!(
+            svc.free_gpu_count().await,
+            0,
+            "capacity remains owned until the child handler has reaped"
+        );
+        allow_reap_tx.send(()).expect("child handler still alive");
+        handler.await.expect("child handler exits");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if svc.free_gpu_count().await == 1
+                    && !svc.running.lock().await.contains_key(&job_id)
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("GPU is released only after exact child absence");
+        assert!(!svc.active_steps.lock().await.contains_key(&key));
     }
 
     #[tokio::test]
@@ -4688,19 +7231,22 @@ mod tests {
         tracked.memory_mb = 16384;
         svc.insert_test_job(job_id, tracked).await;
 
-        let req = Request::new(RunCommandRequest {
-            command: vec![
-                "/bin/sh".into(),
-                "-c".into(),
-                "echo ROCR=$ROCR_VISIBLE_DEVICES CUDA=$CUDA_VISIBLE_DEVICES".into(),
-            ],
-            uid: 0,
-            gid: 0,
-            work_dir: String::new(),
-            environment: HashMap::new(),
-            job_id,
-            ..Default::default()
-        });
+        let req = exact_run_command_request(
+            &svc,
+            RunCommandRequest {
+                command: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "echo ROCR=$ROCR_VISIBLE_DEVICES CUDA=$CUDA_VISIBLE_DEVICES".into(),
+                ],
+                uid: 0,
+                gid: 0,
+                work_dir: String::new(),
+                environment: HashMap::new(),
+                job_id,
+                ..Default::default()
+            },
+        );
         let resp = svc.run_command(req).await.unwrap().into_inner();
         assert_eq!(resp.exit_code, 0);
         assert!(
@@ -4792,6 +7338,7 @@ mod tests {
             nodelist: String::new(),
             mpi: String::new(),
             run_attempt: 0,
+            submission_generation: "test-generation".into(),
         };
         svc.insert_test_job(job_id, tracked).await;
 
@@ -4852,6 +7399,7 @@ mod tests {
                 nodelist: String::new(),
                 mpi: String::new(),
                 run_attempt,
+                submission_generation: "test-generation".into(),
             };
             (t, pid)
         }
@@ -5057,7 +7605,7 @@ mod tests {
 
         let inbound = tokio_stream::wrappers::ReceiverStream::new(in_rx);
         tokio::spawn(AgentService::run_pty_bridge(
-            master, child, child_pid, inbound, out_tx,
+            master, child, child_pid, inbound, out_tx, None,
         ));
 
         in_tx

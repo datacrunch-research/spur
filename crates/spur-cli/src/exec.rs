@@ -47,6 +47,11 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             job_id: args.job_id,
             command: args.command.clone(),
             user: crate::interactive::current_user()?,
+            // The controller resolves and overwrites the exact execution
+            // identity after authorizing the user-facing request.
+            submission_generation: String::new(),
+            run_attempt: 0,
+            worker_incarnation: String::new(),
         })
         .await
         .context("exec failed")?;

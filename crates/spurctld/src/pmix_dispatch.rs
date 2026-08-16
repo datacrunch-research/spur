@@ -49,13 +49,29 @@ pub fn multi_node_pmix_unsupported(
 pub struct PmixPrepareNode {
     pub node_name: String,
     pub agent_addr: String,
+    pub worker_incarnation: String,
     pub pmix_plan: spur_proto::proto::PmixLaunchPlan,
+}
+
+/// Stable opaque identity for a batch PMIx prepare. The token is carried by
+/// Prepare, Launch, Release, and exact-attempt Cancel paths so none of them can
+/// consume or tear down a different prepare for the same job id.
+pub fn batch_prepare_token(submission_generation: &str, run_attempt: u32) -> String {
+    format!("batch:{submission_generation}:{run_attempt}")
+}
+
+/// Stable opaque identity for one srun step PMIx prepare.
+pub fn step_prepare_token(submission_generation: &str, run_attempt: u32, step_id: u32) -> String {
+    format!("step:{submission_generation}:{run_attempt}:{step_id}")
 }
 
 pub async fn prepare_pmix_on_agent(
     agent_addr: &str,
     job_id: u32,
+    submission_generation: &str,
+    worker_incarnation: &str,
     run_attempt: u32,
+    prepare_token: &str,
     pmix_plan: spur_proto::proto::PmixLaunchPlan,
 ) -> Result<(), String> {
     let mut client = SlurmAgentClient::connect(agent_addr.to_string())
@@ -68,6 +84,9 @@ pub async fn prepare_pmix_on_agent(
             job_id,
             pmix_plan: Some(pmix_plan),
             run_attempt,
+            prepare_token: prepare_token.to_string(),
+            submission_generation: submission_generation.to_string(),
+            worker_incarnation: worker_incarnation.to_string(),
         })
         .await
         .map_err(|e| format!("PreparePmix RPC failed: {e}"))?
@@ -81,55 +100,107 @@ pub async fn prepare_pmix_on_agent(
     }
 }
 
-pub async fn release_pmix_on_agent(agent_addr: &str, job_id: u32) {
+pub async fn release_pmix_on_agent(
+    agent_addr: &str,
+    job_id: u32,
+    submission_generation: &str,
+    worker_incarnation: &str,
+    run_attempt: u32,
+    prepare_token: &str,
+) {
     let result = async {
         let mut client = SlurmAgentClient::connect(agent_addr.to_string())
             .await
             .map_err(|e| tonic::Status::unavailable(e.to_string()))?
             .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
             .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
-        client.release_pmix(ReleasePmixRequest { job_id }).await?;
+        client
+            .release_pmix(ReleasePmixRequest {
+                job_id,
+                run_attempt,
+                prepare_token: prepare_token.to_string(),
+                submission_generation: submission_generation.to_string(),
+                worker_incarnation: worker_incarnation.to_string(),
+            })
+            .await?;
         Ok::<(), tonic::Status>(())
     }
     .await;
     if let Err(e) = result {
-        warn!(job_id, agent = %agent_addr, error = %e, "ReleasePmix rollback failed");
+        warn!(job_id, run_attempt, prepare_token, agent = %agent_addr, error = %e, "ReleasePmix rollback failed");
     }
 }
 
-pub async fn release_pmix_on_agents(agent_addrs: &[String], job_id: u32) {
+pub async fn release_pmix_on_agents(
+    agents: &[(String, String)],
+    job_id: u32,
+    submission_generation: &str,
+    run_attempt: u32,
+    prepare_token: &str,
+) {
     let mut release_set = tokio::task::JoinSet::new();
-    for agent_addr in agent_addrs {
+    for (agent_addr, worker_incarnation) in agents {
         let agent_addr = agent_addr.clone();
+        let worker_incarnation = worker_incarnation.clone();
+        let submission_generation = submission_generation.to_string();
+        let prepare_token = prepare_token.to_string();
         release_set.spawn(async move {
-            release_pmix_on_agent(&agent_addr, job_id).await;
+            release_pmix_on_agent(
+                &agent_addr,
+                job_id,
+                &submission_generation,
+                &worker_incarnation,
+                run_attempt,
+                &prepare_token,
+            )
+            .await;
         });
     }
     while release_set.join_next().await.is_some() {}
 }
 
-/// Parallel PreparePmix on all nodes. Rolls back successful prepares when any node fails.
+/// Parallel PreparePmix on all nodes. `rollback_on_failure` is for srun step
+/// setup, where no durable batch-dispatch abort fence exists. Batch dispatch
+/// passes false: its exact-attempt CancelJob recovery is the only operation
+/// authorized to release a prepare, after JobDispatchAbortBegin commits.
 pub async fn prepare_pmix_on_nodes(
     job_id: u32,
+    submission_generation: &str,
     run_attempt: u32,
+    prepare_token: &str,
     nodes: Vec<PmixPrepareNode>,
+    rollback_on_failure: bool,
 ) -> Result<(), String> {
     if nodes.is_empty() {
         return Ok(());
     }
 
-    let all_agent_addrs: Vec<String> = nodes.iter().map(|n| n.agent_addr.clone()).collect();
+    let all_agents: Vec<(String, String)> = nodes
+        .iter()
+        .map(|n| (n.agent_addr.clone(), n.worker_incarnation.clone()))
+        .collect();
 
     let mut prepare_set = tokio::task::JoinSet::new();
     for node in nodes {
         let agent_addr = node.agent_addr.clone();
         let node_name = node.node_name.clone();
         let pmix_plan = node.pmix_plan;
+        let worker_incarnation = node.worker_incarnation;
+        let submission_generation = submission_generation.to_string();
+        let prepare_token = prepare_token.to_string();
         prepare_set.spawn(async move {
-            prepare_pmix_on_agent(&agent_addr, job_id, run_attempt, pmix_plan)
-                .await
-                .map(|()| agent_addr)
-                .map_err(|e| format!("{node_name}: {e}"))
+            prepare_pmix_on_agent(
+                &agent_addr,
+                job_id,
+                &submission_generation,
+                &worker_incarnation,
+                run_attempt,
+                &prepare_token,
+                pmix_plan,
+            )
+            .await
+            .map(|()| agent_addr)
+            .map_err(|e| format!("{node_name}: {e}"))
         });
     }
 
@@ -147,8 +218,17 @@ pub async fn prepare_pmix_on_nodes(
     }
 
     let detail = errors.join("; ");
-    error!(job_id, error = %detail, "PMIx prepare failed — rolling back prepared agents");
-    release_pmix_on_agents(&all_agent_addrs, job_id).await;
+    error!(job_id, run_attempt, prepare_token, error = %detail, "PMIx prepare failed");
+    if rollback_on_failure {
+        release_pmix_on_agents(
+            &all_agents,
+            job_id,
+            submission_generation,
+            run_attempt,
+            prepare_token,
+        )
+        .await;
+    }
     Err(detail)
 }
 
@@ -156,15 +236,27 @@ pub async fn prepare_pmix_on_nodes(
 /// before the normal release path runs.
 pub struct PmixPreparedReleaseGuard {
     job_id: u32,
-    agent_addrs: Vec<String>,
+    submission_generation: String,
+    run_attempt: u32,
+    prepare_token: String,
+    agents: Vec<(String, String)>,
     release: bool,
 }
 
 impl PmixPreparedReleaseGuard {
-    pub fn new(job_id: u32, agent_addrs: Vec<String>) -> Self {
+    pub fn new(
+        job_id: u32,
+        submission_generation: String,
+        run_attempt: u32,
+        prepare_token: String,
+        agents: Vec<(String, String)>,
+    ) -> Self {
         Self {
             job_id,
-            agent_addrs,
+            submission_generation,
+            run_attempt,
+            prepare_token,
+            agents,
             release: true,
         }
     }
@@ -180,9 +272,19 @@ impl Drop for PmixPreparedReleaseGuard {
             return;
         }
         let job_id = self.job_id;
-        let addrs = self.agent_addrs.clone();
+        let run_attempt = self.run_attempt;
+        let prepare_token = self.prepare_token.clone();
+        let agents = self.agents.clone();
+        let submission_generation = self.submission_generation.clone();
         tokio::spawn(async move {
-            release_pmix_on_agents(&addrs, job_id).await;
+            release_pmix_on_agents(
+                &agents,
+                job_id,
+                &submission_generation,
+                run_attempt,
+                &prepare_token,
+            )
+            .await;
         });
     }
 }
@@ -204,6 +306,30 @@ mod tests {
     fn multi_node_pmix_allowed_on_native_hosts() {
         let err = multi_node_pmix_unsupported([NodeSource::NativeHost]);
         assert!(err.is_none());
+    }
+
+    #[test]
+    fn prepare_tokens_are_stable_and_scope_batch_from_steps() {
+        assert_eq!(
+            batch_prepare_token("generation-a", 7),
+            "batch:generation-a:7"
+        );
+        assert_eq!(
+            step_prepare_token("generation-a", 7, 3),
+            "step:generation-a:7:3"
+        );
+        assert_ne!(
+            batch_prepare_token("generation-a", 7),
+            step_prepare_token("generation-a", 7, 3)
+        );
+        assert_ne!(
+            step_prepare_token("generation-a", 7, 3),
+            step_prepare_token("generation-a", 7, 4)
+        );
+        assert_ne!(
+            batch_prepare_token("generation-a", 7),
+            batch_prepare_token("generation-b", 7)
+        );
     }
 
     #[test]

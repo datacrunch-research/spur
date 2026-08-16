@@ -277,6 +277,10 @@ impl SlurmAccounting for AccountingService {
                 srun_step_dispatch: false,
                 req_gpus: 0,
                 req_gpus_detail: String::new(),
+                run_attempt: 0,
+                // Historical accounting rows predate execution generations.
+                submission_generation: String::new(),
+                submission_token: String::new(),
             })
             .collect();
 

@@ -160,6 +160,43 @@ fn default_equal() -> String {
     "Equal".to_string()
 }
 
+/// A terminal Pod completion durably queued for delivery to spurctld.
+///
+/// Entries remain in status after acknowledgement with `delivered = true` so
+/// a terminal Pod observed again after an operator restart is not re-enqueued.
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PodCompletionDelivery {
+    #[serde(default)]
+    pub pod_name: String,
+    #[serde(default)]
+    pub pod_uid: String,
+    #[serde(default)]
+    pub job_id: u32,
+    #[serde(default)]
+    pub state: i32,
+    #[serde(default)]
+    pub exit_code: i32,
+    #[serde(default)]
+    pub signal: i32,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub reporting_node: String,
+    #[serde(default)]
+    pub run_attempt: u32,
+    #[serde(default)]
+    pub submission_generation: String,
+    #[serde(default)]
+    pub submission_token: String,
+    #[serde(default)]
+    pub worker_incarnation: String,
+    #[serde(default)]
+    pub pod_dispatch_token: String,
+    #[serde(default)]
+    pub delivered: bool,
+}
+
 /// Status subresource for SpurJob.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -170,15 +207,124 @@ pub struct SpurJobStatus {
     /// Spur-assigned job ID.
     #[serde(default)]
     pub spur_job_id: Option<u32>,
+    /// Immutable controller submission identity used to fence delayed cleanup
+    /// from a future reuse of `spur_job_id`.
+    #[serde(default)]
+    pub submission_generation: Option<String>,
+    /// Operator-generated token persisted before the SubmitJob RPC. It is the
+    /// crash-recovery key for obtaining the original controller identity.
+    #[serde(default)]
+    pub submission_token: Option<String>,
+    /// SHA-256 of the canonical SpurJob spec persisted before SubmitJob. The
+    /// preview operator rejects later spec drift instead of launching a
+    /// workload different from the committed submission intent.
+    #[serde(default)]
+    pub launch_spec_sha256: Option<String>,
     /// Nodes assigned by the scheduler.
     #[serde(default)]
     pub assigned_nodes: Vec<String>,
     /// Pod names created for this job.
     #[serde(default)]
     pub pods: Vec<String>,
+    /// Immutable Pod UIDs recorded by the operator after creation. Completion
+    /// and cleanup require this provenance in addition to Pod metadata.
+    #[serde(default)]
+    pub pod_uids: std::collections::BTreeMap<String, String>,
+    /// Per-Pod dispatch nonces persisted before creation. A create-response
+    /// loss can adopt only a conflicting Pod carrying this durable nonce.
+    #[serde(default)]
+    pub pod_dispatch_tokens: std::collections::BTreeMap<String, String>,
+    /// Immutable Service UIDs recorded after creation. Service control and
+    /// finalization require this binding in addition to owner and annotations.
+    #[serde(default)]
+    pub service_uids: std::collections::BTreeMap<String, String>,
+    /// Per-Service attempt nonce persisted before creation. A create-response
+    /// loss may adopt only an exact desired Service carrying this nonce.
+    #[serde(default)]
+    pub service_dispatch_tokens: std::collections::BTreeMap<String, String>,
+    /// Durable terminal-completion outbox, keyed by immutable Pod UID.
+    /// A successful report is marked delivered instead of removed so watcher
+    /// replay and operator restarts cannot enqueue it again.
+    #[serde(default)]
+    pub completion_deliveries: std::collections::BTreeMap<String, PodCompletionDelivery>,
     /// Human-readable message.
     #[serde(default)]
     pub message: Option<String>,
+}
+
+pub(crate) fn validate_preview_launch_fields(spec: &SpurJobSpec) -> Result<(), String> {
+    let mut unsupported = Vec::new();
+    if !spec.tolerations.is_empty() {
+        unsupported.push("tolerations");
+    }
+    if !spec.node_selector.is_empty() {
+        unsupported.push("nodeSelector");
+    }
+    if spec.priority_class.is_some() {
+        unsupported.push("priorityClass");
+    }
+    if spec.service_account.is_some() {
+        unsupported.push("serviceAccount");
+    }
+    if unsupported.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Kubernetes preview does not yet support non-default {}",
+            unsupported.join(", ")
+        ))
+    }
+}
+
+pub(crate) fn resolved_submission_user(job: &SpurJob) -> String {
+    job.metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get("spur.amd.com/user"))
+        .cloned()
+        .unwrap_or_else(|| "k8s".to_string())
+}
+
+pub(crate) fn launch_spec_sha256(spec: &SpurJobSpec, user: &str) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    fn canonicalize(value: serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Array(values) => {
+                serde_json::Value::Array(values.into_iter().map(canonicalize).collect())
+            }
+            serde_json::Value::Object(values) => {
+                let mut entries: Vec<_> = values.into_iter().collect();
+                entries.sort_by(|left, right| left.0.cmp(&right.0));
+                let mut sorted = serde_json::Map::new();
+                for (key, value) in entries {
+                    sorted.insert(key, canonicalize(value));
+                }
+                serde_json::Value::Object(sorted)
+            }
+            scalar => scalar,
+        }
+    }
+
+    #[derive(serde::Serialize)]
+    struct LaunchIntent<'a> {
+        spec: &'a SpurJobSpec,
+        user: &'a str,
+    }
+
+    let value = serde_json::to_value(LaunchIntent { spec, user })
+        .map(canonicalize)
+        .map_err(|error| format!("cannot canonicalize SpurJob spec: {error}"))?;
+    let bytes = serde_json::to_vec(&value)
+        .map_err(|error| format!("cannot encode canonical SpurJob spec: {error}"))?;
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}")
+            .map_err(|error| format!("cannot encode SpurJob spec digest: {error}"))?;
+    }
+    Ok(encoded)
 }
 
 /// Convert a SpurJobSpec into a spur-core JobSpec for submission to spurctld.
@@ -600,9 +746,68 @@ mod tests {
         let status = SpurJobStatus::default();
         assert_eq!(status.state, "");
         assert!(status.spur_job_id.is_none());
+        assert!(status.launch_spec_sha256.is_none());
         assert!(status.assigned_nodes.is_empty());
         assert!(status.pods.is_empty());
+        assert!(status.service_dispatch_tokens.is_empty());
         assert!(status.message.is_none());
+    }
+
+    #[test]
+    fn launch_fingerprint_is_map_order_independent_and_user_bound() {
+        let mut first = minimal_spec();
+        first.env.insert("B".into(), "two".into());
+        first.env.insert("A".into(), "one".into());
+        first
+            .extra_resources
+            .insert("example.com/z".into(), "2".into());
+        first
+            .extra_resources
+            .insert("example.com/a".into(), "1".into());
+
+        let mut second = minimal_spec();
+        second.env.insert("A".into(), "one".into());
+        second.env.insert("B".into(), "two".into());
+        second
+            .extra_resources
+            .insert("example.com/a".into(), "1".into());
+        second
+            .extra_resources
+            .insert("example.com/z".into(), "2".into());
+
+        let first_digest = launch_spec_sha256(&first, "alice").unwrap();
+        assert_eq!(first_digest, launch_spec_sha256(&second, "alice").unwrap());
+        assert_ne!(first_digest, launch_spec_sha256(&second, "bob").unwrap());
+        assert_eq!(first_digest.len(), 64);
+    }
+
+    #[test]
+    fn preview_launch_fields_fail_closed_until_implemented() {
+        assert!(validate_preview_launch_fields(&minimal_spec()).is_ok());
+
+        let mut tolerations = minimal_spec();
+        tolerations.tolerations.push(TolerationSpec::default());
+        assert!(validate_preview_launch_fields(&tolerations)
+            .unwrap_err()
+            .contains("tolerations"));
+
+        let mut selector = minimal_spec();
+        selector.node_selector.insert("zone".into(), "west".into());
+        assert!(validate_preview_launch_fields(&selector)
+            .unwrap_err()
+            .contains("nodeSelector"));
+
+        let mut priority = minimal_spec();
+        priority.priority_class = Some("critical".into());
+        assert!(validate_preview_launch_fields(&priority)
+            .unwrap_err()
+            .contains("priorityClass"));
+
+        let mut service_account = minimal_spec();
+        service_account.service_account = Some("custom".into());
+        assert!(validate_preview_launch_fields(&service_account)
+            .unwrap_err()
+            .contains("serviceAccount"));
     }
 
     // --- CRD generation ---
@@ -615,6 +820,22 @@ mod tests {
         assert!(json.contains("spur.amd.com"));
         assert!(json.contains("SpurJob"));
         assert!(json.contains("v1alpha1"));
+
+        let generated = serde_json::to_value(crd).unwrap();
+        let generated_schema = generated
+            .pointer("/spec/versions/0/schema/openAPIV3Schema")
+            .unwrap();
+        for checked_in in [
+            include_str!("../../../examples/k8s/spurjob-crd.yaml"),
+            include_str!("../../../tests/k8s/e2e/manifests/spurjob-crd.yaml"),
+        ] {
+            let checked_in: serde_json::Value = serde_yaml::from_str(checked_in).unwrap();
+            assert_eq!(
+                Some(generated_schema),
+                checked_in.pointer("/spec/versions/0/schema/openAPIV3Schema"),
+                "checked-in CRD schema must match the generated structural schema"
+            );
+        }
     }
 
     // --- SpurJobSpec JSON roundtrip ---

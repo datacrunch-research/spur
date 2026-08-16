@@ -10,6 +10,18 @@
 use crate::array::aggregate_array_state;
 use crate::job::{Job, JobId, JobState};
 
+/// A terminal state is not externally final while its durable outbox marker is
+/// outstanding.  In particular, the Ack may atomically requeue it. Dependency
+/// and singleton decisions must wait for that committed choice rather than
+/// irreversibly launching/cancelling children from a transient terminal view.
+fn dependency_state(job: &Job) -> JobState {
+    if job.pending_finalization.is_some() {
+        JobState::Running
+    } else {
+        job.state
+    }
+}
+
 /// A parsed dependency condition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Dependency {
@@ -162,7 +174,7 @@ fn resolve_target_state(
     get_array_tasks: &dyn Fn(JobId) -> Vec<Job>,
 ) -> Option<JobState> {
     if let Some(job) = get_job(dep_id) {
-        return Some(job.state);
+        return Some(dependency_state(&job));
     }
     let tasks = get_array_tasks(dep_id);
     if tasks.is_empty() {
@@ -170,7 +182,7 @@ fn resolve_target_state(
     }
     // Array parent: aggregate; unfinished -> Running sentinel (see doc).
     Some(
-        aggregate_array_state(&tasks.iter().map(|t| t.state).collect::<Vec<_>>())
+        aggregate_array_state(&tasks.iter().map(dependency_state).collect::<Vec<_>>())
             .unwrap_or(JobState::Running),
     )
 }
@@ -272,7 +284,7 @@ pub fn check_dependencies(
                             }
                         } else {
                             match tasks.iter().find(|t| t.spec.array_task_id == Some(task_n)) {
-                                Some(t) => match t.state {
+                                Some(t) => match dependency_state(t) {
                                     JobState::Completed => {}
                                     s if s.is_terminal() => return DependencyResult::Failed,
                                     _ => return DependencyResult::Waiting,
@@ -298,7 +310,7 @@ pub fn check_dependencies(
                 let matching = get_jobs_by_name_user(&job.spec.name, &job.spec.user);
                 let has_active = matching.iter().any(|j| {
                     j.job_id != job.job_id
-                        && (j.state == JobState::Running || j.state == JobState::Pending)
+                        && (matches!(dependency_state(j), JobState::Running | JobState::Pending))
                 });
                 if has_active {
                     return DependencyResult::Waiting;
@@ -323,7 +335,7 @@ pub enum DependencyResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::job::JobSpec;
+    use crate::job::{FinalizationIntent, JobSpec, PendingFinalization};
 
     fn make_job(id: JobId, state: JobState) -> Job {
         let mut job = Job::new(
@@ -341,6 +353,107 @@ mod tests {
             }
         }
         job
+    }
+
+    fn with_pending_finalization(mut job: Job) -> Job {
+        let end_time = chrono::Utc::now();
+        job.end_time = Some(end_time);
+        job.exit_code = Some(if job.state == JobState::Completed {
+            0
+        } else {
+            -1
+        });
+        job.pending_finalization = Some(PendingFinalization {
+            finalization_id: Default::default(),
+            submission_generation: job.submission_generation,
+            run_attempt: job.run_attempt,
+            state: job.state,
+            exit_code: job.exit_code.unwrap(),
+            exit_signal: 0,
+            derived_exit_code: 0,
+            end_time,
+            intent: FinalizationIntent::AutoRequeue,
+        });
+        job
+    }
+
+    #[test]
+    fn pending_finalization_keeps_scalar_dependencies_unresolved() {
+        for dependency in ["after:100", "afterok:100", "afterany:100", "afternotok:100"] {
+            let parent = with_pending_finalization(make_job(100, JobState::Completed));
+            let child = Job::new(
+                1,
+                JobSpec {
+                    name: "child".into(),
+                    user: "alice".into(),
+                    dependency: vec![dependency.into()],
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                check_dependencies(
+                    &child,
+                    &|id| (id == 100).then(|| parent.clone()),
+                    &|_| Vec::new(),
+                    &|_, _| Vec::new(),
+                ),
+                DependencyResult::Waiting,
+                "{dependency} must wait for the exact finalization Ack"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_finalization_keeps_array_aggregate_and_aftercorr_unresolved() {
+        let tasks = vec![
+            make_array_task(100, 0, JobState::Completed),
+            with_pending_finalization(make_array_task(100, 1, JobState::Completed)),
+        ];
+        let get_tasks = |id| if id == 100 { tasks.clone() } else { Vec::new() };
+
+        for dependency in ["afterok:100", "afterany:100", "afternotok:100"] {
+            let child = child_with_dep(dependency);
+            assert_eq!(
+                check_dependencies(&child, &|_| None, &get_tasks, &|_, _| Vec::new()),
+                DependencyResult::Waiting,
+                "array {dependency} must wait for every task's finalization Ack"
+            );
+        }
+
+        let mut correlated = child_with_dep("aftercorr:100");
+        correlated.spec.array_job_id = Some(200);
+        correlated.spec.array_task_id = Some(1);
+        assert_eq!(
+            check_dependencies(&correlated, &|_| None, &get_tasks, &|_, _| Vec::new()),
+            DependencyResult::Waiting
+        );
+    }
+
+    #[test]
+    fn pending_finalization_still_blocks_singleton() {
+        let mut contender = Job::new(
+            1,
+            JobSpec {
+                name: "one-at-a-time".into(),
+                user: "alice".into(),
+                dependency: vec!["singleton".into()],
+                ..Default::default()
+            },
+        );
+        contender.job_id = 1;
+        let peer = with_pending_finalization(make_job(2, JobState::Completed));
+        let mut peer = peer;
+        peer.spec.name = contender.spec.name.clone();
+        assert_eq!(
+            check_dependencies(&contender, &|_| None, &|_| Vec::new(), &|name, user| {
+                if name == peer.spec.name && user == peer.spec.user {
+                    vec![peer.clone()]
+                } else {
+                    Vec::new()
+                }
+            },),
+            DependencyResult::Waiting
+        );
     }
 
     #[test]

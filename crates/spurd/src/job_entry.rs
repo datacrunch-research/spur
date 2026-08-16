@@ -12,6 +12,9 @@ pub struct JobEntry {
     pub uid: u32,
     pub gid: u32,
     pub work_dir: String,
+    pub cgroup_path: Option<std::path::PathBuf>,
+    pub submission_generation: String,
+    pub run_attempt: u32,
 }
 
 impl JobEntry {
@@ -63,6 +66,9 @@ mod tests {
             uid: 1000,
             gid: 1000,
             work_dir: "/home/user".into(),
+            cgroup_path: None,
+            submission_generation: "test-generation".into(),
+            run_attempt: 1,
         };
         let args = entry.nsenter_args();
         assert_eq!(args, vec!["--target", "1234", "--mount", "--pid"]);
@@ -78,6 +84,9 @@ mod tests {
             uid: 0,
             gid: 0,
             work_dir: "/".into(),
+            cgroup_path: None,
+            submission_generation: "test-generation".into(),
+            run_attempt: 1,
         };
         let args = entry.nsenter_args();
         assert_eq!(args, vec!["--target", "5678", "--user", "--mount", "--pid"]);
@@ -93,6 +102,9 @@ mod tests {
             uid: 1000,
             gid: 1000,
             work_dir: "/tmp".into(),
+            cgroup_path: None,
+            submission_generation: "test-generation".into(),
+            run_attempt: 1,
         };
         assert!(!entry.has_namespaces());
         let args = entry.nsenter_args();
@@ -109,6 +121,9 @@ mod tests {
             uid: 1000,
             gid: 1000,
             work_dir: "/".into(),
+            cgroup_path: None,
+            submission_generation: "test-generation".into(),
+            run_attempt: 1,
         };
         let args = entry.nsenter_args();
         assert_eq!(args, vec!["--target", "4444", "--user", "--mount", "--pid"]);

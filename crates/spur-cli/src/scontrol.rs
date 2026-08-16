@@ -341,6 +341,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                     job_id,
                     signal: 0,
                     user: crate::interactive::current_user()?,
+                    expected_submission_generation: String::new(),
                 })
                 .await
                 .context("requeue failed")?;
@@ -1356,6 +1357,7 @@ async fn update_node(
             labels: HashMap::new(),
             remove_labels: Vec::new(),
             external_gpus,
+            expected_worker_incarnation: String::new(),
         })
         .await
         .context("node update failed")?;

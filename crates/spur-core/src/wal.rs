@@ -4,7 +4,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::admission::AdmissionToken;
-use crate::job::{JobId, JobSpec, JobState, PendingReason};
+use crate::job::{
+    DurableFinalizationContext, FinalizationAction, FinalizationIntent, JobId, JobSpec, JobState,
+    PendingFinalization, PendingReason,
+};
 use crate::k0s::{K0sPhase, K0sRole};
 use crate::node::{NodeSource, NodeState};
 use crate::partition::Partition;
@@ -12,6 +15,59 @@ use crate::reservation::Reservation;
 use std::collections::HashMap;
 
 use crate::resource::{ResourceAllocations, ResourceSet};
+use uuid::Uuid;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobSubmissionMetadata {
+    pub generation: Uuid,
+    pub submitted_at: chrono::DateTime<chrono::Utc>,
+    /// Present for callers that need durable, replicated submit idempotency.
+    /// The fingerprint is computed from the exact pre-admission user/spec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency: Option<JobSubmissionIdempotency>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobSubmissionIdempotency {
+    pub token: String,
+    pub user: String,
+    pub spec_sha256: String,
+}
+
+impl JobSubmissionMetadata {
+    pub fn new(submitted_at: chrono::DateTime<chrono::Utc>) -> Self {
+        Self {
+            generation: Uuid::new_v4(),
+            submitted_at,
+            idempotency: None,
+        }
+    }
+
+    pub fn new_idempotent(
+        submitted_at: chrono::DateTime<chrono::Utc>,
+        token: String,
+        user: String,
+        spec_sha256: String,
+    ) -> Self {
+        Self {
+            generation: Uuid::new_v4(),
+            submitted_at,
+            idempotency: Some(JobSubmissionIdempotency {
+                token,
+                user,
+                spec_sha256,
+            }),
+        }
+    }
+
+    pub fn legacy() -> Self {
+        Self {
+            generation: Uuid::nil(),
+            submitted_at: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+            idempotency: None,
+        }
+    }
+}
 
 fn default_port() -> u16 {
     6818
@@ -24,6 +80,10 @@ pub enum WalOperation {
     JobSubmit {
         job_id: JobId,
         spec: Box<JobSpec>,
+        /// New submissions always provide this. `None` preserves replay of
+        /// submit entries written before metadata became part of the WAL.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<JobSubmissionMetadata>,
     },
     JobStateChange {
         job_id: JobId,
@@ -51,6 +111,9 @@ pub enum WalOperation {
         /// Per-node allocation slices (device IDs are node-local).
         #[serde(default)]
         per_node_alloc: HashMap<String, ResourceAllocations>,
+        /// Exact worker registrations that ACKed a standalone allocation.
+        #[serde(default)]
+        allocated_node_incarnations: HashMap<String, String>,
         /// Standalone srun: native step dispatch (false = K8s batch fallback).
         #[serde(default)]
         srun_step_dispatch: bool,
@@ -58,16 +121,82 @@ pub enum WalOperation {
         #[serde(default)]
         run_attempt: u32,
     },
+    /// Atomically publish a standalone-srun allocation after every worker has
+    /// accepted the exact generation at its reserved zero attempt.
+    JobStandaloneStart {
+        job_id: JobId,
+        #[serde(default)]
+        submission_generation: Uuid,
+        nodes: Vec<String>,
+        resources: ResourceAllocations,
+        #[serde(default)]
+        per_node_alloc: HashMap<String, ResourceAllocations>,
+        #[serde(default)]
+        target_incarnations: HashMap<String, String>,
+    },
+    /// Finalize a standalone allocation only after every exact worker target
+    /// has acknowledged TERMINATE_AND_REAP. The generation fence prevents a
+    /// delayed controller proposal from cancelling a replacement that reused
+    /// the numeric job ID.
+    JobStandaloneCancel {
+        job_id: JobId,
+        #[serde(default)]
+        submission_generation: Uuid,
+    },
+    /// Atomically record a batch dispatch proven on every target by an ACK or
+    /// exact completion, together with its allocation and batch step as durable
+    /// `Committed` preparation. Running remains hidden so crash recovery can
+    /// emit BEGIN/accounting before any buffered completion publishes END.
+    JobDispatchCommit {
+        job_id: JobId,
+        #[serde(default)]
+        submission_generation: Uuid,
+        nodes: Vec<String>,
+        resources: ResourceAllocations,
+        per_node_alloc: HashMap<String, ResourceAllocations>,
+        run_attempt: u32,
+    },
+    /// Complete external start publication for a committed batch dispatch.
+    /// The leader emits BEGIN/accounting first, then this entry atomically
+    /// transitions Pending to Running and consumes buffered completions. The
+    /// ownership record remains until exact completion or cleanup proof.
+    JobDispatchPublish {
+        job_id: JobId,
+        #[serde(default)]
+        submission_generation: Uuid,
+        run_attempt: u32,
+    },
     JobComplete {
         job_id: JobId,
         exit_code: i32,
         state: JobState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        finalization_intent: Option<FinalizationIntent>,
+    },
+    JobFinalizationAck {
+        job_id: JobId,
+        marker: PendingFinalization,
+        #[serde(default)]
+        action: FinalizationAction,
     },
     JobNodeComplete {
         job_id: JobId,
+        #[serde(default)]
+        submission_generation: Uuid,
+        #[serde(default)]
+        worker_incarnation: String,
         node_name: String,
         exit_code: i32,
         signal: i32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        drain_reason: Option<String>,
+        /// Worker launch epoch. Zero preserves pre-epoch WAL compatibility.
+        #[serde(default)]
+        run_attempt: u32,
+        /// Present for tokened external reconcilers so exact completion
+        /// receipts remain addressable after the Job is evicted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        submission_token: Option<String>,
     },
     /// The time-limit watchdog signalled a running job for exhausting its wall
     /// clock. Durable so the grace period survives a leadership change and so
@@ -82,6 +211,10 @@ pub enum WalOperation {
     /// job's DerivedExitCode (running max over steps) survives restart/replay.
     JobStepComplete {
         job_id: JobId,
+        #[serde(default)]
+        submission_generation: Uuid,
+        #[serde(default)]
+        run_attempt: u32,
         step_id: u32,
         exit_code: i32,
     },
@@ -113,7 +246,72 @@ pub enum WalOperation {
     /// if the job has since left Pending.
     JobDispatchBackoff {
         job_id: JobId,
+        #[serde(default)]
+        submission_generation: Uuid,
         begin_time: chrono::DateTime<chrono::Utc>,
+    },
+    /// Reserve exact ownership before any worker-visible RPC. Batch launches
+    /// reserve a monotonically increasing epoch; standalone registration uses
+    /// attempt zero but persists generation, targets, and worker incarnations
+    /// before `RegisterJobAllocation` can appear in a heartbeat.
+    ///
+    /// This new enum variant is a stop-the-world controller upgrade boundary;
+    /// see the deployment upgrade guide.
+    JobDispatchBegin {
+        job_id: JobId,
+        #[serde(default)]
+        submission_generation: Uuid,
+        expected_run_attempt: u32,
+        run_attempt: u32,
+        target_nodes: Vec<String>,
+        #[serde(default)]
+        target_incarnations: HashMap<String, String>,
+        resources: ResourceAllocations,
+        per_node_alloc: HashMap<String, ResourceAllocations>,
+    },
+    /// Irreversibly fence a pre-commit fanout against becoming Running before
+    /// any worker cancel is sent. Commit accepts only `Launching`; cleanup
+    /// accepts only `Aborting`, so their Raft order decides the race.
+    JobDispatchAbortBegin {
+        job_id: JobId,
+        #[serde(default)]
+        submission_generation: Uuid,
+        run_attempt: u32,
+    },
+    /// Persist one exact worker cleanup ACK and release only that target's
+    /// allocation slice.
+    JobDispatchTargetClear {
+        job_id: JobId,
+        #[serde(default)]
+        submission_generation: Uuid,
+        run_attempt: u32,
+        node_name: String,
+    },
+    /// Clear a dispatch intent only after every target has acknowledged an
+    /// attempt-scoped exact reap. Matching generation and attempt makes
+    /// replay/out-of-order cleanup deterministic, including attempt zero.
+    JobDispatchClear {
+        job_id: JobId,
+        #[serde(default)]
+        submission_generation: Uuid,
+        run_attempt: u32,
+    },
+    /// Temporarily reject placement resources that an external-occupancy
+    /// prolog found busy. `whole_nodes` applies to this job only; `gpu_ids`
+    /// preserves shared-GPU placement by rejecting exact device IDs. Unlike
+    /// `JobDispatchBackoff`, this never consumes `max_batch_requeue`.
+    ///
+    /// Rolling-upgrade note: this new enum variant is intentionally a
+    /// stop-the-world controller upgrade boundary. An older controller cannot
+    /// deserialize it from the Raft log; upgrade every controller before
+    /// scheduling jobs with the new behavior.
+    JobTransientCapacityReject {
+        job_id: JobId,
+        #[serde(default)]
+        submission_generation: Uuid,
+        whole_nodes: Vec<String>,
+        gpu_ids: HashMap<String, Vec<u32>>,
+        retry_after: chrono::DateTime<chrono::Utc>,
     },
     /// Preempt a running job and requeue it in one atomic step: free its node
     /// allocation, end the prior run for accounting (as PREEMPTED), return it to
@@ -158,6 +356,8 @@ pub enum WalOperation {
         name: String,
         #[serde(default)]
         hostname: String,
+        #[serde(default)]
+        incarnation: String,
         resources: ResourceSet,
         address: String,
         #[serde(default = "default_port")]
@@ -175,6 +375,8 @@ pub enum WalOperation {
         name: String,
         #[serde(default)]
         hostname: String,
+        #[serde(default)]
+        incarnation: String,
         resources: ResourceSet,
         address: String,
         port: u16,
@@ -185,7 +387,20 @@ pub enum WalOperation {
     },
     NodeStateChange {
         name: String,
+        #[serde(default)]
+        expected_incarnation: String,
         old_state: NodeState,
+        new_state: NodeState,
+        reason: Option<String>,
+        #[serde(default)]
+        admin_locked: bool,
+    },
+    /// Agent-originated node state transition fenced to one worker process.
+    NodeStateChangeExact {
+        name: String,
+        expected_incarnation: String,
+        #[serde(default)]
+        expected_old_state: Option<NodeState>,
         new_state: NodeState,
         reason: Option<String>,
         #[serde(default)]
@@ -207,6 +422,14 @@ pub enum WalOperation {
     // Node deregistration
     NodeRemove {
         name: String,
+        #[serde(default)]
+        expected_incarnation: String,
+        reason: Option<String>,
+    },
+    /// Agent deregistration fenced to the exact process that requested it.
+    NodeRemoveExact {
+        name: String,
+        expected_incarnation: String,
         reason: Option<String>,
     },
 
@@ -293,6 +516,27 @@ pub enum WalOperation {
         name: String,
         error: Option<String>,
     },
+
+    /// Idempotent external-reconciler cancellation fenced to one immutable
+    /// submission. This is a stop-the-world upgrade boundary: older controllers
+    /// cannot deserialize the new externally tagged WAL variant.
+    JobCancelExact {
+        job_id: JobId,
+        expected_submission_generation: Uuid,
+    },
+
+    /// Permanently reject future submission with this token and atomically
+    /// cancel the exact submission already bound to it, if any. This is a
+    /// stop-the-world upgrade boundary for older controllers, like
+    /// `JobCancelExact` above.
+    SubmissionTokenCancel {
+        token: String,
+    },
+
+    DurableFinalization {
+        context: DurableFinalizationContext,
+        operation: Box<WalOperation>,
+    },
 }
 
 impl WalOperation {
@@ -375,8 +619,100 @@ impl WalOperation {
             nodes,
             resources,
             per_node_alloc,
+            allocated_node_incarnations: HashMap::new(),
             srun_step_dispatch: false,
             run_attempt: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod standalone_start_wal_tests {
+    use super::*;
+
+    #[test]
+    fn standalone_start_identity_round_trips_and_defaults_missing_fences() {
+        let generation = Uuid::new_v4();
+        let op = WalOperation::JobStandaloneStart {
+            job_id: 7,
+            submission_generation: generation,
+            nodes: vec!["n1".into()],
+            resources: ResourceAllocations::with_scalar(1, 1_000),
+            per_node_alloc: HashMap::from([(
+                "n1".into(),
+                ResourceAllocations::with_scalar(1, 1_000),
+            )]),
+            target_incarnations: HashMap::from([("n1".into(), "worker-a".into())]),
+        };
+        let restored: WalOperation =
+            serde_json::from_value(serde_json::to_value(&op).unwrap()).unwrap();
+        match restored {
+            WalOperation::JobStandaloneStart {
+                submission_generation,
+                target_incarnations,
+                ..
+            } => {
+                assert_eq!(submission_generation, generation);
+                assert_eq!(
+                    target_incarnations.get("n1").map(String::as_str),
+                    Some("worker-a")
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let mut legacy = serde_json::to_value(op).unwrap();
+        legacy["JobStandaloneStart"]
+            .as_object_mut()
+            .unwrap()
+            .remove("target_incarnations");
+        legacy["JobStandaloneStart"]
+            .as_object_mut()
+            .unwrap()
+            .remove("submission_generation");
+        let restored: WalOperation = serde_json::from_value(legacy).unwrap();
+        match restored {
+            WalOperation::JobStandaloneStart {
+                submission_generation,
+                target_incarnations,
+                ..
+            } => {
+                assert_eq!(submission_generation, Uuid::nil());
+                assert!(target_incarnations.is_empty());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn standalone_cancel_generation_round_trips_and_defaults_missing_fence() {
+        let generation = Uuid::new_v4();
+        let op = WalOperation::JobStandaloneCancel {
+            job_id: 7,
+            submission_generation: generation,
+        };
+        let restored: WalOperation =
+            serde_json::from_value(serde_json::to_value(&op).unwrap()).unwrap();
+        match restored {
+            WalOperation::JobStandaloneCancel {
+                submission_generation,
+                ..
+            } => assert_eq!(submission_generation, generation),
+            _ => panic!("wrong variant"),
+        }
+
+        let mut legacy = serde_json::to_value(op).unwrap();
+        legacy["JobStandaloneCancel"]
+            .as_object_mut()
+            .unwrap()
+            .remove("submission_generation");
+        let restored: WalOperation = serde_json::from_value(legacy).unwrap();
+        match restored {
+            WalOperation::JobStandaloneCancel {
+                submission_generation,
+                ..
+            } => assert_eq!(submission_generation, Uuid::nil()),
+            _ => panic!("wrong variant"),
         }
     }
 }
@@ -534,16 +870,147 @@ mod job_state_change_wal_tests {
     #[test]
     fn job_dispatch_backoff_round_trips() {
         let hold = chrono::Utc::now() + chrono::Duration::seconds(20);
+        let generation = Uuid::new_v4();
         let op = WalOperation::JobDispatchBackoff {
             job_id: 8,
+            submission_generation: generation,
             begin_time: hold,
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
         match back {
-            WalOperation::JobDispatchBackoff { job_id, begin_time } => {
+            WalOperation::JobDispatchBackoff {
+                job_id,
+                submission_generation,
+                begin_time,
+            } => {
                 assert_eq!(job_id, 8);
+                assert_eq!(submission_generation, generation);
                 assert_eq!(begin_time, hold);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn transient_capacity_rejection_round_trips() {
+        let retry_after = chrono::Utc::now() + chrono::Duration::seconds(30);
+        let generation = Uuid::new_v4();
+        let op = WalOperation::JobTransientCapacityReject {
+            job_id: 9,
+            submission_generation: generation,
+            whole_nodes: vec!["n1".into()],
+            gpu_ids: HashMap::from([("n3".into(), vec![1, 3])]),
+            retry_after,
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            WalOperation::JobTransientCapacityReject {
+                job_id,
+                submission_generation,
+                whole_nodes,
+                gpu_ids,
+                retry_after: actual,
+            } => {
+                assert_eq!(job_id, 9);
+                assert_eq!(submission_generation, generation);
+                assert_eq!(whole_nodes, vec!["n1"]);
+                assert_eq!(gpu_ids, HashMap::from([("n3".into(), vec![1, 3])]));
+                assert_eq!(actual, retry_after);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn dispatch_begin_round_trips() {
+        let resources = ResourceAllocations::with_scalar(4, 2048);
+        let per_node_alloc = HashMap::from([
+            ("n1".into(), ResourceAllocations::with_scalar(2, 1024)),
+            ("n2".into(), ResourceAllocations::with_scalar(2, 1024)),
+        ]);
+        let op = WalOperation::JobDispatchBegin {
+            job_id: 11,
+            submission_generation: Uuid::nil(),
+            expected_run_attempt: 3,
+            run_attempt: 4,
+            target_nodes: vec!["n1".into(), "n2".into()],
+            target_incarnations: HashMap::new(),
+            resources: resources.clone(),
+            per_node_alloc: per_node_alloc.clone(),
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            WalOperation::JobDispatchBegin {
+                job_id,
+                submission_generation,
+                expected_run_attempt,
+                run_attempt,
+                target_nodes,
+                target_incarnations,
+                resources: actual_resources,
+                per_node_alloc: actual_per_node_alloc,
+            } => {
+                assert_eq!(job_id, 11);
+                assert_eq!(submission_generation, Uuid::nil());
+                assert_eq!(expected_run_attempt, 3);
+                assert_eq!(run_attempt, 4);
+                assert_eq!(target_nodes, vec!["n1", "n2"]);
+                assert!(target_incarnations.is_empty());
+                assert_eq!(actual_resources, resources);
+                assert_eq!(actual_per_node_alloc, per_node_alloc);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let clear = WalOperation::JobDispatchClear {
+            job_id: 11,
+            submission_generation: Uuid::nil(),
+            run_attempt: 4,
+        };
+        let json = serde_json::to_string(&clear).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<WalOperation>(&json).unwrap(),
+            WalOperation::JobDispatchClear {
+                job_id: 11,
+                run_attempt: 4,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn dispatch_commit_round_trips() {
+        let resources = ResourceAllocations::with_scalar(2, 1024);
+        let per_node_alloc =
+            HashMap::from([("n1".into(), ResourceAllocations::with_scalar(2, 1024))]);
+        let op = WalOperation::JobDispatchCommit {
+            job_id: 12,
+            submission_generation: Uuid::nil(),
+            nodes: vec!["n1".into()],
+            resources: resources.clone(),
+            per_node_alloc: per_node_alloc.clone(),
+            run_attempt: 7,
+        };
+        let back: WalOperation =
+            serde_json::from_str(&serde_json::to_string(&op).unwrap()).unwrap();
+        match back {
+            WalOperation::JobDispatchCommit {
+                job_id,
+                submission_generation,
+                nodes,
+                resources: actual_resources,
+                per_node_alloc: actual_per_node_alloc,
+                run_attempt,
+            } => {
+                assert_eq!(job_id, 12);
+                assert_eq!(submission_generation, Uuid::nil());
+                assert_eq!(nodes, vec!["n1"]);
+                assert_eq!(actual_resources, resources);
+                assert_eq!(actual_per_node_alloc, per_node_alloc);
+                assert_eq!(run_attempt, 7);
             }
             _ => panic!("wrong variant"),
         }
@@ -696,8 +1163,13 @@ mod tests {
             "v0.5.1 JobSubmit must deserialize; a new JobSpec field needs #[serde(default)]",
         );
         match op {
-            WalOperation::JobSubmit { job_id, spec } => {
+            WalOperation::JobSubmit {
+                job_id,
+                spec,
+                metadata,
+            } => {
                 assert_eq!(job_id, 7);
+                assert!(metadata.is_none());
                 assert_eq!(spec.name, "fixture");
                 assert_eq!(spec.work_dir, "/home/alice");
                 assert!(!spec.pty);
@@ -720,13 +1192,19 @@ mod tests {
                 mpi: Some("pmix".into()),
                 ..Default::default()
             }),
+            metadata: Some(JobSubmissionMetadata::new(chrono::Utc::now())),
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
         match back {
-            WalOperation::JobSubmit { job_id, spec } => {
+            WalOperation::JobSubmit {
+                job_id,
+                spec,
+                metadata,
+            } => {
                 assert_eq!(job_id, 99);
                 assert_eq!(spec.mpi.as_deref(), Some("pmix"));
+                assert!(metadata.is_some());
             }
             _ => panic!("wrong variant"),
         }
@@ -736,9 +1214,14 @@ mod tests {
     fn job_node_complete_signal_round_trips() {
         let op = WalOperation::JobNodeComplete {
             job_id: 1,
+            submission_generation: Uuid::nil(),
+            worker_incarnation: "worker-incarnation".into(),
+            drain_reason: None,
             node_name: "n0".into(),
             exit_code: 0,
             signal: 9,
+            run_attempt: 4,
+            submission_token: Some("submission-token".into()),
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
@@ -746,16 +1229,39 @@ mod tests {
         match back {
             WalOperation::JobNodeComplete {
                 job_id,
+                submission_generation,
+                worker_incarnation,
+                drain_reason,
                 node_name,
                 exit_code,
                 signal,
+                run_attempt,
+                submission_token,
             } => {
                 assert_eq!(job_id, 1);
+                assert_eq!(submission_generation, Uuid::nil());
+                assert_eq!(worker_incarnation, "worker-incarnation");
+                assert_eq!(drain_reason, None);
                 assert_eq!(node_name, "n0");
                 assert_eq!(exit_code, 0);
                 assert_eq!(signal, 9);
+                assert_eq!(submission_token.as_deref(), Some("submission-token"));
+                assert_eq!(run_attempt, 4);
             }
             _ => panic!("wrong variant"),
+        }
+
+        let mut legacy = serde_json::to_value(&op).unwrap();
+        legacy
+            .get_mut("JobNodeComplete")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("externally tagged node-complete entry")
+            .remove("submission_token");
+        match serde_json::from_value::<WalOperation>(legacy).unwrap() {
+            WalOperation::JobNodeComplete {
+                submission_token, ..
+            } => assert_eq!(submission_token, None),
+            _ => panic!("wrong legacy variant"),
         }
     }
 }
@@ -768,12 +1274,13 @@ mod deregistration_wal_tests {
     fn node_remove_round_trips() {
         let op = WalOperation::NodeRemove {
             name: "gpu01".into(),
+            expected_incarnation: String::new(),
             reason: Some("decommission".into()),
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
         match back {
-            WalOperation::NodeRemove { name, reason } => {
+            WalOperation::NodeRemove { name, reason, .. } => {
                 assert_eq!(name, "gpu01");
                 assert_eq!(reason.as_deref(), Some("decommission"));
             }
@@ -913,16 +1420,61 @@ mod deregistration_wal_tests {
     fn node_remove_none_reason_round_trips() {
         let op = WalOperation::NodeRemove {
             name: "n0".into(),
+            expected_incarnation: String::new(),
             reason: None,
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
         match back {
-            WalOperation::NodeRemove { name, reason } => {
+            WalOperation::NodeRemove { name, reason, .. } => {
                 assert_eq!(name, "n0");
                 assert!(reason.is_none());
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn legacy_node_lifecycle_entries_default_to_unfenced_replay() {
+        let operations = [
+            WalOperation::NodeStateChange {
+                name: "n0".into(),
+                expected_incarnation: "worker-a".into(),
+                old_state: NodeState::Idle,
+                new_state: NodeState::Down,
+                reason: None,
+                admin_locked: false,
+            },
+            WalOperation::NodeRemove {
+                name: "n0".into(),
+                expected_incarnation: "worker-a".into(),
+                reason: None,
+            },
+        ];
+
+        for operation in operations {
+            let mut value = serde_json::to_value(operation).unwrap();
+            let payload = value
+                .as_object_mut()
+                .unwrap()
+                .values_mut()
+                .next()
+                .unwrap()
+                .as_object_mut()
+                .unwrap();
+            payload.remove("expected_incarnation");
+            let restored: WalOperation = serde_json::from_value(value).unwrap();
+            match restored {
+                WalOperation::NodeStateChange {
+                    expected_incarnation,
+                    ..
+                }
+                | WalOperation::NodeRemove {
+                    expected_incarnation,
+                    ..
+                } => assert!(expected_incarnation.is_empty()),
+                _ => unreachable!(),
+            }
         }
     }
 
@@ -1068,7 +1620,9 @@ mod evict_wal_tests {
     fn job_step_create_op_round_trips() {
         let step = JobStep {
             job_id: 7,
+            submission_generation: Uuid::nil(),
             step_id: 1,
+            run_attempt: 0,
             name: "hostname".into(),
             state: StepState::Running,
             num_tasks: 2,

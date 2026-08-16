@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -9,6 +10,7 @@ use sqlx::PgPool;
 use tracing::error;
 
 use spur_core::job::{JobId, JobState};
+use uuid::Uuid;
 
 const RETRY_ATTEMPTS: u32 = 3;
 const RETRY_BACKOFF: Duration = Duration::from_millis(200);
@@ -51,8 +53,11 @@ where
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub struct JobStartRecord {
     pub job_id: JobId,
+    pub submission_generation: Uuid,
+    pub run_attempt: u32,
     pub name: String,
     pub user: String,
     pub account: String,
@@ -66,6 +71,37 @@ pub struct JobStartRecord {
     pub reservation: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct JobEndRecord {
+    pub job_id: JobId,
+    pub submission_generation: Uuid,
+    pub run_attempt: u32,
+    /// Immutable durable-finalization identity. Legacy records may carry nil;
+    /// the database then falls back to the exact execution tuple.
+    pub finalization_id: Uuid,
+    pub state: JobState,
+    pub exit_code: i32,
+    pub end_time: DateTime<Utc>,
+    pub exit_signal: i32,
+    pub derived_exit_code: i32,
+    pub user: String,
+    pub account: String,
+    pub start_time: DateTime<Utc>,
+    pub num_tasks: u32,
+    pub cpus_per_task: u32,
+}
+
+pub type AccountingFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>;
+
+/// Injectable accounting boundary. Production uses PostgreSQL; controller
+/// tests use an in-memory implementation to exercise durable retry/ACK
+/// ordering without requiring an external service.
+pub trait AccountingSink: Send + Sync {
+    fn record_start(&self, record: JobStartRecord) -> AccountingFuture<'_>;
+    fn record_finalization(&self, record: JobEndRecord) -> AccountingFuture<'_>;
+}
+
+#[derive(Clone)]
 pub struct AccountingNotifier {
     pool: PgPool,
 }
@@ -75,9 +111,14 @@ impl AccountingNotifier {
         Self { pool }
     }
 
-    pub fn notify_job_start(&self, record: JobStartRecord) {
+    /// Attempt a start write before a committed dispatch publishes Running.
+    /// Bounded by `retry_with_backoff`; failure is logged and does not strand
+    /// dispatch.
+    pub async fn notify_job_start_ordered(&self, record: JobStartRecord) -> anyhow::Result<()> {
         let pool = self.pool.clone();
         let job_id = record.job_id;
+        let submission_generation = record.submission_generation;
+        let run_attempt = record.run_attempt;
         let name = record.name;
         let user = record.user;
         let account = record.account;
@@ -89,61 +130,87 @@ impl AccountingNotifier {
         let submit_time = record.submit_time;
         let start_time = record.start_time;
         let reservation = record.reservation.unwrap_or_default();
-        tokio::spawn(async move {
-            let write = || async {
-                let mut conn = pool.acquire().await?;
-                super::db::record_job_start(
-                    &mut conn,
-                    job_id as i32,
-                    &name,
-                    &user,
-                    &account,
-                    &partition,
-                    num_nodes,
-                    num_tasks,
-                    cpus_per_task,
-                    memory_mb,
-                    submit_time,
-                    start_time,
-                    &reservation,
-                )
-                .await
-            };
-            if let Err(e) = retry_with_backoff(write, RETRY_ATTEMPTS, RETRY_BACKOFF).await {
-                error!(job_id, error = %e, "failed to record job start in accounting after retries");
-            }
-        });
+        let write = || async {
+            super::db::record_job_start_exact(
+                &pool,
+                job_id as i32,
+                submission_generation,
+                run_attempt,
+                &name,
+                &user,
+                &account,
+                &partition,
+                num_nodes,
+                num_tasks,
+                cpus_per_task,
+                memory_mb,
+                submit_time,
+                start_time,
+                &reservation,
+            )
+            .await
+        };
+        if let Err(e) = retry_with_backoff(write, RETRY_ATTEMPTS, RETRY_BACKOFF).await {
+            error!(job_id, run_attempt, error = %e, "failed to record job start in accounting after retries");
+            return Err(e);
+        }
+        Ok(())
     }
 
-    pub fn notify_job_end(
-        &self,
-        job_id: JobId,
-        state: JobState,
-        exit_code: i32,
-        end_time: DateTime<Utc>,
-        exit_signal: i32,
-        derived_exit_code: i32,
-    ) {
+    pub async fn notify_job_end_ordered(&self, record: JobEndRecord) -> anyhow::Result<()> {
+        let JobEndRecord {
+            job_id,
+            submission_generation,
+            run_attempt,
+            finalization_id,
+            state,
+            exit_code,
+            end_time,
+            exit_signal,
+            derived_exit_code,
+            user,
+            account,
+            start_time,
+            num_tasks,
+            cpus_per_task,
+        } = record;
         let pool = self.pool.clone();
         let state_str = state.display().to_owned();
-        tokio::spawn(async move {
-            let write = || async {
-                let mut conn = pool.acquire().await?;
-                super::db::record_job_end(
-                    &mut conn,
-                    job_id as i32,
-                    &state_str,
-                    exit_code,
-                    end_time,
-                    exit_signal,
-                    derived_exit_code,
-                )
-                .await
-            };
-            if let Err(e) = retry_with_backoff(write, RETRY_ATTEMPTS, RETRY_BACKOFF).await {
-                error!(job_id, error = %e, "failed to record job end in accounting after retries");
-            }
-        });
+        let write = || async {
+            super::db::record_job_finalization(
+                &pool,
+                job_id as i32,
+                submission_generation,
+                run_attempt,
+                (!finalization_id.is_nil()).then_some(finalization_id),
+                &state_str,
+                exit_code,
+                end_time,
+                exit_signal,
+                derived_exit_code,
+                &user,
+                &account,
+                start_time,
+                num_tasks as i32,
+                cpus_per_task as i32,
+            )
+            .await
+        };
+        if let Err(e) = retry_with_backoff(write, RETRY_ATTEMPTS, RETRY_BACKOFF).await {
+            error!(job_id, run_attempt, error = %e, "failed to record job end in accounting after retries");
+            return Err(e);
+        }
+        Ok(())
+    }
+}
+
+impl AccountingSink for AccountingNotifier {
+    fn record_start(&self, record: JobStartRecord) -> AccountingFuture<'_> {
+        Box::pin(self.notify_job_start_ordered(record))
+    }
+
+    fn record_finalization(&self, record: JobEndRecord) -> AccountingFuture<'_> {
+        Box::pin(self.notify_job_end_ordered(record))
     }
 }
 

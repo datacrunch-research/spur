@@ -23,6 +23,7 @@ use crate::heartbeat::HeartbeatManager;
 /// On every taint transition, `synced` flips to false and the operator retries
 /// until spurctld acknowledges the state change.
 struct NodeTaintState {
+    worker_incarnation: String,
     tainted: bool,
     synced: bool,
 }
@@ -56,6 +57,60 @@ fn fingerprint(resources: &ResourceSet) -> u64 {
     hasher.finish()
 }
 
+/// Use the Kubernetes object's immutable UID as the virtual worker
+/// incarnation. Unlike a process-local UUID, this survives operator restarts,
+/// so the replacement operator can still control pods launched by its prior
+/// process. Deleting and recreating a Node produces a new UID and therefore a
+/// new incarnation, which fences stale pods and control requests.
+fn worker_incarnation(node: &K8sNode) -> anyhow::Result<String> {
+    node.metadata
+        .uid
+        .as_deref()
+        .filter(|uid| !uid.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Kubernetes node {} has no metadata.uid",
+                node.metadata.name.as_deref().unwrap_or("<unnamed>")
+            )
+        })
+}
+
+/// Forget only watcher-local state belonging to the deleted Kubernetes Node
+/// object. A delayed Delete for an old UID can arrive after an Apply for a
+/// same-name replacement and must not erase the replacement's cache entries.
+fn forget_deleted_incarnation(
+    fingerprints: &mut HashMap<String, (u64, String)>,
+    taint_states: &mut HashMap<String, NodeTaintState>,
+    name: &str,
+    deleted_incarnation: &str,
+) {
+    if fingerprints
+        .get(name)
+        .is_some_and(|(_, current)| current == deleted_incarnation)
+    {
+        fingerprints.remove(name);
+    }
+    if taint_states
+        .get(name)
+        .is_some_and(|state| state.worker_incarnation == deleted_incarnation)
+    {
+        taint_states.remove(name);
+    }
+}
+
+fn removed_node_request(name: &str, worker_incarnation: String) -> UpdateNodeRequest {
+    UpdateNodeRequest {
+        name: name.into(),
+        state: Some(NodeState::NodeDown as i32),
+        reason: Some("K8s node removed".into()),
+        labels: HashMap::new(),
+        remove_labels: Vec::new(),
+        external_gpus: None,
+        expected_worker_incarnation: worker_incarnation,
+    }
+}
+
 async fn sync_taint_state(
     name: &str,
     entry: &mut NodeTaintState,
@@ -74,6 +129,7 @@ async fn sync_taint_state(
         labels: HashMap::new(),
         remove_labels: Vec::new(),
         external_gpus: None,
+        expected_worker_incarnation: entry.worker_incarnation.clone(),
     };
 
     match client.update_node(req).await {
@@ -107,7 +163,10 @@ pub async fn run(
     info!(selector = %label_selector, "starting K8s node watcher");
 
     let mut ctrl_client = connect_controller(&controller_addr).await?;
-    let mut fingerprints: HashMap<String, u64> = HashMap::new();
+    // Include the immutable Kubernetes Node UID in the registered fingerprint.
+    // A same-name Node replacement must register even when its resources are
+    // identical to those of the deleted object.
+    let mut fingerprints: HashMap<String, (u64, String)> = HashMap::new();
     let mut taint_states: HashMap<String, NodeTaintState> = HashMap::new();
 
     let stream = watcher::watcher(nodes, watcher::Config::default().labels(&label_selector));
@@ -119,12 +178,17 @@ pub async fn run(
                 let name = node.metadata.name.clone().unwrap_or_default();
                 let tainted = is_node_not_ready(&node);
                 let resources = extract_resources(&node);
+                let worker_incarnation = match worker_incarnation(&node) {
+                    Ok(incarnation) => incarnation,
+                    Err(error) => {
+                        error!(node = %name, %error, "cannot register K8s node without stable identity");
+                        continue;
+                    }
+                };
 
                 let fp = fingerprint(&resources);
 
-                if fingerprints.get(&name) != Some(&fp) {
-                    fingerprints.insert(name.clone(), fp);
-
+                if fingerprints.get(&name) != Some(&(fp, worker_incarnation.clone())) {
                     info!(node = %name, cpus = resources.cpus, memory_mb = resources.memory_mb, gpus = resources.gpus.len(), "registering K8s node");
 
                     let req = RegisterAgentRequest {
@@ -136,10 +200,12 @@ pub async fn run(
                         wg_pubkey: String::new(),
                         labels: std::collections::HashMap::new(),
                         join_token: String::new(),
+                        worker_incarnation: worker_incarnation.clone(),
                     };
 
                     match ctrl_client.register_agent(req.clone()).await {
                         Ok(_) => {
+                            fingerprints.insert(name.clone(), (fp, worker_incarnation.clone()));
                             debug!(node = %name, "K8s node registered with spurctld");
                             hb.track(name.clone(), req).await;
                         }
@@ -150,11 +216,16 @@ pub async fn run(
                 }
 
                 let entry = taint_states.entry(name.clone()).or_insert(NodeTaintState {
+                    worker_incarnation: worker_incarnation.clone(),
                     tainted,
                     synced: false,
                 });
 
-                if entry.tainted != tainted {
+                if entry.worker_incarnation != worker_incarnation {
+                    entry.worker_incarnation = worker_incarnation;
+                    entry.tainted = tainted;
+                    entry.synced = false;
+                } else if entry.tainted != tainted {
                     entry.tainted = tainted;
                     entry.synced = false;
                 }
@@ -165,19 +236,23 @@ pub async fn run(
             }
             Event::Delete(node) => {
                 let name = node.metadata.name.clone().unwrap_or_default();
-                warn!(node = %name, "K8s node deleted, marking DOWN");
-                fingerprints.remove(&name);
-                taint_states.remove(&name);
-                hb.untrack(&name).await;
-
-                let req = UpdateNodeRequest {
-                    name: name.clone(),
-                    state: Some(NodeState::NodeDown as i32),
-                    reason: Some("K8s node removed".into()),
-                    labels: HashMap::new(),
-                    remove_labels: Vec::new(),
-                    external_gpus: None,
+                let worker_incarnation = match worker_incarnation(&node) {
+                    Ok(incarnation) => incarnation,
+                    Err(error) => {
+                        error!(node = %name, %error, "refusing unfenced K8s node deletion");
+                        continue;
+                    }
                 };
+                warn!(node = %name, "K8s node deleted, marking DOWN");
+                forget_deleted_incarnation(
+                    &mut fingerprints,
+                    &mut taint_states,
+                    &name,
+                    &worker_incarnation,
+                );
+                hb.untrack_exact(&name, &worker_incarnation).await;
+
+                let req = removed_node_request(&name, worker_incarnation);
 
                 if let Err(e) = ctrl_client.update_node(req).await {
                     error!(node = %name, error = %e, "failed to mark K8s node DOWN");
@@ -319,6 +394,7 @@ mod tests {
         K8sNode {
             metadata: kube::api::ObjectMeta {
                 name: Some(name.into()),
+                uid: Some(format!("uid-{name}")),
                 labels: Some(labels),
                 ..Default::default()
             },
@@ -335,6 +411,84 @@ mod tests {
                 ..Default::default()
             }),
         }
+    }
+
+    #[test]
+    fn worker_incarnation_is_stable_across_operator_restart() {
+        let first_operator_view = make_node("node-1", BTreeMap::new(), BTreeMap::new(), vec![]);
+        let second_operator_view = first_operator_view.clone();
+
+        assert_eq!(
+            worker_incarnation(&first_operator_view).unwrap(),
+            worker_incarnation(&second_operator_view).unwrap()
+        );
+    }
+
+    #[test]
+    fn worker_incarnation_changes_when_node_object_is_recreated() {
+        let old_node = make_node("node-1", BTreeMap::new(), BTreeMap::new(), vec![]);
+        let mut replacement = old_node.clone();
+        replacement.metadata.uid = Some("replacement-node-uid".into());
+
+        assert_ne!(
+            worker_incarnation(&old_node).unwrap(),
+            worker_incarnation(&replacement).unwrap()
+        );
+    }
+
+    #[test]
+    fn worker_incarnation_requires_kubernetes_uid() {
+        let mut node = make_node("node-1", BTreeMap::new(), BTreeMap::new(), vec![]);
+        node.metadata.uid = None;
+
+        assert!(worker_incarnation(&node).is_err());
+    }
+
+    #[test]
+    fn delayed_old_delete_preserves_replacement_apply_state() {
+        let mut fingerprints = HashMap::from([(
+            "node-1".to_string(),
+            (123, "replacement-node-uid".to_string()),
+        )]);
+        let mut taint_states = HashMap::from([(
+            "node-1".to_string(),
+            NodeTaintState {
+                worker_incarnation: "replacement-node-uid".into(),
+                tainted: false,
+                synced: true,
+            },
+        )]);
+
+        // Model an old Delete arriving after the replacement Apply populated
+        // both caches. Its controller request remains fenced by the old UID,
+        // while the replacement's local state stays intact.
+        forget_deleted_incarnation(
+            &mut fingerprints,
+            &mut taint_states,
+            "node-1",
+            "old-node-uid",
+        );
+        let request = removed_node_request("node-1", "old-node-uid".into());
+        assert_eq!(
+            fingerprints.get("node-1"),
+            Some(&(123, "replacement-node-uid".to_string()))
+        );
+        assert_eq!(
+            taint_states
+                .get("node-1")
+                .map(|state| state.worker_incarnation.as_str()),
+            Some("replacement-node-uid")
+        );
+        assert_eq!(request.expected_worker_incarnation, "old-node-uid");
+
+        forget_deleted_incarnation(
+            &mut fingerprints,
+            &mut taint_states,
+            "node-1",
+            "replacement-node-uid",
+        );
+        assert!(!fingerprints.contains_key("node-1"));
+        assert!(!taint_states.contains_key("node-1"));
     }
 
     // --- is_node_not_ready ---

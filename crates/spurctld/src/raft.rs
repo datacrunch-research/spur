@@ -22,6 +22,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use spur_core::job::Uuid;
 use spur_core::wal::WalOperation;
 
 pub type NodeId = u64;
@@ -65,6 +66,10 @@ pub(crate) fn raft_client(
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct JobFinalized {
     pub job_id: u32,
+    #[serde(default)]
+    pub submission_generation: Uuid,
+    #[serde(default)]
+    pub run_attempt: u32,
     pub state: spur_core::job::JobState,
     pub exit_code: i32,
 }
@@ -72,12 +77,88 @@ pub struct JobFinalized {
 /// Response returned after a Raft write is committed.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClientResponse {
+    /// Result of an idempotent JobSubmit. These fields are populated from the
+    /// committed state-machine decision, never reconstructed from a local map.
+    #[serde(default)]
+    pub submission_job_id: u32,
+    #[serde(default)]
+    pub submission_generation: Uuid,
+    #[serde(default)]
+    pub submission_created: bool,
+    #[serde(default)]
+    pub submission_conflict: bool,
+    /// A token cancellation fence won the replicated ordering. For JobSubmit
+    /// this means creation was refused; for SubmissionTokenCancel it means the
+    /// durable no-create/cancel intent is installed.
+    #[serde(default)]
+    pub submission_cancelled: bool,
+    #[serde(default)]
+    pub submission_cleanup_complete: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub jobs_finalized: Vec<JobFinalized>,
     #[serde(default)]
     pub reservation_created: bool,
     #[serde(default)]
     pub partition_created: bool,
+    /// True only when a `NodeRemove` entry actually removed the node. Removal
+    /// is refused while a durable pending dispatch targets it.
+    #[serde(default)]
+    pub node_removed: bool,
+    /// True only when registration/update accepted the exact worker
+    /// incarnation without crossing an execution-ownership fence.
+    #[serde(default)]
+    pub node_registration_accepted: bool,
+    #[serde(default)]
+    pub node_state_changed: bool,
+    /// True only when this specific `JobDispatchBegin` entry won its CAS and
+    /// installed the provisional reservation. A competing controller that
+    /// proposed the same epoch cannot infer ownership from a later state read.
+    #[serde(default)]
+    pub dispatch_begun: bool,
+    /// True when the matching intent is durably in Aborting and exact-attempt
+    /// worker cancellation is therefore authorized.
+    #[serde(default)]
+    pub dispatch_abort_authorized: bool,
+    /// True only when one exact target cleanup ACK released its owned slice.
+    #[serde(default)]
+    pub dispatch_target_cleared: bool,
+    /// True only when this exact Clear released the matching provisional
+    /// reservation. Avoids inferring success from a racy post-apply state read.
+    #[serde(default)]
+    pub dispatch_cleared: bool,
+    /// True only when an exact pending-finalization marker was consumed.  A
+    /// stale leader response cannot infer success from a later job state.
+    #[serde(default)]
+    pub finalization_acked: bool,
+    /// True only when this specific `JobDispatchCommit` entry atomically
+    /// transitioned the matching pending dispatch to Running. Replays and
+    /// stale commits leave it false, so callers never infer success from a
+    /// racy post-commit state read.
+    #[serde(default)]
+    pub dispatch_committed: bool,
+    /// True only when `JobDispatchPublish` completed the matching committed
+    /// epoch's Pending-to-Running publication.
+    #[serde(default)]
+    pub dispatch_published: bool,
+    /// True when a matching completion arrived while its dispatch was still
+    /// Pending and was durably buffered for the atomic commit.
+    #[serde(default)]
+    pub completion_buffered: bool,
+    /// True only when this completion mutated the matching live execution.
+    #[serde(default)]
+    pub completion_accepted: bool,
+    /// The exact completion conflicts with a permanent token receipt.
+    #[serde(default)]
+    pub completion_conflict: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completion_remaining_nodes: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub completion_submission_generation: String,
+    #[serde(default)]
+    pub completion_run_attempt: u32,
+    /// A terminal request was durably deferred until exact worker cleanup.
+    #[serde(default)]
+    pub terminal_cleanup_deferred: bool,
 }
 
 /// Trait for applying committed Raft entries to the cluster state.
@@ -1651,6 +1732,7 @@ mod tests {
                 index: 1,
             },
             payload: EntryPayload::Normal(WalOperation::JobSubmit {
+                metadata: None,
                 job_id: 1,
                 spec: Box::new(big_spec),
             }),

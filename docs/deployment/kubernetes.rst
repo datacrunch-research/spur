@@ -3,6 +3,23 @@ Kubernetes Deployment
 
 Deploy Spur on an existing Kubernetes cluster. The controller runs as a StatefulSet with Raft consensus, and compute nodes are managed by the ``spur-k8s-operator``.
 
+Operational status
+------------------
+
+The ``SpurJob`` operator is suitable for bounded pilot deployments. Treat it
+as preview rather than production-ready until tokened submission has an
+authenticated caller identity, a fail-closed tombstone capacity limit, and
+cardinality/size metrics. The controller retains every submission-token
+binding in Raft snapshots so delayed retries and restored custom resources
+cannot create duplicate jobs. Those bindings are intentionally not expired or
+garbage-collected today.
+
+Restrict the controller gRPC port to trusted clients; a submission token is an
+idempotency key, not an authentication credential. Do not restore a controller
+snapshot older than live workers or ``SpurJob`` resources. Deploy controller,
+operator, and virtual-agent identity changes together, and do not roll back a
+controller after it has accepted tokened submissions.
+
 Prerequisites
 -------------
 
@@ -120,6 +137,11 @@ Apply with ``kubectl``:
    kubectl apply -f job.yaml
 
 The operator watches SpurJob resources, submits them to the controller, and updates status fields as the job progresses.
+
+The Kubernetes integration is currently a preview. Non-empty ``tolerations`` and
+``nodeSelector`` fields, and non-default ``priorityClass`` or ``serviceAccount`` values, are
+rejected before submission. They are not silently ignored. Remove those fields until the
+operator implements their workload semantics.
 
 Verify
 ------

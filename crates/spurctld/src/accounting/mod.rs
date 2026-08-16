@@ -8,7 +8,9 @@ mod notifier;
 mod reconcile;
 
 pub(crate) use grpc::{accounting_server, AccountingService};
-pub use notifier::{AccountingNotifier, JobStartRecord};
+#[cfg(test)]
+pub use notifier::AccountingFuture;
+pub use notifier::{AccountingNotifier, AccountingSink, JobEndRecord, JobStartRecord};
 pub use reconcile::spawn_loop as spawn_reconcile_loop;
 pub use reconcile::RECONCILE_INTERVAL_SECS;
 

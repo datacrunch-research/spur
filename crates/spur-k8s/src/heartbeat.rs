@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 use tokio::sync::RwLock;
+use tonic::Status;
 use tracing::{debug, warn};
 
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
@@ -37,9 +38,68 @@ impl HeartbeatManager {
         self.registry.write().await.insert(name, req);
     }
 
-    /// Remove a node from the tracked set. Safe to call for unknown names.
-    pub async fn untrack(&self, name: &str) {
-        self.registry.write().await.remove(name);
+    /// Remove only the exact virtual worker that disappeared. A delayed Delete
+    /// event for an old Kubernetes Node UID must not stop heartbeats for a
+    /// same-name replacement.
+    pub async fn untrack_exact(&self, name: &str, worker_incarnation: &str) -> bool {
+        let mut registry = self.registry.write().await;
+        if registry
+            .get(name)
+            .is_some_and(|request| request.worker_incarnation == worker_incarnation)
+        {
+            registry.remove(name);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Require a request to name the current incarnation of a specific virtual
+    /// worker. This mirrors native spurd's incarnation gate and prevents a
+    /// delayed launch/control RPC from a prior registration from mutating K8s.
+    pub async fn require_incarnation(
+        &self,
+        name: &str,
+        worker_incarnation: &str,
+    ) -> Result<(), Status> {
+        if worker_incarnation.is_empty() {
+            return Err(Status::invalid_argument(
+                "worker_incarnation must be nonempty",
+            ));
+        }
+        let registry = self.registry.read().await;
+        let Some(current) = registry.get(name) else {
+            return Err(Status::failed_precondition(format!(
+                "virtual worker {name} is not currently registered"
+            )));
+        };
+        if current.worker_incarnation != worker_incarnation {
+            return Err(Status::failed_precondition(format!(
+                "virtual worker {name} incarnation is stale"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Resolve a current virtual worker by its opaque incarnation. Controller
+    /// fan-out RPCs other than LaunchJob do not carry the target node name.
+    pub async fn require_known_incarnation(
+        &self,
+        worker_incarnation: &str,
+    ) -> Result<String, Status> {
+        if worker_incarnation.is_empty() {
+            return Err(Status::invalid_argument(
+                "worker_incarnation must be nonempty",
+            ));
+        }
+        self.registry
+            .read()
+            .await
+            .iter()
+            .find_map(|(name, request)| {
+                (request.worker_incarnation == worker_incarnation).then(|| name.clone())
+            })
+            .ok_or_else(|| Status::failed_precondition("virtual worker incarnation is stale"))
     }
 
     /// Send `Heartbeat` RPCs to spurctld for every tracked node.
@@ -48,14 +108,20 @@ impl HeartbeatManager {
         loop {
             interval.tick().await;
 
-            let names: Vec<String> = self.registry.read().await.keys().cloned().collect();
-            if names.is_empty() {
+            let registrations: Vec<(String, String)> = self
+                .registry
+                .read()
+                .await
+                .iter()
+                .map(|(name, req)| (name.clone(), req.worker_incarnation.clone()))
+                .collect();
+            if registrations.is_empty() {
                 continue;
             }
 
             match connect(&self.controller_addr).await {
                 Ok(mut client) => {
-                    for name in &names {
+                    for (name, worker_incarnation) in &registrations {
                         let req = HeartbeatRequest {
                             hostname: name.clone(),
                             cpu_load: 0,
@@ -64,6 +130,7 @@ impl HeartbeatManager {
                             node_token: String::new(),
                             wg_pubkey: String::new(), // virtual agents are not on the mesh
                             k0s_status: None,         // virtual agents run no k0s unit
+                            worker_incarnation: worker_incarnation.clone(),
                         };
                         match client.heartbeat(req).await {
                             Ok(_) => debug!(node = %name, "heartbeat sent"),
@@ -103,6 +170,7 @@ mod tests {
             wg_pubkey: String::new(),
             labels: std::collections::HashMap::new(),
             join_token: String::new(),
+            worker_incarnation: format!("{hostname}-incarnation"),
         }
     }
 
@@ -120,17 +188,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_untrack_removes_node() {
+    async fn stale_incarnation_cannot_untrack_replacement() {
         let hb = HeartbeatManager::new("http://localhost:6817".into());
-        hb.track("node-1".into(), make_req("node-1")).await;
-        hb.untrack("node-1").await;
-        assert!(hb.registry.read().await.is_empty());
-    }
+        let mut replacement = make_req("node-1");
+        replacement.worker_incarnation = "replacement".into();
+        hb.track("node-1".into(), replacement).await;
 
-    #[tokio::test]
-    async fn test_untrack_unknown_name_is_safe() {
-        let hb = HeartbeatManager::new("http://localhost:6817".into());
-        hb.untrack("does-not-exist").await;
+        assert!(!hb.untrack_exact("node-1", "old").await);
+        assert!(hb.registry.read().await.contains_key("node-1"));
+        assert!(hb.untrack_exact("node-1", "replacement").await);
         assert!(hb.registry.read().await.is_empty());
     }
 
@@ -149,6 +215,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_incarnation_gate_rejects_stale_worker() {
+        let hb = HeartbeatManager::new("http://localhost:6817".into());
+        let mut current = make_req("node-1");
+        current.worker_incarnation = "current-incarnation".into();
+        hb.track("node-1".into(), current).await;
+
+        assert!(hb
+            .require_incarnation("node-1", "current-incarnation")
+            .await
+            .is_ok());
+        assert_eq!(
+            hb.require_incarnation("node-1", "stale-incarnation")
+                .await
+                .expect_err("stale launch must be rejected")
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+    }
+
+    #[tokio::test]
     async fn test_multiple_nodes_tracked_independently() {
         let hb = HeartbeatManager::new("http://localhost:6817".into());
         hb.track("node-1".into(), make_req("node-1")).await;
@@ -162,7 +248,7 @@ mod tests {
         let hb = HeartbeatManager::new("http://localhost:6817".into());
         hb.track("node-1".into(), make_req("node-1")).await;
         hb.track("node-2".into(), make_req("node-2")).await;
-        hb.untrack("node-1").await;
+        assert!(hb.untrack_exact("node-1", "node-1-incarnation").await);
 
         let guard = hb.registry.read().await;
         assert_eq!(guard.len(), 1);
@@ -174,7 +260,7 @@ mod tests {
     async fn test_track_after_untrack_re_adds_node() {
         let hb = HeartbeatManager::new("http://localhost:6817".into());
         hb.track("node-1".into(), make_req("node-1")).await;
-        hb.untrack("node-1").await;
+        assert!(hb.untrack_exact("node-1", "node-1-incarnation").await);
         hb.track("node-1".into(), make_req("node-1")).await;
 
         assert_eq!(hb.registry.read().await.len(), 1);
@@ -185,8 +271,8 @@ mod tests {
         let hb = HeartbeatManager::new("http://localhost:6817".into());
         hb.track("node-1".into(), make_req("node-1")).await;
         hb.track("node-2".into(), make_req("node-2")).await;
-        hb.untrack("node-1").await;
-        hb.untrack("node-2").await;
+        assert!(hb.untrack_exact("node-1", "node-1-incarnation").await);
+        assert!(hb.untrack_exact("node-2", "node-2-incarnation").await);
         assert!(hb.registry.read().await.is_empty());
     }
 
@@ -196,7 +282,7 @@ mod tests {
         let req = make_req("node-1");
         hb.track("node-1".into(), req.clone()).await;
         hb.track("node-2".into(), make_req("node-2")).await;
-        hb.untrack("node-2").await;
+        assert!(hb.untrack_exact("node-2", "node-2-incarnation").await);
 
         let guard = hb.registry.read().await;
         let stored = guard.get("node-1").expect("node-1 must still be tracked");

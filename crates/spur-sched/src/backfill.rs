@@ -84,15 +84,15 @@ impl BackfillScheduler {
             node.can_satisfy_request(&required)
         };
 
-        if placement.nodelist_is_additive()
-            && nodes.iter().any(|node| {
-                placement.is_listed(&node.name)
-                    && placement.eligible(node, reservations, now)
-                    && node.can_satisfy_request(&required)
-                    && !suitable(node)
-            })
-        {
-            return Vec::new();
+        if placement.nodelist_is_additive() {
+            let listed: Vec<_> = nodes
+                .iter()
+                .filter(|node| placement.is_listed(&node.name))
+                .collect();
+            if listed.len() != placement.listed_count() || listed.iter().any(|node| !suitable(node))
+            {
+                return Vec::new();
+            }
         }
 
         nodes
@@ -107,12 +107,13 @@ impl BackfillScheduler {
     /// for the timeline's committed reservations.
     fn free_gpus_at(
         &self,
+        job: &Job,
         ni: usize,
         node: &Node,
         gpu_type: Option<&str>,
         time: chrono::DateTime<Utc>,
     ) -> u32 {
-        let current = self.unavailable_at(ni, node, time);
+        let current = self.unavailable_at(job, ni, node, time);
         node.total_resources
             .available_device_ids(&current, "gpu", gpu_type)
             .len() as u32
@@ -121,14 +122,25 @@ impl BackfillScheduler {
     /// Managed allocations at `time` plus GPUs reported as externally occupied.
     fn unavailable_at(
         &self,
+        job: &Job,
         ni: usize,
         node: &Node,
         time: chrono::DateTime<Utc>,
     ) -> ResourceAllocations {
         let mut unavailable = self.timelines[ni].accumulated_at(time);
+        // These sources describe unavailable *identities*, not additive GPU
+        // consumption. Union them before rebuilding the GPU slice so one GPU
+        // present in both managed/external/transient state is counted once.
+        let mut unavailable_gpu_ids: std::collections::BTreeSet<u32> =
+            unavailable.device_ids("gpu").into_iter().collect();
+        unavailable_gpu_ids.extend(node.external_gpu_ids.iter().copied());
+        if let Some(rejection) = job.transient_capacity_rejections.get(&node.name) {
+            unavailable_gpu_ids.extend(rejection.rejected_gpu_ids_at(time));
+        }
+        unavailable.devices.remove("gpu");
         unavailable.add(&ResourceAllocations::from_device_ids(
             "gpu",
-            &node.external_gpu_ids,
+            &unavailable_gpu_ids.into_iter().collect::<Vec<_>>(),
         ));
         unavailable
     }
@@ -165,7 +177,7 @@ impl BackfillScheduler {
                 // Capacity-sorted greedy: pack GPUs onto most-available nodes.
                 let mut caps: Vec<(usize, u32)> = assigned_nodes
                     .iter()
-                    .map(|(ni, _)| (*ni, self.free_gpus_at(*ni, &nodes[*ni], gpu_type, now)))
+                    .map(|(ni, _)| (*ni, self.free_gpus_at(job, *ni, &nodes[*ni], gpu_type, now)))
                     .collect();
                 caps.sort_by_key(|(_, cap)| std::cmp::Reverse(*cap));
                 let cap_values: Vec<u32> = caps.iter().map(|(_, c)| *c).collect();
@@ -180,7 +192,7 @@ impl BackfillScheduler {
         let mut per_node_alloc = HashMap::new();
         for (idx, (ni, _)) in assigned_nodes.iter().enumerate() {
             let node = &nodes[*ni];
-            let current = self.unavailable_at(*ni, node, now);
+            let current = self.unavailable_at(job, *ni, node, now);
 
             let mut req = base.clone();
             let cpus = cpu_counts.get(idx).copied().unwrap_or(base.cpus).max(1);
@@ -304,7 +316,13 @@ impl Scheduler for BackfillScheduler {
                     .map(|&ni| {
                         (
                             ni,
-                            self.free_gpus_at(ni, &cluster.nodes[ni], gpu_type.as_deref(), now),
+                            self.free_gpus_at(
+                                job,
+                                ni,
+                                &cluster.nodes[ni],
+                                gpu_type.as_deref(),
+                                now,
+                            ),
                         )
                     })
                     .collect()
@@ -440,15 +458,31 @@ impl Scheduler for BackfillScheduler {
                     None => continue, // not enough free capacity right now
                 }
             } else {
+                let mut allocation_failed = false;
                 for (ni, _) in &assigned_nodes {
                     let node = &cluster.nodes[*ni];
                     let node_alloc = if job.spec.exclusive {
                         build_exclusive_allocation(&node.total_resources, required.memory_mb)
                     } else {
-                        let current = self.timelines[*ni].accumulated_at(now);
+                        // Include both globally external GPUs and this job's
+                        // short-lived per-device rejection leases. The old
+                        // homogeneous fast path used only the timeline here,
+                        // which could select an externally occupied GPU even
+                        // though feasibility had counted it unavailable.
+                        let current = self.unavailable_at(job, *ni, node, now);
+                        if !node
+                            .total_resources
+                            .can_satisfy_with_allocated(&current, &required)
+                        {
+                            allocation_failed = true;
+                            break;
+                        }
                         build_node_allocation(&node.total_resources, &current, &required)
                     };
                     per_node_alloc.insert(node.name.clone(), node_alloc);
+                }
+                if allocation_failed {
+                    continue;
                 }
             }
 
@@ -610,7 +644,7 @@ pub fn job_resource_request(job: &Job) -> ResourceSet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spur_core::job::JobSpec;
+    use spur_core::job::{JobSpec, TransientCapacityRejection};
     use spur_core::node::NodeState;
     use spur_core::partition::Partition;
     use spur_core::resource::{GpuLinkType, GpuResource, ResourceAllocations};
@@ -955,6 +989,195 @@ mod tests {
         assert!(
             ids_a.is_disjoint(&ids_b),
             "GPU IDs overlap: {ids_a:?} vs {ids_b:?}"
+        );
+    }
+
+    #[test]
+    fn transient_gpu_rejection_uses_other_devices_without_hiding_the_node() {
+        let mut nodes = vec![make_gpu_node(4)];
+        nodes[0].name = "n1".into();
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+        let mut constrained = make_gpu_job(1, 2);
+        constrained.transient_capacity_rejections.insert(
+            "n1".into(),
+            TransientCapacityRejection {
+                gpu_until: HashMap::from([
+                    (0, Utc::now() + Duration::seconds(30)),
+                    (1, Utc::now() + Duration::seconds(30)),
+                ]),
+                ..Default::default()
+            },
+        );
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let mut sched = BackfillScheduler::new(10);
+        let constrained_assignments = sched.schedule(&[constrained], &cluster);
+        assert_eq!(constrained_assignments.len(), 1);
+        assert_eq!(
+            gpu_ids_from_assignment(&constrained_assignments[0]),
+            HashSet::from([2, 3])
+        );
+
+        // The lease belongs only to job 1. A different job sees the same tray's
+        // ordinary free device ordering and may use 0/1.
+        let mut sched = BackfillScheduler::new(10);
+        let unconstrained_assignments = sched.schedule(&[make_gpu_job(2, 2)], &cluster);
+        assert_eq!(
+            gpu_ids_from_assignment(&unconstrained_assignments[0]),
+            HashSet::from([0, 1])
+        );
+    }
+
+    #[test]
+    fn all_transient_gpus_wait_until_the_lease_expires_then_become_reeligible() {
+        let mut nodes = vec![make_gpu_node(2)];
+        nodes[0].name = "n1".into();
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+        let mut job = make_gpu_job(1, 2);
+        job.transient_capacity_rejections.insert(
+            "n1".into(),
+            TransientCapacityRejection {
+                gpu_until: HashMap::from([
+                    (0, Utc::now() + Duration::seconds(30)),
+                    (1, Utc::now() + Duration::seconds(30)),
+                ]),
+                ..Default::default()
+            },
+        );
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let mut sched = BackfillScheduler::new(10);
+        assert!(sched.schedule(&[job.clone()], &cluster).is_empty());
+
+        for until in job
+            .transient_capacity_rejections
+            .get_mut("n1")
+            .unwrap()
+            .gpu_until
+            .values_mut()
+        {
+            *until = Utc::now() - Duration::seconds(1);
+        }
+        let mut sched = BackfillScheduler::new(10);
+        let assignments = sched.schedule(&[job], &cluster);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(
+            gpu_ids_from_assignment(&assignments[0]),
+            HashSet::from([0, 1])
+        );
+    }
+
+    #[test]
+    fn all_whole_nodes_rejected_wait_until_ttl_then_become_reeligible() {
+        let nodes = make_nodes(1);
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+        let mut job = make_job(1, 1, 1);
+        job.transient_capacity_rejections.insert(
+            "node001".into(),
+            TransientCapacityRejection {
+                whole_node_until: Some(Utc::now() + Duration::seconds(30)),
+                ..Default::default()
+            },
+        );
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let mut sched = BackfillScheduler::new(10);
+        assert!(sched.schedule(&[job.clone()], &cluster).is_empty());
+
+        job.transient_capacity_rejections
+            .get_mut("node001")
+            .unwrap()
+            .whole_node_until = Some(Utc::now() - Duration::seconds(1));
+        let mut sched = BackfillScheduler::new(10);
+        let assignments = sched.schedule(&[job], &cluster);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].nodes, vec!["node001"]);
+    }
+
+    #[test]
+    fn homogeneous_gpu_allocation_never_selects_external_devices() {
+        let mut node = make_gpu_node(4);
+        node.name = "n1".into();
+        node.external_gpu_ids = vec![0, 1];
+        let nodes = vec![node];
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let mut sched = BackfillScheduler::new(10);
+        let assignments = sched.schedule(&[make_gpu_job(1, 2)], &cluster);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(
+            gpu_ids_from_assignment(&assignments[0]),
+            HashSet::from([2, 3])
+        );
+    }
+
+    #[test]
+    fn overlapping_external_and_transient_gpu_ids_are_counted_once() {
+        let mut node = make_gpu_node(4);
+        node.name = "n1".into();
+        node.external_gpu_ids = vec![0];
+        let nodes = vec![node];
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+        let mut job = make_gpu_job(1, 2);
+        job.transient_capacity_rejections.insert(
+            "n1".into(),
+            TransientCapacityRejection {
+                gpu_until: HashMap::from([
+                    (0, Utc::now() + Duration::seconds(30)),
+                    (1, Utc::now() + Duration::seconds(30)),
+                ]),
+                ..Default::default()
+            },
+        );
+        let cluster = ClusterState {
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        let mut sched = BackfillScheduler::new(10);
+        let assignments = sched.schedule(&[job], &cluster);
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(
+            gpu_ids_from_assignment(&assignments[0]),
+            HashSet::from([2, 3])
         );
     }
 

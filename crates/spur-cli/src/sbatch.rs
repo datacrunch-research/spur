@@ -1029,6 +1029,7 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
     let response = client
         .submit_job(SubmitJobRequest {
             spec: Some(job_spec),
+            submission_token: String::new(),
         })
         .await
         .context("job submission failed")?;

@@ -226,6 +226,39 @@ The rolling upgrade is controlled with these ``-e`` flags:
 Safe Upgrade Order
 ~~~~~~~~~~~~~~~~~~~
 
+.. warning::
+
+   The exact-execution/finalization revision is a one-time exception to the rolling
+   procedure above. It adds the ``JobDispatchBegin``, ``JobDispatchAbortBegin``,
+   ``JobDispatchTargetClear``, ``JobDispatchClear``, ``JobDispatchCommit``,
+   ``JobDispatchPublish``, ``JobCancelExact``, ``DurableFinalization``,
+   ``JobFinalizationAck``, and ``JobTransientCapacityReject`` Raft operations. It also
+   makes submission generation, run attempt, and worker incarnation mandatory ownership
+   fences for controller/worker traffic. **Rolling or mixed-version operation is
+   forbidden:** an older controller can neither replay the new WAL variants nor preserve
+   the mandatory identity fields, while an older worker can acknowledge the wrong
+   execution after a numeric job ID is reused.
+
+   First drain the cluster and wait for the runnable queue and active jobs to empty. Stop
+   every controller **before upgrading the first worker**, upgrade all ``spurd`` agents,
+   upgrade every controller as one coordinated set while preserving its Raft state, and
+   restart the controller set. Do not resume scheduling until every process reports the
+   same revision. Downgrading after a new controller has written or compacted these
+   operations is unsupported; restore a pre-upgrade state backup instead.
+
+   The Kubernetes submission-incarnation revision is the same kind of stop-the-world
+   boundary. It adds the ``SubmissionTokenCancel`` WAL variant and adds a submission token
+   to ``JobNodeComplete`` so exact per-node completion receipts are replicated. An older
+   controller cannot decode ``SubmissionTokenCancel``; worse, it can ignore the new field on
+   an otherwise familiar completion entry and apply the job transition without updating the
+   token receipt index, causing replicas to diverge in crash-recovery behavior. Tokened submit
+   metadata has the same mixed-writer risk. Stop every controller, install the new controller
+   binary on the complete Raft set, and coordinate the matching ``spur-k8s-operator`` and
+   Kubernetes virtual-agent rollout before re-enabling ``SpurJob`` reconciliation. Do not run
+   old and new controllers together. After any tokened submit, token cancellation, or tokened
+   completion-report entry has been written, rollback is unsupported; restore the pre-upgrade
+   state backup instead.
+
 Follow this order for any cluster upgrade:
 
 1. **Rebuild all three binaries together** from the same source tree — they share a Raft

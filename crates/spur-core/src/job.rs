@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
+pub use uuid::Uuid;
 
 use crate::burst_buffer::BbStageState;
 use crate::resource::ResourceAllocations;
@@ -681,10 +682,238 @@ pub struct NodeCompletion {
     pub signal: i32,
 }
 
+/// Scheduler-only placement feedback for one node that temporarily rejected a
+/// pending job because capacity was occupied outside Spur.
+///
+/// A CPU-only/clean-host launch rejects the whole node for this job. A shared
+/// GPU launch rejects only the exact device IDs selected for that attempt, so
+/// the scheduler may retry other free GPUs on the same node. Expirations are
+/// stored per scope so a later GPU rejection does not accidentally extend an
+/// earlier whole-node lease (or vice versa).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TransientCapacityRejection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whole_node_until: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub gpu_until: HashMap<u32, DateTime<Utc>>,
+}
+
+/// Durable ownership record for one batch execution. It survives publication
+/// so controller-side terminal state and capacity release remain gated on
+/// exact worker exit proof.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PendingDispatchPhase {
+    #[default]
+    Launching,
+    /// Every target proved launch through an ACK or an exact completion, and
+    /// the replicated allocation/batch step are installed. BEGIN/accounting
+    /// publication has not yet been followed by the final Running transition.
+    /// Completions remain buffered so failover preserves BEGIN-before-END.
+    Committed,
+    /// Running is visible and each remaining target still owns its exact
+    /// node-local allocation slice.
+    Published,
+    Aborting,
+}
+
+/// Terminal outcome requested while a launched attempt still requires exact
+/// worker cleanup. The intent keeps its resource slices charged until every
+/// target acknowledges cancellation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingDispatchDisposition {
+    pub state: JobState,
+    pub exit_code: i32,
+    #[serde(default)]
+    pub exit_signal: i32,
+    #[serde(default)]
+    pub natural_completion: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_reason: Option<PendingReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub finalization_intent: FinalizationIntent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalization: Option<DurableFinalizationContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingDispatch {
+    pub submission_generation: Uuid,
+    pub run_attempt: u32,
+    pub target_nodes: Vec<String>,
+    /// Exact worker process expected on each target.
+    #[serde(default)]
+    pub target_incarnations: HashMap<String, String>,
+    #[serde(default)]
+    pub phase: PendingDispatchPhase,
+    /// Aggregate resources still owned by the targets in this record.
+    pub resources: ResourceAllocations,
+    /// Exact node-local slices already charged to node allocation state. The
+    /// Commit records them without adding again. Natural completion or
+    /// acknowledged cleanup removes each slice exactly once.
+    pub per_node_alloc: HashMap<String, ResourceAllocations>,
+    /// Completion reports that arrived before Running publication (during
+    /// Launching or Committed). Keyed by target node for idempotent replay.
+    #[serde(default)]
+    pub early_completions: HashMap<String, NodeCompletion>,
+    /// First terminal request wins by Raft order. Cleanup applies it only after
+    /// exact cancel acknowledgement from every target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_after_cleanup: Option<PendingDispatchDisposition>,
+    /// Dispatch retry hold applied only after exact worker cleanup completes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff_after_cleanup: Option<DateTime<Utc>>,
+    /// Preemption hold installed atomically after cleanup of the old run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preempt_requeue_after_cleanup: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preempt_finalization_after_cleanup: Option<DurableFinalizationContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurableFinalizationContext {
+    pub finalization_id: Uuid,
+    pub end_time: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_submission_generation: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_run_attempt: Option<u32>,
+    #[serde(default)]
+    pub expected_node_incarnations: HashMap<String, String>,
+}
+
+impl DurableFinalizationContext {
+    pub fn exact(submission_generation: Uuid, run_attempt: u32, end_time: DateTime<Utc>) -> Self {
+        Self {
+            finalization_id: Uuid::new_v4(),
+            end_time,
+            expected_submission_generation: Some(submission_generation),
+            expected_run_attempt: Some(run_attempt),
+            expected_node_incarnations: HashMap::new(),
+        }
+    }
+
+    pub fn node_lifecycle(end_time: DateTime<Utc>) -> Self {
+        Self {
+            finalization_id: Uuid::new_v4(),
+            end_time,
+            expected_submission_generation: None,
+            expected_run_attempt: None,
+            expected_node_incarnations: HashMap::new(),
+        }
+    }
+
+    pub fn with_node_incarnations(mut self, incarnations: HashMap<String, String>) -> Self {
+        self.expected_node_incarnations = incarnations;
+        self
+    }
+
+    pub fn matches_execution(&self, submission_generation: Uuid, run_attempt: u32) -> bool {
+        self.expected_submission_generation == Some(submission_generation)
+            && self.expected_run_attempt == Some(run_attempt)
+    }
+
+    pub fn is_node_lifecycle(&self) -> bool {
+        self.expected_submission_generation.is_none() && self.expected_run_attempt.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub enum FinalizationIntent {
+    #[default]
+    KeepTerminal,
+    AutoRequeue,
+    LaunchFailure {
+        hold: bool,
+        begin_time: DateTime<Utc>,
+    },
+    PreemptRequeue {
+        begin_time: DateTime<Utc>,
+    },
+}
+
+impl FinalizationIntent {
+    pub fn for_terminal_state(state: JobState) -> Self {
+        if matches!(state, JobState::Timeout | JobState::NodeFail) {
+            Self::AutoRequeue
+        } else {
+            Self::KeepTerminal
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FinalizationRequeueCounter {
+    #[default]
+    None,
+    Ordinary,
+    Preempt,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub enum FinalizationAction {
+    #[default]
+    KeepTerminal,
+    Requeue {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        begin_time: Option<DateTime<Utc>>,
+        #[serde(default)]
+        pending_reason: PendingReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pending_reason_desc: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        priority: Option<u32>,
+        #[serde(default)]
+        counter: FinalizationRequeueCounter,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingFinalization {
+    #[serde(default)]
+    pub finalization_id: Uuid,
+    pub submission_generation: Uuid,
+    pub run_attempt: u32,
+    pub state: JobState,
+    pub exit_code: i32,
+    #[serde(default)]
+    pub exit_signal: i32,
+    #[serde(default)]
+    pub derived_exit_code: i32,
+    pub end_time: DateTime<Utc>,
+    #[serde(default)]
+    pub intent: FinalizationIntent,
+}
+
+impl TransientCapacityRejection {
+    pub fn rejects_node_at(&self, at: DateTime<Utc>) -> bool {
+        self.whole_node_until.is_some_and(|until| until > at)
+    }
+
+    pub fn rejected_gpu_ids_at(&self, at: DateTime<Utc>) -> Vec<u32> {
+        let mut ids: Vec<u32> = self
+            .gpu_until
+            .iter()
+            .filter_map(|(&id, &until)| (until > at).then_some(id))
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+}
+
 /// Internal job record held by the controller.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
     pub job_id: JobId,
+    /// Stable identity for this use of `job_id`, chosen by the submitting
+    /// leader and replicated with the submit entry.
+    #[serde(default)]
+    pub submission_generation: Uuid,
+    /// Durable external submit token. This is opaque and empty for submissions
+    /// that do not request controller-side idempotency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_token: Option<String>,
     pub spec: JobSpec,
     pub state: JobState,
     pub pending_reason: PendingReason,
@@ -706,6 +935,9 @@ pub struct Job {
     /// Per-node allocation slices (for deallocation on job complete).
     #[serde(default)]
     pub per_node_alloc: HashMap<String, ResourceAllocations>,
+    /// Worker identities that own the active allocation.
+    #[serde(default)]
+    pub allocated_node_incarnations: HashMap<String, String>,
 
     pub exit_code: Option<i32>,
 
@@ -725,6 +957,21 @@ pub struct Job {
     /// separately since it isn't a failure signal and never counts toward `max_batch_requeue`.
     #[serde(default)]
     pub preempt_requeue_count: u32,
+
+    /// Node and exact-GPU leases that temporarily exclude capacity for this job
+    /// after an external-occupancy rejection. This is controller placement
+    /// state, not a user `--exclude`: it is durable across leader failover and
+    /// cleared once the job successfully starts.
+    #[serde(default)]
+    pub transient_capacity_rejections: HashMap<String, TransientCapacityRejection>,
+
+    /// Batch execution ownership, persisted before fanout and retained until
+    /// every target has supplied exact completion or cleanup proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_dispatch: Option<PendingDispatch>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_finalization: Option<PendingFinalization>,
 
     /// Monotonic run epoch, bumped on each dispatch (first dispatch = 1). Lets
     /// the controller drop a completion report from a superseded run.
@@ -785,6 +1032,15 @@ pub struct Job {
 
 impl Job {
     pub fn new(job_id: JobId, spec: JobSpec) -> Self {
+        Self::new_with_submission(job_id, spec, Uuid::new_v4(), Utc::now())
+    }
+
+    pub fn new_with_submission(
+        job_id: JobId,
+        spec: JobSpec,
+        submission_generation: Uuid,
+        submit_time: DateTime<Utc>,
+    ) -> Self {
         let priority = if spec.hold {
             0
         } else {
@@ -802,22 +1058,28 @@ impl Job {
         };
         Self {
             job_id,
+            submission_generation,
+            submission_token: None,
             spec,
             state,
             pending_reason,
             pending_reason_desc: None,
             priority,
-            submit_time: Utc::now(),
+            submit_time,
             start_time: None,
             end_time: None,
             allocated_nodes: Vec::new(),
             allocated_resources: None,
             per_node_alloc: HashMap::new(),
+            allocated_node_incarnations: HashMap::new(),
             exit_code: None,
             exit_signal: 0,
             derived_exit_code: 0,
             requeue_count: 0,
             preempt_requeue_count: 0,
+            transient_capacity_rejections: HashMap::new(),
+            pending_dispatch: None,
+            pending_finalization: None,
             run_attempt: 0,
             het_job_id: None,
             het_group: None,
@@ -1102,6 +1364,9 @@ pub enum NodeCompleteError {
     #[error("node {node} is not allocated to job {job_id}")]
     NodeNotAllocated { job_id: JobId, node: String },
 
+    #[error("completion report conflicts with durable receipt for job {job_id} node {node}")]
+    ReceiptConflict { job_id: JobId, node: String },
+
     #[error("raft propose failed: {source}")]
     RaftPropose {
         #[source]
@@ -1112,7 +1377,9 @@ pub enum NodeCompleteError {
 impl NodeCompleteError {
     pub fn retryable(&self) -> bool {
         match self {
-            Self::JobNotFound { .. } | Self::NodeNotAllocated { .. } => false,
+            Self::JobNotFound { .. }
+            | Self::NodeNotAllocated { .. }
+            | Self::ReceiptConflict { .. } => false,
             Self::RaftPropose { .. } => true,
         }
     }
@@ -1188,6 +1455,9 @@ impl Job {
             (JobState::Pending, JobState::Running) => true,
             (JobState::Pending, JobState::Cancelled) => true,
             (JobState::Pending, JobState::Deadline) => true,
+            (JobState::Pending, JobState::Failed) => true,
+            (JobState::Pending, JobState::Timeout) => true,
+            (JobState::Pending, JobState::NodeFail) => true,
             (JobState::Running, JobState::Completing) => true,
             (JobState::Running, JobState::Completed) => true,
             (JobState::Running, JobState::Failed) => true,
@@ -2190,6 +2460,86 @@ mod tests {
         let back: Job = serde_json::from_value(value).expect("deserialize job");
         assert_eq!(back.pending_reason_desc, None);
         assert_eq!(back.state_reason_display(), "JobHeldUser");
+    }
+
+    #[test]
+    fn pre_transient_capacity_job_snapshot_defaults_rejections_empty() {
+        let job = make_job();
+        let mut value = serde_json::to_value(&job).expect("serialize job");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("transient_capacity_rejections");
+        value.as_object_mut().unwrap().remove("pending_dispatch");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("pending_finalization");
+
+        let back: Job = serde_json::from_value(value).expect("deserialize pre-upgrade job");
+        assert!(back.transient_capacity_rejections.is_empty());
+        assert!(back.pending_dispatch.is_none());
+        assert!(back.pending_finalization.is_none());
+    }
+
+    #[test]
+    fn pending_finalization_survives_job_snapshot_round_trip() {
+        let mut job = make_job();
+        let end_time = Utc::now();
+        job.state = JobState::Timeout;
+        job.exit_code = Some(-1);
+        job.end_time = Some(end_time);
+        job.run_attempt = 7;
+        job.pending_finalization = Some(PendingFinalization {
+            finalization_id: Uuid::new_v4(),
+            submission_generation: job.submission_generation,
+            run_attempt: job.run_attempt,
+            state: job.state,
+            exit_code: -1,
+            exit_signal: 9,
+            derived_exit_code: 3,
+            end_time,
+            intent: FinalizationIntent::AutoRequeue,
+        });
+
+        let json = serde_json::to_vec(&job).expect("serialize job snapshot");
+        let back: Job = serde_json::from_slice(&json).expect("restore job snapshot");
+        assert_eq!(back.pending_finalization, job.pending_finalization);
+    }
+
+    #[test]
+    fn transient_capacity_rejections_survive_job_snapshot_round_trip() {
+        let now = Utc::now();
+        let mut job = make_job();
+        job.transient_capacity_rejections.insert(
+            "n1".into(),
+            TransientCapacityRejection {
+                whole_node_until: Some(now + chrono::Duration::seconds(30)),
+                gpu_until: HashMap::from([(2, now + chrono::Duration::seconds(10))]),
+            },
+        );
+        job.pending_dispatch = Some(PendingDispatch {
+            submission_generation: job.submission_generation,
+            run_attempt: 3,
+            target_nodes: vec!["n1".into(), "n2".into()],
+            target_incarnations: HashMap::new(),
+            phase: PendingDispatchPhase::Launching,
+            resources: ResourceAllocations::default(),
+            per_node_alloc: HashMap::new(),
+            early_completions: HashMap::new(),
+            terminal_after_cleanup: None,
+            backoff_after_cleanup: None,
+            preempt_requeue_after_cleanup: None,
+            preempt_finalization_after_cleanup: None,
+        });
+
+        let json = serde_json::to_vec(&job).expect("serialize job snapshot");
+        let back: Job = serde_json::from_slice(&json).expect("restore job snapshot");
+        assert_eq!(
+            back.transient_capacity_rejections,
+            job.transient_capacity_rejections
+        );
+        assert_eq!(back.pending_dispatch, job.pending_dispatch);
     }
 
     #[test]

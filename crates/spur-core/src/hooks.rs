@@ -5,7 +5,7 @@ use std::process::Stdio;
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tracing::{info, warn};
 
@@ -36,6 +36,22 @@ pub struct HookContext {
 /// Stderr is captured and logged; stdout is discarded.
 /// Returns `Err` on script execution failure or non-zero exit.
 pub async fn run_hook(script_path: &str, ctx: &HookContext) -> anyhow::Result<()> {
+    run_hook_inner(script_path, ctx, None).await
+}
+
+pub async fn run_hook_with_timeout(
+    script_path: &str,
+    ctx: &HookContext,
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
+    run_hook_inner(script_path, ctx, Some(timeout)).await
+}
+
+async fn run_hook_inner(
+    script_path: &str,
+    ctx: &HookContext,
+    timeout: Option<std::time::Duration>,
+) -> anyhow::Result<()> {
     info!(
         job_id = ctx.job_id,
         hook = %ctx.script_context,
@@ -66,25 +82,54 @@ pub async fn run_hook(script_path: &str, ctx: &HookContext) -> anyhow::Result<()
     env.set("SPUR_SCRIPT_CONTEXT", &ctx.script_context);
 
     let mut cmd = Command::new(script_path);
+    cmd.kill_on_drop(true);
     for (k, v) in env.into_map() {
         cmd.env(k, v);
     }
     cmd.stdout(Stdio::null()).stderr(Stdio::piped());
-    let child = spawn_hook_in_work_dir(&mut cmd, &ctx.work_dir, ctx.job_id, &ctx.script_context)
-        .with_context(|| {
-            format!(
-                "{} script failed to execute: {}",
-                ctx.script_context, script_path
-            )
-        })?;
+    let mut child =
+        spawn_hook_in_work_dir(&mut cmd, &ctx.work_dir, ctx.job_id, &ctx.script_context)
+            .with_context(|| {
+                format!(
+                    "{} script failed to execute: {}",
+                    ctx.script_context, script_path
+                )
+            })?;
 
-    let output = child
-        .wait_with_output()
+    let stderr = child.stderr.take();
+    let stderr_reader = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        if let Some(mut stderr) = stderr {
+            stderr.read_to_end(&mut bytes).await?;
+        }
+        Ok::<_, std::io::Error>(bytes)
+    });
+    let status = match timeout {
+        Some(limit) => match tokio::time::timeout(limit, child.wait()).await {
+            Ok(result) => result,
+            Err(_) => {
+                kill_hook_process_group(child.id());
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                let _ = stderr_reader.await;
+                anyhow::bail!(
+                    "{} script timed out after {:?} (script: {})",
+                    ctx.script_context,
+                    limit,
+                    script_path
+                );
+            }
+        },
+        None => child.wait().await,
+    }
+    .with_context(|| format!("{} script failed to complete", ctx.script_context))?;
+    let stderr = stderr_reader
         .await
-        .with_context(|| format!("{} script failed to complete", ctx.script_context))?;
+        .context("hook stderr reader task failed")?
+        .context("hook stderr read failed")?;
 
-    if !output.stderr.is_empty() {
-        let stderr_text = String::from_utf8_lossy(&output.stderr);
+    if !stderr.is_empty() {
+        let stderr_text = String::from_utf8_lossy(&stderr);
         for line in stderr_text.lines() {
             warn!(
                 job_id = ctx.job_id,
@@ -94,11 +139,11 @@ pub async fn run_hook(script_path: &str, ctx: &HookContext) -> anyhow::Result<()
         }
     }
 
-    if !output.status.success() {
+    if !status.success() {
         anyhow::bail!(
             "{} script exited with {} (script: {})",
             ctx.script_context,
-            output.status,
+            status,
             script_path
         );
     }
@@ -613,6 +658,11 @@ fn spawn_hook_in_work_dir(
     job_id: JobId,
     script_context: &str,
 ) -> std::io::Result<tokio::process::Child> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.as_std_mut().process_group(0);
+    }
     if work_dir.is_empty() {
         return cmd.current_dir("/tmp").spawn();
     }
@@ -629,6 +679,18 @@ fn spawn_hook_in_work_dir(
         "hook could not start in work_dir, ran from /tmp instead"
     );
     Ok(child)
+}
+
+fn kill_hook_process_group(pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = pid.and_then(|pid| i32::try_from(pid).ok()) {
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
 }
 
 fn resolve_username(uid: u32) -> String {
@@ -691,6 +753,38 @@ mod tests {
         let result = run_hook(script.to_str().unwrap(), &ctx).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("prolog_slurmd"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial(run_hooks)]
+    async fn hook_timeout_kills_descendants_before_returning() {
+        let child_pid = NamedTempFile::new().unwrap();
+        let child_pid_path = child_pid.path().to_string_lossy().into_owned();
+        let script = make_script(&format!(
+            "(\n  echo \"$BASHPID\" > '{child_pid_path}'\n  while true; do sleep 60; done\n) &\nwait"
+        ));
+        let result = run_hook_with_timeout(
+            script.to_str().unwrap(),
+            &test_ctx(),
+            std::time::Duration::from_millis(200),
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("script timed out"));
+
+        let descendant_pid: i32 = std::fs::read_to_string(&child_pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let status = std::fs::read_to_string(format!("/proc/{descendant_pid}/stat"));
+        if let Ok(status) = status {
+            let state = status.split_whitespace().nth(2).unwrap_or("?");
+            assert_eq!(
+                state, "Z",
+                "hook descendant is still live after process-group cleanup"
+            );
+        }
     }
 
     #[tokio::test]

@@ -8,6 +8,7 @@ use std::time::Duration;
 use chrono::Utc;
 use sqlx::PgPool;
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 use spur_core::job::{Job, JobId, JobState};
 
@@ -62,9 +63,9 @@ async fn run_once(pool: &PgPool, cluster: &ClusterManager) {
         return;
     }
 
-    let expected: Vec<(JobId, String)> = candidates
+    let expected: Vec<ExpectedAccountingState> = candidates
         .iter()
-        .map(|j| (j.job_id, accounting_expected_state(j.state)))
+        .map(ExpectedAccountingState::from)
         .collect();
 
     let job_ids: Vec<i32> = candidates.iter().map(|j| j.job_id as i32).collect();
@@ -101,10 +102,38 @@ async fn run_once(pool: &PgPool, cluster: &ClusterManager) {
 
     for job in candidates.iter().filter(|j| stale.contains(&j.job_id)) {
         let row = accounting_states.get(&job.job_id);
-        let row_missing = row.is_none();
-        let needs_start_backfill = row.map(|r| r.needs_start_backfill).unwrap_or(false);
+        // A projection row for an older reuse of the same numeric ID is
+        // missing for this exact execution. Treat it as such so finalized
+        // jobs replay both START and END rather than merely accepting the
+        // older row's matching terminal state.
+        let exact_row = row.filter(|r| accounting_row_matches_execution(r, job));
+        let row_missing = exact_row.is_none();
+        let needs_start_backfill = exact_row.map(|r| r.needs_start_backfill).unwrap_or(false);
         resync_job(pool, job, row_missing, needs_start_backfill).await;
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExpectedAccountingState {
+    job_id: JobId,
+    submission_generation: Uuid,
+    run_attempt: u32,
+    state: String,
+}
+
+impl From<&Job> for ExpectedAccountingState {
+    fn from(job: &Job) -> Self {
+        Self {
+            job_id: job.job_id,
+            submission_generation: job.submission_generation,
+            run_attempt: job.run_attempt,
+            state: accounting_expected_state(job.state),
+        }
+    }
+}
+
+fn accounting_row_matches_execution(row: &AccountingRowState, job: &Job) -> bool {
+    row.submission_generation == job.submission_generation && row.run_attempt == job.run_attempt
 }
 
 /// What accounting should show for a job's current state. Accounting only
@@ -130,52 +159,41 @@ fn accounting_expected_state(state: JobState) -> String {
 /// read failed this pass — distinct from a confirmed-absent row, so they're
 /// skipped rather than treated as missing.
 fn jobs_needing_resync(
-    expected: &[(JobId, String)],
+    expected: &[ExpectedAccountingState],
     accounting: &HashMap<JobId, AccountingRowState>,
     unknown: &HashSet<JobId>,
 ) -> Vec<JobId> {
     expected
         .iter()
-        .filter(|(id, _)| !unknown.contains(id))
-        .filter(|(id, state)| match accounting.get(id) {
+        .filter(|expected| !unknown.contains(&expected.job_id))
+        .filter(|expected| match accounting.get(&expected.job_id) {
             None => true,
-            Some(row) => row.needs_start_backfill || &row.state != state,
+            Some(row) => {
+                row.submission_generation != expected.submission_generation
+                    || row.run_attempt != expected.run_attempt
+                    || row.needs_start_backfill
+                    || row.state != expected.state
+            }
         })
-        .map(|(id, _)| *id)
+        .map(|expected| expected.job_id)
         .collect()
 }
 
-/// Resync one job's accounting record. `write_start` and `write_end` (when
-/// both are needed) run inside a single transaction so a failure partway
-/// through — including `write_start` itself failing — rolls back cleanly
-/// instead of leaving the row in an intermediate state: `record_job_start`
-/// unconditionally sets `state='RUNNING'` with a wiped end time and exit
-/// code, and previously that reset was committed on its own statement, with
-/// `write_end` relied on to fix it back up immediately after. Any failure
-/// between the two — or a concurrent reader landing in the gap — could
-/// observe or permanently persist a correct finalized record clobbered back
-/// to `RUNNING`. The whole attempt is bounded by `ATTEMPT_TIMEOUT` so a
-/// wedged connection can't stall the reconciliation loop; a timed-out job is
-/// simply retried on the next pass.
+/// Resync one job through the same exact-identity transactions as live
+/// delivery. Each write is independently replay-safe: START cannot erase an
+/// existing terminal outcome, and END claims usage once by execution tuple.
+/// The whole attempt is bounded so a wedged connection cannot stall the loop.
 async fn resync_job(pool: &PgPool, job: &Job, row_missing: bool, needs_start_backfill: bool) {
-    // record_job_start unconditionally sets state='RUNNING', so only call it
-    // when the row doesn't exist yet, is missing start metadata a proper
-    // record_job_start would have populated (see AccountingRowState), or the
-    // job hasn't reached a finalized state — otherwise it would clobber a
-    // correct finalized state. The finalized case is corrected in the same
-    // transaction by write_end below.
     let needs_start = row_missing || needs_start_backfill || !job.state.is_finalized();
     let is_finalized = job.state.is_finalized();
 
     let attempt = async {
-        let mut tx = pool.begin().await?;
         if needs_start {
-            write_start(&mut tx, job).await?;
+            write_start(pool, job).await?;
         }
         if is_finalized {
-            write_end(&mut tx, job).await?;
+            write_end(pool, job).await?;
         }
-        tx.commit().await?;
         anyhow::Ok(())
     };
 
@@ -193,7 +211,7 @@ async fn resync_job(pool: &PgPool, job: &Job, row_missing: bool, needs_start_bac
     }
 }
 
-async fn write_start(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result<()> {
+async fn write_start(pool: &PgPool, job: &Job) -> anyhow::Result<()> {
     let spec = &job.spec;
     let memory_mb = job
         .allocated_resources
@@ -201,9 +219,11 @@ async fn write_start(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result
         .map(|r| r.memory_mb)
         .unwrap_or(0);
     let start_time = job.start_time.unwrap_or(job.submit_time);
-    db::record_job_start(
-        conn,
+    db::record_job_start_exact(
+        pool,
         job.job_id as i32,
+        job.submission_generation,
+        job.run_attempt,
         &spec.name,
         &spec.user,
         spec.account.as_deref().unwrap_or_default(),
@@ -219,16 +239,33 @@ async fn write_start(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result
     .await
 }
 
-async fn write_end(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result<()> {
+async fn write_end(pool: &PgPool, job: &Job) -> anyhow::Result<()> {
     let end_time = job.end_time.unwrap_or_else(Utc::now);
-    db::record_job_end(
-        conn,
+    let finalization_id = job
+        .pending_finalization
+        .as_ref()
+        .filter(|marker| {
+            marker.submission_generation == job.submission_generation
+                && marker.run_attempt == job.run_attempt
+        })
+        .map(|marker| marker.finalization_id)
+        .filter(|id| !id.is_nil());
+    db::record_job_finalization(
+        pool,
         job.job_id as i32,
+        job.submission_generation,
+        job.run_attempt,
+        finalization_id,
         job.state.display(),
         job.exit_code.unwrap_or(0),
         end_time,
         job.exit_signal,
         job.derived_exit_code,
+        &job.spec.user,
+        job.spec.account.as_deref().unwrap_or_default(),
+        job.start_time.unwrap_or(job.submit_time),
+        job.spec.num_tasks as i32,
+        job.spec.cpus_per_task as i32,
     )
     .await
 }
@@ -241,8 +278,19 @@ mod tests {
 
     fn synced_row(state: &str) -> AccountingRowState {
         AccountingRowState {
+            submission_generation: Uuid::nil(),
+            run_attempt: 0,
             state: state.to_string(),
             needs_start_backfill: false,
+        }
+    }
+
+    fn expected(job_id: JobId, state: &str) -> ExpectedAccountingState {
+        ExpectedAccountingState {
+            job_id,
+            submission_generation: Uuid::nil(),
+            run_attempt: 0,
+            state: state.to_string(),
         }
     }
 
@@ -252,7 +300,7 @@ mod tests {
 
     #[test]
     fn jobs_needing_resync_flags_missing_job() {
-        let expected = vec![(1, "RUNNING".to_string())];
+        let expected = vec![expected(1, "RUNNING")];
         let accounting = HashMap::new();
 
         let stale = jobs_needing_resync(&expected, &accounting, &no_unknown());
@@ -262,7 +310,7 @@ mod tests {
 
     #[test]
     fn jobs_needing_resync_flags_stale_state() {
-        let expected = vec![(1, "COMPLETED".to_string())];
+        let expected = vec![expected(1, "COMPLETED")];
         let mut accounting = HashMap::new();
         accounting.insert(1, synced_row("RUNNING"));
 
@@ -273,7 +321,7 @@ mod tests {
 
     #[test]
     fn jobs_needing_resync_ignores_job_in_sync() {
-        let expected = vec![(1, "RUNNING".to_string())];
+        let expected = vec![expected(1, "RUNNING")];
         let mut accounting = HashMap::new();
         accounting.insert(1, synced_row("RUNNING"));
 
@@ -285,9 +333,9 @@ mod tests {
     #[test]
     fn jobs_needing_resync_handles_mixed_batch() {
         let expected = vec![
-            (1, "RUNNING".to_string()),
-            (2, "COMPLETED".to_string()),
-            (3, "FAILED".to_string()),
+            expected(1, "RUNNING"),
+            expected(2, "COMPLETED"),
+            expected(3, "FAILED"),
         ];
         let mut accounting = HashMap::new();
         accounting.insert(1, synced_row("RUNNING")); // in sync
@@ -305,11 +353,13 @@ mod tests {
     // must still be flagged, or the gap is permanent.
     #[test]
     fn jobs_needing_resync_flags_bare_row_even_when_state_matches() {
-        let expected = vec![(1, "COMPLETED".to_string())];
+        let expected = vec![expected(1, "COMPLETED")];
         let mut accounting = HashMap::new();
         accounting.insert(
             1,
             AccountingRowState {
+                submission_generation: Uuid::nil(),
+                run_attempt: 0,
                 state: "COMPLETED".to_string(),
                 needs_start_backfill: true,
             },
@@ -326,7 +376,7 @@ mod tests {
     // conflating them can clobber a correct finalized record via write_start.
     #[test]
     fn jobs_needing_resync_skips_jobs_with_unknown_read_status() {
-        let expected = vec![(1, "COMPLETED".to_string()), (2, "RUNNING".to_string())];
+        let expected = vec![expected(1, "COMPLETED"), expected(2, "RUNNING")];
         let accounting = HashMap::new();
         let mut unknown = HashSet::new();
         unknown.insert(1);
@@ -365,7 +415,7 @@ mod tests {
         // pre-fix behavior, since is_terminal() excluded Preempted from ever
         // getting write_end'd) must be flagged for resync so it converges on
         // PREEMPTED rather than being ignored forever.
-        let expected = vec![(1, accounting_expected_state(JobState::Preempted))];
+        let expected = vec![expected(1, &accounting_expected_state(JobState::Preempted))];
         let mut accounting = HashMap::new();
         accounting.insert(1, synced_row("RUNNING"));
 
@@ -376,13 +426,54 @@ mod tests {
 
     #[test]
     fn jobs_needing_resync_ignores_suspended_job_matching_running_row() {
-        let expected = vec![(1, accounting_expected_state(JobState::Suspended))];
+        let expected = vec![expected(1, &accounting_expected_state(JobState::Suspended))];
         let mut accounting = HashMap::new();
         accounting.insert(1, synced_row("RUNNING"));
 
         let stale = jobs_needing_resync(&expected, &accounting, &no_unknown());
 
         assert!(stale.is_empty());
+    }
+
+    // Regression: the compatible `jobs` projection is keyed by numeric ID,
+    // so an old RUNNING row can look state-synchronized after that ID is
+    // reused and the new execution's START response is lost. Generation and
+    // attempt must participate in the comparison or the exact `job_runs`
+    // receipt for the new execution is never repaired.
+    #[test]
+    fn reused_numeric_job_id_with_lost_start_is_resynced_after_restart() {
+        let job_id = 1;
+        let old_generation = Uuid::from_u128(1);
+        let new_generation = Uuid::from_u128(2);
+        let mut new_job = test_job(job_id, JobState::Running);
+        new_job.submission_generation = new_generation;
+        new_job.run_attempt = 1;
+
+        // The Raft snapshot is a serialized `Job`; round-trip it to model a
+        // controller restart after the exact START write was lost.
+        let snapshot = serde_json::to_vec(&new_job).unwrap();
+        let restarted_job: Job = serde_json::from_slice(&snapshot).unwrap();
+        let expected = vec![ExpectedAccountingState::from(&restarted_job)];
+        let accounting = HashMap::from([(
+            job_id,
+            AccountingRowState {
+                submission_generation: old_generation,
+                run_attempt: 0,
+                state: "RUNNING".to_string(),
+                needs_start_backfill: false,
+            },
+        )]);
+
+        let stale = jobs_needing_resync(&expected, &accounting, &no_unknown());
+
+        assert_eq!(stale, vec![job_id]);
+        assert!(
+            accounting
+                .get(&job_id)
+                .filter(|row| accounting_row_matches_execution(row, &restarted_job))
+                .is_none(),
+            "the older projection must be treated as absent for this exact execution"
+        );
     }
 
     fn test_job_id(slot: u32) -> u32 {
@@ -463,7 +554,7 @@ mod tests {
         assert_eq!(bare.state, "COMPLETED");
 
         // The diff must flag this job even though state already matches.
-        let expected = vec![(job_id, accounting_expected_state(job.state))];
+        let expected = vec![ExpectedAccountingState::from(&job)];
         let mut accounting = HashMap::new();
         accounting.insert(job_id, bare);
         let stale = jobs_needing_resync(&expected, &accounting, &no_unknown());
@@ -518,12 +609,14 @@ mod tests {
         let running_job = test_job(job_id, JobState::Running);
         resync_job(&pool, &running_job, true, false).await;
 
-        let suspended_job = test_job(job_id, JobState::Suspended);
+        let mut suspended_job = test_job(job_id, JobState::Suspended);
+        suspended_job.submission_generation = running_job.submission_generation;
+        suspended_job.run_attempt = running_job.run_attempt;
         let row = db::job_accounting_states(&pool, &[job_id as i32])
             .await?
             .remove(&(job_id as i32))
             .expect("row exists");
-        let expected = vec![(job_id, accounting_expected_state(suspended_job.state))];
+        let expected = vec![ExpectedAccountingState::from(&suspended_job)];
         let mut accounting = HashMap::new();
         accounting.insert(job_id, row);
 
@@ -537,81 +630,18 @@ mod tests {
         Ok(())
     }
 
-    // Regression test for the core atomicity bug: record_job_start
-    // unconditionally resets state='RUNNING'/end_time=NULL, so a resync pass
-    // that backfills a job already holding a correct, complete terminal
-    // record must never leave that record clobbered if anything fails
-    // between write_start committing its (would-be-corrupting) write and
-    // write_end correcting it. write_start's own INSERT is single-statement
-    // atomic on its own — a bad value in it just fails outright without
-    // writing anything, old buggy code included — so this drives write_start
-    // to completion for real (proving it does flip the row to RUNNING with
-    // no end_time, exactly the corrupted shape the bug left behind) and then
-    // forces a real SQL failure on the same transaction before commit, the
-    // way a failing write_end or a dropped connection would. Only the
-    // transaction's rollback — not any additional application-level fixup —
-    // is what must protect the pre-existing terminal record here.
+    // An exact START replay arriving after END must fill metadata without
+    // clearing the immutable terminal result.
     #[tokio::test]
     #[ignore = "requires DATABASE_URL and PostgreSQL"]
-    async fn resync_job_transaction_rolls_back_a_partial_backfill() -> anyhow::Result<()> {
+    async fn exact_start_replay_preserves_a_terminal_run() -> anyhow::Result<()> {
         let pool = test_pool().await?;
         let job_id = test_job_id(2);
         delete_job(&pool, job_id as i32).await;
 
-        // Seed a correct, complete terminal record, as if a prior pass had
-        // already recorded it successfully.
         let job = test_job(job_id, JobState::Completed);
-        {
-            let mut conn = pool.acquire().await?;
-            db::record_job_start(
-                &mut conn,
-                job_id as i32,
-                &job.spec.name,
-                &job.spec.user,
-                "",
-                "",
-                job.spec.num_nodes as i32,
-                job.spec.num_tasks as i32,
-                job.spec.cpus_per_task as i32,
-                0,
-                job.submit_time,
-                job.start_time.unwrap(),
-                "",
-            )
-            .await?;
-            db::record_job_end(
-                &mut conn,
-                job_id as i32,
-                "COMPLETED",
-                0,
-                job.end_time.unwrap(),
-                0,
-                0,
-            )
-            .await?;
-        }
-
-        // Run write_start (the real function resync_job calls) inside a
-        // transaction of our own, the same way resync_job's fix does.
-        let mut tx = pool.begin().await?;
-        write_start(&mut tx, &job).await?;
-
-        // Within the uncommitted transaction, the row is now exactly the
-        // corrupted shape the pre-fix bug used to leave committed: RUNNING
-        // with end_time wiped out.
-        let mid_row = sqlx::query("SELECT state, end_time FROM jobs WHERE job_id = $1")
-            .bind(job_id as i32)
-            .fetch_one(&mut *tx)
-            .await?;
-        let mid_state: String = mid_row.get("state");
-        let mid_end_time: Option<chrono::DateTime<Utc>> = mid_row.get("end_time");
-        assert_eq!(mid_state, "RUNNING");
-        assert!(mid_end_time.is_none());
-
-        // Simulate write_end failing (or a connection drop) before commit —
-        // any real SQL error on the same transaction has the same effect.
-        assert!(sqlx::query("SELECT 1/0").execute(&mut *tx).await.is_err());
-        drop(tx); // never committed: sqlx issues ROLLBACK
+        write_end(&pool, &job).await?;
+        write_start(&pool, &job).await?;
 
         let row = sqlx::query("SELECT state, end_time FROM jobs WHERE job_id = $1")
             .bind(job_id as i32)
@@ -621,11 +651,11 @@ mod tests {
         let end_time: Option<chrono::DateTime<Utc>> = row.get("end_time");
         assert_eq!(
             state, "COMPLETED",
-            "a rolled-back backfill must never leave the row RUNNING"
+            "a late START must never leave the row RUNNING"
         );
         assert!(
             end_time.is_some(),
-            "a rolled-back backfill must never wipe out end_time"
+            "a late START must never wipe out end_time"
         );
 
         delete_job(&pool, job_id as i32).await;

@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use sqlx::postgres::{PgConnection, PgRow};
 use sqlx::{PgPool, QueryBuilder, Row};
+use uuid::Uuid;
 
 /// Apply the database schema, serialized across controllers by a fixed advisory
 /// lock: migrate now also rewrites data (default-account dedup) and builds a
@@ -32,6 +33,8 @@ const SCHEMA_LOCK_OBJ: i32 = 1;
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS jobs (
     job_id          INTEGER PRIMARY KEY,
+    submission_generation UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000',
+    run_attempt     INTEGER NOT NULL DEFAULT 0,
     name            TEXT NOT NULL DEFAULT '',
     user_name       TEXT NOT NULL,
     uid             INTEGER NOT NULL DEFAULT 0,
@@ -86,6 +89,56 @@ CREATE TABLE IF NOT EXISTS usage (
     PRIMARY KEY (user_name, account, period_start)
 );
 
+-- Authoritative immutable execution records. `jobs` remains the compatible
+-- current-job projection; this table prevents a reused numeric job ID or a
+-- later run attempt from aliasing an earlier accounting contribution.
+CREATE TABLE IF NOT EXISTS job_runs (
+    job_id          INTEGER NOT NULL,
+    submission_generation UUID NOT NULL,
+    run_attempt     INTEGER NOT NULL,
+    finalization_id UUID,
+    name            TEXT NOT NULL DEFAULT '',
+    user_name       TEXT NOT NULL,
+    account         TEXT NOT NULL DEFAULT '',
+    partition_name  TEXT NOT NULL DEFAULT '',
+    num_nodes       INTEGER NOT NULL DEFAULT 1,
+    num_tasks       INTEGER NOT NULL DEFAULT 1,
+    cpus_per_task   INTEGER NOT NULL DEFAULT 1,
+    memory_mb       BIGINT NOT NULL DEFAULT 0,
+    submit_time     TIMESTAMPTZ NOT NULL,
+    start_time      TIMESTAMPTZ NOT NULL,
+    reservation     TEXT NOT NULL DEFAULT '',
+    start_recorded  BOOLEAN NOT NULL DEFAULT FALSE,
+    state           TEXT NOT NULL DEFAULT 'RUNNING',
+    exit_code       INTEGER NOT NULL DEFAULT 0,
+    exit_signal     INTEGER NOT NULL DEFAULT 0,
+    derived_exit_code INTEGER NOT NULL DEFAULT 0,
+    end_time        TIMESTAMPTZ,
+    PRIMARY KEY (job_id, submission_generation, run_attempt)
+);
+
+-- UUID uniqueness is mandatory for new finalizations. Legacy snapshots use a
+-- nil UUID, which the controller writes as NULL and fences by execution tuple.
+CREATE UNIQUE INDEX IF NOT EXISTS job_runs_finalization_id_unique
+    ON job_runs (finalization_id) WHERE finalization_id IS NOT NULL;
+
+-- One exact additive contribution claim per execution. The claim and the
+-- aggregate increment are committed in the same transaction.
+CREATE TABLE IF NOT EXISTS usage_contributions (
+    job_id          INTEGER NOT NULL,
+    submission_generation UUID NOT NULL,
+    run_attempt     INTEGER NOT NULL,
+    finalization_id UUID,
+    user_name       TEXT NOT NULL,
+    account         TEXT NOT NULL,
+    period_start    TIMESTAMPTZ NOT NULL,
+    period_end      TIMESTAMPTZ NOT NULL,
+    cpu_seconds     BIGINT NOT NULL,
+    PRIMARY KEY (job_id, submission_generation, run_attempt),
+    FOREIGN KEY (job_id, submission_generation, run_attempt)
+        REFERENCES job_runs (job_id, submission_generation, run_attempt)
+);
+
 CREATE TABLE IF NOT EXISTS qos (
     name            TEXT PRIMARY KEY,
     description     TEXT NOT NULL DEFAULT '',
@@ -137,6 +190,10 @@ CREATE INDEX IF NOT EXISTS idx_assoc_account ON associations(account);
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS exit_signal INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS derived_exit_code INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS reservation TEXT NOT NULL DEFAULT '';
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS submission_generation UUID NOT NULL
+    DEFAULT '00000000-0000-0000-0000-000000000000';
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS run_attempt INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE job_runs ADD COLUMN IF NOT EXISTS start_recorded BOOLEAN NOT NULL DEFAULT FALSE;
 -- No FK to qos(name): a stale reference (QOS deleted after being set as a
 -- default) must degrade gracefully at read time, not be blocked here.
 ALTER TABLE associations ADD COLUMN IF NOT EXISTS default_qos TEXT;
@@ -165,6 +222,472 @@ WHERE default_account IS NOT NULL
 CREATE UNIQUE INDEX IF NOT EXISTS one_default_account_per_user
     ON users (name) WHERE default_account IS NOT NULL;
 "#;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FinalizationReceipt {
+    finalization_id: Option<Uuid>,
+    state: String,
+    exit_code: i32,
+    end_time: DateTime<Utc>,
+    exit_signal: i32,
+    derived_exit_code: i32,
+}
+
+impl FinalizationReceipt {
+    /// `None` is the legacy/reconciliation fallback: the exact execution tuple
+    /// remains authoritative, while a supplied UUID must match byte-for-byte.
+    fn accepts_replay(&self, candidate: &Self) -> bool {
+        (candidate.finalization_id.is_none() || self.finalization_id == candidate.finalization_id)
+            && self.state == candidate.state
+            && self.exit_code == candidate.exit_code
+            && self.end_time.timestamp_micros() == candidate.end_time.timestamp_micros()
+            && self.exit_signal == candidate.exit_signal
+            && self.derived_exit_code == candidate.derived_exit_code
+    }
+}
+
+/// Record an exact execution start without erasing an already-recorded end.
+/// The execution row and backward-compatible `jobs` projection commit
+/// together. Replays must carry identical immutable start metadata.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_job_start_exact(
+    pool: &PgPool,
+    job_id: i32,
+    submission_generation: Uuid,
+    run_attempt: u32,
+    name: &str,
+    user: &str,
+    account: &str,
+    partition: &str,
+    num_nodes: i32,
+    num_tasks: i32,
+    cpus_per_task: i32,
+    memory_mb: i64,
+    submit_time: DateTime<Utc>,
+    start_time: DateTime<Utc>,
+    reservation: &str,
+) -> anyhow::Result<()> {
+    let run_attempt = i32::try_from(run_attempt)?;
+    let mut tx = pool.begin().await?;
+    let existing = sqlx::query(
+        r#"
+        SELECT name, user_name, account, partition_name, num_nodes, num_tasks,
+               cpus_per_task, memory_mb, submit_time, start_time, reservation,
+               start_recorded
+        FROM job_runs
+        WHERE job_id = $1 AND submission_generation = $2 AND run_attempt = $3
+        FOR UPDATE
+        "#,
+    )
+    .bind(job_id)
+    .bind(submission_generation)
+    .bind(run_attempt)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(row) = existing {
+        if row.get::<bool, _>("start_recorded") {
+            let matches = row.get::<String, _>("name") == name
+                && row.get::<String, _>("user_name") == user
+                && row.get::<String, _>("account") == account
+                && row.get::<String, _>("partition_name") == partition
+                && row.get::<i32, _>("num_nodes") == num_nodes
+                && row.get::<i32, _>("num_tasks") == num_tasks
+                && row.get::<i32, _>("cpus_per_task") == cpus_per_task
+                && row.get::<i64, _>("memory_mb") == memory_mb
+                && row
+                    .get::<DateTime<Utc>, _>("submit_time")
+                    .timestamp_micros()
+                    == submit_time.timestamp_micros()
+                && row.get::<DateTime<Utc>, _>("start_time").timestamp_micros()
+                    == start_time.timestamp_micros()
+                && row.get::<String, _>("reservation") == reservation;
+            anyhow::ensure!(
+                matches,
+                "conflicting accounting start for job {job_id} generation {submission_generation} attempt {run_attempt}"
+            );
+        } else {
+            // END-before-START: fill the exact run's missing start projection
+            // without clearing its immutable terminal outcome. Fields that
+            // already determined the contribution must still match.
+            anyhow::ensure!(
+                row.get::<String, _>("user_name") == user
+                    && row.get::<String, _>("account") == account
+                    && row
+                        .get::<DateTime<Utc>, _>("start_time")
+                        .timestamp_micros()
+                        == start_time.timestamp_micros()
+                    && row.get::<i32, _>("num_tasks") == num_tasks
+                    && row.get::<i32, _>("cpus_per_task") == cpus_per_task,
+                "conflicting late accounting start for job {job_id} generation {submission_generation} attempt {run_attempt}"
+            );
+            sqlx::query(
+                r#"
+                UPDATE job_runs SET name=$4, user_name=$5, account=$6,
+                    partition_name=$7, num_nodes=$8, num_tasks=$9,
+                    cpus_per_task=$10, memory_mb=$11, submit_time=$12,
+                    start_time=$13, reservation=$14, start_recorded=TRUE
+                WHERE job_id=$1 AND submission_generation=$2 AND run_attempt=$3
+                "#,
+            )
+            .bind(job_id)
+            .bind(submission_generation)
+            .bind(run_attempt)
+            .bind(name)
+            .bind(user)
+            .bind(account)
+            .bind(partition)
+            .bind(num_nodes)
+            .bind(num_tasks)
+            .bind(cpus_per_task)
+            .bind(memory_mb)
+            .bind(submit_time)
+            .bind(start_time)
+            .bind(reservation)
+            .execute(&mut *tx)
+            .await?;
+        }
+    } else {
+        sqlx::query(
+            r#"
+            INSERT INTO job_runs (
+                job_id, submission_generation, run_attempt, name, user_name,
+                account, partition_name, num_nodes, num_tasks, cpus_per_task,
+                memory_mb, submit_time, start_time, reservation, state,
+                start_recorded
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'RUNNING',TRUE)
+            "#,
+        )
+        .bind(job_id)
+        .bind(submission_generation)
+        .bind(run_attempt)
+        .bind(name)
+        .bind(user)
+        .bind(account)
+        .bind(partition)
+        .bind(num_nodes)
+        .bind(num_tasks)
+        .bind(cpus_per_task)
+        .bind(memory_mb)
+        .bind(submit_time)
+        .bind(start_time)
+        .bind(reservation)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO jobs (
+            job_id, submission_generation, run_attempt, name, user_name,
+            account, partition_name, num_nodes, num_tasks, cpus_per_task,
+            memory_mb, submit_time, start_time, state, reservation
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'RUNNING',$14)
+        ON CONFLICT (job_id) DO UPDATE SET
+            submission_generation = EXCLUDED.submission_generation,
+            run_attempt = EXCLUDED.run_attempt,
+            name = EXCLUDED.name,
+            user_name = EXCLUDED.user_name,
+            account = EXCLUDED.account,
+            partition_name = EXCLUDED.partition_name,
+            num_nodes = EXCLUDED.num_nodes,
+            num_tasks = EXCLUDED.num_tasks,
+            cpus_per_task = EXCLUDED.cpus_per_task,
+            memory_mb = EXCLUDED.memory_mb,
+            submit_time = EXCLUDED.submit_time,
+            start_time = EXCLUDED.start_time,
+            reservation = EXCLUDED.reservation,
+            state = CASE
+                WHEN jobs.submission_generation = EXCLUDED.submission_generation
+                 AND jobs.run_attempt = EXCLUDED.run_attempt
+                 AND jobs.end_time IS NOT NULL THEN jobs.state
+                ELSE 'RUNNING'
+            END,
+            exit_code = CASE
+                WHEN jobs.submission_generation = EXCLUDED.submission_generation
+                 AND jobs.run_attempt = EXCLUDED.run_attempt
+                 AND jobs.end_time IS NOT NULL THEN jobs.exit_code ELSE 0 END,
+            exit_signal = CASE
+                WHEN jobs.submission_generation = EXCLUDED.submission_generation
+                 AND jobs.run_attempt = EXCLUDED.run_attempt
+                 AND jobs.end_time IS NOT NULL THEN jobs.exit_signal ELSE 0 END,
+            derived_exit_code = CASE
+                WHEN jobs.submission_generation = EXCLUDED.submission_generation
+                 AND jobs.run_attempt = EXCLUDED.run_attempt
+                 AND jobs.end_time IS NOT NULL THEN jobs.derived_exit_code ELSE 0 END,
+            end_time = CASE
+                WHEN jobs.submission_generation = EXCLUDED.submission_generation
+                 AND jobs.run_attempt = EXCLUDED.run_attempt THEN jobs.end_time ELSE NULL END
+        WHERE jobs.submit_time < EXCLUDED.submit_time
+           OR (jobs.submission_generation = EXCLUDED.submission_generation
+               AND jobs.run_attempt <= EXCLUDED.run_attempt)
+        "#,
+    )
+    .bind(job_id)
+    .bind(submission_generation)
+    .bind(run_attempt)
+    .bind(name)
+    .bind(user)
+    .bind(account)
+    .bind(partition)
+    .bind(num_nodes)
+    .bind(num_tasks)
+    .bind(cpus_per_task)
+    .bind(memory_mb)
+    .bind(submit_time)
+    .bind(start_time)
+    .bind(reservation)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Transactionally record one immutable finalization and claim its additive
+/// usage contribution. A retry after PostgreSQL committed but before the
+/// caller observed success validates the same receipt and performs no second
+/// aggregate update.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_job_finalization(
+    pool: &PgPool,
+    job_id: i32,
+    submission_generation: Uuid,
+    run_attempt: u32,
+    finalization_id: Option<Uuid>,
+    state: &str,
+    exit_code: i32,
+    end_time: DateTime<Utc>,
+    exit_signal: i32,
+    derived_exit_code: i32,
+    user: &str,
+    account: &str,
+    start_time: DateTime<Utc>,
+    num_tasks: i32,
+    cpus_per_task: i32,
+) -> anyhow::Result<()> {
+    let run_attempt = i32::try_from(run_attempt)?;
+    let mut tx = pool.begin().await?;
+
+    if let Some(finalization_id) = finalization_id {
+        let owner = sqlx::query(
+            "SELECT job_id, submission_generation, run_attempt FROM job_runs WHERE finalization_id = $1 FOR UPDATE",
+        )
+        .bind(finalization_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(owner) = owner {
+            anyhow::ensure!(
+                owner.get::<i32, _>("job_id") == job_id
+                    && owner.get::<Uuid, _>("submission_generation") == submission_generation
+                    && owner.get::<i32, _>("run_attempt") == run_attempt,
+                "finalization UUID {finalization_id} is already owned by another execution"
+            );
+        }
+    }
+
+    let existing = sqlx::query(
+        r#"
+        SELECT finalization_id, user_name, account, start_time, num_tasks,
+               cpus_per_task, state, exit_code, end_time, exit_signal,
+               derived_exit_code
+        FROM job_runs
+        WHERE job_id = $1 AND submission_generation = $2 AND run_attempt = $3
+        FOR UPDATE
+        "#,
+    )
+    .bind(job_id)
+    .bind(submission_generation)
+    .bind(run_attempt)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if let Some(row) = existing {
+        anyhow::ensure!(
+            row.get::<String, _>("user_name") == user
+                && row.get::<String, _>("account") == account
+                && row
+                    .get::<DateTime<Utc>, _>("start_time")
+                    .timestamp_micros()
+                    == start_time.timestamp_micros()
+                && row.get::<i32, _>("num_tasks") == num_tasks
+                && row.get::<i32, _>("cpus_per_task") == cpus_per_task,
+            "conflicting accounting metadata for job {job_id} generation {submission_generation} attempt {run_attempt}"
+        );
+        let stored_end: Option<DateTime<Utc>> = row.get("end_time");
+        if let Some(stored_end) = stored_end {
+            let stored = FinalizationReceipt {
+                finalization_id: row.get("finalization_id"),
+                state: row.get("state"),
+                exit_code: row.get("exit_code"),
+                end_time: stored_end,
+                exit_signal: row.get("exit_signal"),
+                derived_exit_code: row.get("derived_exit_code"),
+            };
+            let candidate = FinalizationReceipt {
+                finalization_id,
+                state: state.to_owned(),
+                exit_code,
+                end_time,
+                exit_signal,
+                derived_exit_code,
+            };
+            anyhow::ensure!(
+                stored.accepts_replay(&candidate),
+                "conflicting accounting finalization for job {job_id} generation {submission_generation} attempt {run_attempt}"
+            );
+        } else {
+            sqlx::query(
+                r#"
+                UPDATE job_runs SET finalization_id=$4, state=$5, exit_code=$6,
+                    end_time=$7, exit_signal=$8, derived_exit_code=$9
+                WHERE job_id=$1 AND submission_generation=$2 AND run_attempt=$3
+                "#,
+            )
+            .bind(job_id)
+            .bind(submission_generation)
+            .bind(run_attempt)
+            .bind(finalization_id)
+            .bind(state)
+            .bind(exit_code)
+            .bind(end_time)
+            .bind(exit_signal)
+            .bind(derived_exit_code)
+            .execute(&mut *tx)
+            .await?;
+        }
+    } else {
+        sqlx::query(
+            r#"
+            INSERT INTO job_runs (
+                job_id, submission_generation, run_attempt, finalization_id,
+                user_name, account, submit_time, start_time, num_tasks,
+                cpus_per_task, state, exit_code, end_time, exit_signal,
+                derived_exit_code
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$7,$8,$9,$10,$11,$12,$13,$14)
+            "#,
+        )
+        .bind(job_id)
+        .bind(submission_generation)
+        .bind(run_attempt)
+        .bind(finalization_id)
+        .bind(user)
+        .bind(account)
+        .bind(start_time)
+        .bind(num_tasks)
+        .bind(cpus_per_task)
+        .bind(state)
+        .bind(exit_code)
+        .bind(end_time)
+        .bind(exit_signal)
+        .bind(derived_exit_code)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    let duration_secs = (end_time - start_time).num_seconds().max(0);
+    let cpu_seconds = duration_secs * i64::from(num_tasks) * i64::from(cpus_per_task);
+    let period_start = start_time
+        .date_naive()
+        .and_hms_opt(start_time.hour(), 0, 0)
+        .expect("an existing chrono hour is valid")
+        .and_utc();
+    let period_end = period_start + chrono::Duration::hours(1);
+    let claimed = sqlx::query(
+        r#"
+        INSERT INTO usage_contributions (
+            job_id, submission_generation, run_attempt, finalization_id,
+            user_name, account, period_start, period_end, cpu_seconds
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+        ON CONFLICT (job_id, submission_generation, run_attempt) DO NOTHING
+        "#,
+    )
+    .bind(job_id)
+    .bind(submission_generation)
+    .bind(run_attempt)
+    .bind(finalization_id)
+    .bind(user)
+    .bind(account)
+    .bind(period_start)
+    .bind(period_end)
+    .bind(cpu_seconds)
+    .execute(&mut *tx)
+    .await?;
+    if claimed.rows_affected() == 1 {
+        sqlx::query(
+            r#"
+            INSERT INTO usage (user_name, account, period_start, period_end, cpu_seconds, job_count)
+            VALUES ($1,$2,$3,$4,$5,1)
+            ON CONFLICT (user_name, account, period_start) DO UPDATE SET
+                cpu_seconds = usage.cpu_seconds + EXCLUDED.cpu_seconds,
+                job_count = usage.job_count + 1
+            "#,
+        )
+        .bind(user)
+        .bind(account)
+        .bind(period_start)
+        .bind(period_end)
+        .bind(cpu_seconds)
+        .execute(&mut *tx)
+        .await?;
+    } else {
+        let contribution = sqlx::query(
+            r#"
+            SELECT finalization_id, user_name, account, period_start,
+                   period_end, cpu_seconds
+            FROM usage_contributions
+            WHERE job_id=$1 AND submission_generation=$2 AND run_attempt=$3
+            "#,
+        )
+        .bind(job_id)
+        .bind(submission_generation)
+        .bind(run_attempt)
+        .fetch_one(&mut *tx)
+        .await?;
+        anyhow::ensure!(
+            (finalization_id.is_none()
+                || contribution.get::<Option<Uuid>, _>("finalization_id") == finalization_id)
+                && contribution.get::<String, _>("user_name") == user
+                && contribution.get::<String, _>("account") == account
+                && contribution.get::<DateTime<Utc>, _>("period_start") == period_start
+                && contribution.get::<DateTime<Utc>, _>("period_end") == period_end
+                && contribution.get::<i64, _>("cpu_seconds") == cpu_seconds,
+            "conflicting usage contribution for job {job_id} generation {submission_generation} attempt {run_attempt}"
+        );
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO jobs (
+            job_id, submission_generation, run_attempt, user_name, account,
+            state, exit_code, end_time, exit_signal, derived_exit_code,
+            start_time, num_tasks, cpus_per_task, submit_time
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$11)
+        ON CONFLICT (job_id) DO UPDATE SET
+            state=EXCLUDED.state, exit_code=EXCLUDED.exit_code,
+            end_time=EXCLUDED.end_time, exit_signal=EXCLUDED.exit_signal,
+            derived_exit_code=EXCLUDED.derived_exit_code
+        WHERE jobs.submission_generation=EXCLUDED.submission_generation
+          AND jobs.run_attempt=EXCLUDED.run_attempt
+        "#,
+    )
+    .bind(job_id)
+    .bind(submission_generation)
+    .bind(run_attempt)
+    .bind(user)
+    .bind(account)
+    .bind(state)
+    .bind(exit_code)
+    .bind(end_time)
+    .bind(exit_signal)
+    .bind(derived_exit_code)
+    .bind(start_time)
+    .bind(num_tasks)
+    .bind(cpus_per_task)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(())
+}
 
 /// Record a job start in the database.
 ///
@@ -285,7 +808,13 @@ pub async fn record_job_end(
 }
 
 /// A job row's accounting state, as seen by the reconciliation pass.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccountingRowState {
+    /// Exact submission identity represented by the compatible `jobs`
+    /// projection. A matching numeric `job_id` is not sufficient because IDs
+    /// may be reused after the older execution has left Raft state.
+    pub submission_generation: Uuid,
+    pub run_attempt: u32,
     pub state: String,
     /// True when the row is missing metadata that a proper `record_job_start`
     /// would have populated (e.g. `record_job_end` created a bare row from
@@ -304,25 +833,34 @@ pub async fn job_accounting_states(
     if job_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let rows =
-        sqlx::query("SELECT job_id, state, user_name, start_time FROM jobs WHERE job_id = ANY($1)")
-            .bind(job_ids)
-            .fetch_all(pool)
-            .await?;
+    let rows = sqlx::query(
+        "SELECT job_id, submission_generation, run_attempt, state, user_name, start_time \
+         FROM jobs WHERE job_id = ANY($1)",
+    )
+    .bind(job_ids)
+    .fetch_all(pool)
+    .await?;
 
-    Ok(rows
-        .into_iter()
-        .map(|r| {
-            let job_id: i32 = r.get("job_id");
-            let user_name: String = r.get("user_name");
-            let start_time: Option<DateTime<Utc>> = r.get("start_time");
-            let row = AccountingRowState {
-                state: r.get("state"),
-                needs_start_backfill: user_name.is_empty() || start_time.is_none(),
-            };
-            (job_id, row)
-        })
-        .collect())
+    let mut states = HashMap::with_capacity(rows.len());
+    for r in rows {
+        let job_id: i32 = r.get("job_id");
+        let run_attempt: i32 = r.get("run_attempt");
+        let run_attempt = u32::try_from(run_attempt).map_err(|_| {
+            anyhow::anyhow!(
+                "accounting row for job {job_id} has negative run attempt {run_attempt}"
+            )
+        })?;
+        let user_name: String = r.get("user_name");
+        let start_time: Option<DateTime<Utc>> = r.get("start_time");
+        let row = AccountingRowState {
+            submission_generation: r.get("submission_generation"),
+            run_attempt,
+            state: r.get("state"),
+            needs_start_backfill: user_name.is_empty() || start_time.is_none(),
+        };
+        states.insert(job_id, row);
+    }
+    Ok(states)
 }
 
 /// Update usage accounting for a completed job, from the row `record_job_end` just wrote.
@@ -1112,6 +1650,39 @@ pub struct QosRecord {
 mod job_history_tests {
     use super::*;
     use chrono::Duration;
+
+    #[test]
+    fn exact_accounting_schema_has_both_identity_fences_and_a_usage_claim() {
+        assert!(SCHEMA.contains("PRIMARY KEY (job_id, submission_generation, run_attempt)"));
+        assert!(SCHEMA.contains("ON job_runs (finalization_id) WHERE finalization_id IS NOT NULL"));
+        assert!(SCHEMA.contains("CREATE TABLE IF NOT EXISTS usage_contributions"));
+        assert!(SCHEMA.contains("FOREIGN KEY (job_id, submission_generation, run_attempt)"));
+    }
+
+    #[test]
+    fn immutable_finalization_replay_accepts_only_the_same_outcome() {
+        let receipt = FinalizationReceipt {
+            finalization_id: Some(Uuid::new_v4()),
+            state: "COMPLETED".into(),
+            exit_code: 0,
+            end_time: DateTime::<Utc>::from_timestamp(1_750_000_000, 0).unwrap(),
+            exit_signal: 0,
+            derived_exit_code: 0,
+        };
+        assert!(receipt.accepts_replay(&receipt));
+
+        let mut conflicting_uuid = receipt.clone();
+        conflicting_uuid.finalization_id = Some(Uuid::new_v4());
+        assert!(!receipt.accepts_replay(&conflicting_uuid));
+
+        let mut conflicting_payload = receipt.clone();
+        conflicting_payload.exit_code = 1;
+        assert!(!receipt.accepts_replay(&conflicting_payload));
+
+        let mut legacy_reconcile = receipt.clone();
+        legacy_reconcile.finalization_id = None;
+        assert!(receipt.accepts_replay(&legacy_reconcile));
+    }
 
     fn test_job_id(slot: u32) -> i32 {
         const BASE: i32 = 9_000_000;

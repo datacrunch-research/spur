@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::job::JobId;
 use crate::resource::ResourceAllocations;
+use uuid::Uuid;
 
 /// Job step identifier.
 pub type StepId = u32;
@@ -31,7 +32,13 @@ pub const STEP_RESERVED_MIN: StepId = 0xFFFF_FFF0;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobStep {
     pub job_id: JobId,
+    /// Submitted-job identity owning this step.
+    #[serde(default)]
+    pub submission_generation: Uuid,
     pub step_id: StepId,
+    /// Batch run epoch owning this step. Zero preserves legacy/untagged steps.
+    #[serde(default)]
+    pub run_attempt: u32,
     pub name: String,
     pub state: StepState,
 
@@ -355,7 +362,9 @@ mod tests {
 
         let mut step = JobStep {
             job_id: 1,
+            submission_generation: Uuid::nil(),
             step_id: 0,
+            run_attempt: 0,
             name: "test".into(),
             state: StepState::Pending,
             num_tasks: 4,

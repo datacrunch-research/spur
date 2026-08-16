@@ -499,6 +499,7 @@ mod tests {
         get_jobs(pb::GetJobsRequest) -> pb::GetJobsResponse;
         get_job(pb::GetJobRequest) -> pb::JobInfo;
         cancel_job(pb::CancelJobRequest) -> ();
+        cancel_job_by_submission_token(pb::CancelJobBySubmissionTokenRequest) -> pb::CancelJobBySubmissionTokenResponse;
         complete_job(pb::CompleteJobRequest) -> ();
         job_keepalive(pb::JobKeepaliveRequest) -> pb::JobKeepaliveResponse;
         suspend_job(pb::SuspendJobRequest) -> ();

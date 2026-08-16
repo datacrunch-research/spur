@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
+use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
@@ -16,8 +18,10 @@ use spur_core::accounting::{Qos, TresRecord, TresType};
 use spur_core::burst_buffer::BbStageState;
 use spur_core::config::{EnforcePartLimits, SlurmConfig};
 use spur_core::job::{
-    effective_gpus, effective_memory_mb, Job, JobId, JobSpec, JobState, NodeCompleteError,
-    PendingReason, TransitionOutcome, DEFAULT_PRIORITY,
+    effective_gpus, effective_memory_mb, DurableFinalizationContext, FinalizationAction,
+    FinalizationIntent, FinalizationRequeueCounter, Job, JobId, JobSpec, JobState,
+    NodeCompleteError, PendingDispatch, PendingDispatchDisposition, PendingDispatchPhase,
+    PendingFinalization, PendingReason, TransitionOutcome, Uuid, DEFAULT_PRIORITY,
 };
 use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
 use spur_core::partition::{requested_partition_names, Partition, PreemptMode};
@@ -25,13 +29,13 @@ use spur_core::qos::{check_qos_limits, qos_adjusted_priority, QosCheckResult};
 use spur_core::reservation::{self, normalize_node_list, running_jobs_overlap_start, Reservation};
 use spur_core::resource::{ResourceAllocations, ResourceSet};
 use spur_core::step::{JobStep, StepState, STEP_BATCH, STEP_RESERVED_MIN};
-use spur_core::wal::WalOperation;
+use spur_core::wal::{JobSubmissionMetadata, WalOperation};
 use spur_metrics::job::JobMetricsSnapshot;
 use spur_metrics::node::NodeMetricsSnapshot;
 use spur_metrics::partition::PartitionMetricsSnapshot;
 use spur_metrics::user_acct::UserAcctMetricsSnapshot;
 
-use crate::accounting::{AccountingNotifier, JobStartRecord};
+use crate::accounting::{AccountingNotifier, AccountingSink, JobEndRecord, JobStartRecord};
 use crate::association_cache::{qos_permitted, AccountMembership, AssociationCache};
 use crate::fairshare_cache::FairshareCache;
 use crate::limits_cache::QosCache;
@@ -43,6 +47,131 @@ use crate::sched_stats::SchedStatsCollector;
 /// the next node. Byte-exact with the `state_desc` Slurm sets in the same case,
 /// so operator runbooks and log greps written against Slurm keep working.
 pub const LAUNCH_FAILURE_HELD_DESC: &str = "launch failed requeued held";
+
+struct JobNotificationDelivery {
+    webhook_url: Option<String>,
+    smtp_command: Option<String>,
+    from: String,
+    job_id: JobId,
+    run_attempt: u32,
+    event: String,
+    user: String,
+    mail_user: Option<String>,
+    job_name: String,
+}
+
+struct JobStartSideEffects<'a> {
+    job_id: JobId,
+    submission_generation: Uuid,
+    run_attempt: u32,
+    spec: &'a JobSpec,
+    submit_time: DateTime<Utc>,
+    start_time: DateTime<Utc>,
+    resources: &'a ResourceAllocations,
+}
+
+fn notification_delivery(
+    config: &SlurmConfig,
+    job_id: JobId,
+    run_attempt: u32,
+    event: &str,
+    spec: &JobSpec,
+) -> JobNotificationDelivery {
+    JobNotificationDelivery {
+        webhook_url: config.notifications.webhook_url.clone(),
+        smtp_command: config.notifications.smtp_command.clone(),
+        from: config
+            .notifications
+            .from_address
+            .clone()
+            .unwrap_or_else(|| "spur@localhost".into()),
+        job_id,
+        run_attempt,
+        event: event.to_string(),
+        user: spec.user.clone(),
+        mail_user: spec.mail_user.clone(),
+        job_name: spec.name.clone(),
+    }
+}
+
+async fn deliver_job_notification(delivery: JobNotificationDelivery) {
+    const DELIVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    let JobNotificationDelivery {
+        webhook_url,
+        smtp_command,
+        from,
+        job_id,
+        run_attempt,
+        event,
+        user,
+        mail_user,
+        job_name,
+    } = delivery;
+
+    if let Some(url) = webhook_url {
+        let payload = serde_json::json!({
+            "job_id": job_id,
+            "run_attempt": run_attempt,
+            "event_id": format!("job:{job_id}:attempt:{run_attempt}:{event}"),
+            "event": event,
+            "job_name": job_name,
+            "user": user,
+            "mail_user": mail_user,
+        });
+        let mut command = tokio::process::Command::new("curl");
+        command.kill_on_drop(true).args([
+            "-s",
+            "-X",
+            "POST",
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            &payload.to_string(),
+            &url,
+        ]);
+        match tokio::time::timeout(DELIVERY_TIMEOUT, command.output()).await {
+            Ok(Ok(output)) if output.status.success() => {}
+            Ok(Ok(_)) => {
+                warn!(job_id, run_attempt, %event, "notification webhook returned non-zero exit")
+            }
+            Ok(Err(error)) => {
+                warn!(job_id, run_attempt, %event, %error, "failed to send notification webhook")
+            }
+            Err(_) => warn!(job_id, run_attempt, %event, "notification webhook timed out"),
+        }
+    }
+
+    if let Some(smtp_command) = smtp_command {
+        let to = mail_user.as_deref().unwrap_or(&user).to_string();
+        let subject = format!("Spur Job {job_id} attempt {run_attempt}: {event}");
+        let body =
+            format!("Job ID: {job_id}\nRun attempt: {run_attempt}\nEvent: {event}\nUser: {user}\n");
+        let email = format!("From: {from}\nTo: {to}\nSubject: {subject}\n\n{body}");
+        let send = async {
+            use tokio::io::AsyncWriteExt;
+            let mut command = tokio::process::Command::new("sh");
+            command
+                .kill_on_drop(true)
+                .args(["-c", &smtp_command])
+                .stdin(std::process::Stdio::piped());
+            let mut child = command.spawn()?;
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(email.as_bytes()).await?;
+            }
+            child.wait().await
+        };
+        match tokio::time::timeout(DELIVERY_TIMEOUT, send).await {
+            Ok(Ok(status)) if status.success() => {}
+            Ok(Ok(_)) => {
+                warn!(job_id, run_attempt, %event, "notification email returned non-zero exit")
+            }
+            Ok(Err(error)) => {
+                warn!(job_id, run_attempt, %event, %error, "failed to send notification email")
+            }
+            Err(_) => warn!(job_id, run_attempt, %event, "notification email timed out"),
+        }
+    }
+}
 
 /// Seconds to defer a job by after its `requeue_count`-th launch failure,
 /// doubling per attempt from the same base the preemption requeue uses.
@@ -58,11 +187,126 @@ fn launch_backoff_secs(interval_secs: u32, cap: u64, requeue_count: u32) -> u64 
         .min(spur_core::config::MAX_LAUNCH_BACKOFF_SECS)
 }
 
+/// Canonical device counts for allocation comparisons. Device vectors are an
+/// encoding detail whose order must not affect Raft-side validation.
+fn allocation_device_counts(allocation: &ResourceAllocations) -> HashMap<(String, u32), u64> {
+    let mut counts = HashMap::new();
+    for (name, devices) in &allocation.devices {
+        for device in devices {
+            *counts.entry((name.clone(), device.device_id)).or_insert(0) += device.count;
+        }
+    }
+    counts
+}
+
+fn allocations_equivalent(a: &ResourceAllocations, b: &ResourceAllocations) -> bool {
+    a.cpus == b.cpus
+        && a.memory_mb == b.memory_mb
+        && allocation_device_counts(a) == allocation_device_counts(b)
+}
+
+fn allocation_contains(available: &ResourceAllocations, required: &ResourceAllocations) -> bool {
+    if available.cpus < required.cpus || available.memory_mb < required.memory_mb {
+        return false;
+    }
+    let available_devices = allocation_device_counts(available);
+    allocation_device_counts(required)
+        .into_iter()
+        .all(|(key, count)| available_devices.get(&key).copied().unwrap_or(0) >= count)
+}
+
+/// Validate an exact scheduler-selected slice against the allocation state at
+/// the point its Begin entry is applied. This is the cross-leader CAS for
+/// capacity: two stale assignments can both be proposed, but only disjoint
+/// slices may become provisional reservations.
+fn exact_provisional_slice_fits(node: &Node, slice: &ResourceAllocations) -> bool {
+    if !node.is_schedulable()
+        || node
+            .alloc_resources
+            .cpus
+            .checked_add(slice.cpus)
+            .is_none_or(|total| total > node.total_resources.cpus)
+        || node
+            .alloc_resources
+            .memory_mb
+            .checked_add(slice.memory_mb)
+            .is_none_or(|total| total > node.total_resources.memory_mb)
+    {
+        return false;
+    }
+
+    let allocated = allocation_device_counts(&node.alloc_resources);
+    let requested = allocation_device_counts(slice);
+    let external_gpu_ids: HashSet<u32> = node.external_gpu_ids.iter().copied().collect();
+    for ((name, device_id), count) in requested {
+        if name == "gpu" {
+            if count != 1
+                || !node
+                    .total_resources
+                    .gpus
+                    .iter()
+                    .any(|gpu| gpu.device_id == device_id)
+                || external_gpu_ids.contains(&device_id)
+                || allocated.get(&(name, device_id)).copied().unwrap_or(0) > 0
+            {
+                return false;
+            }
+        } else {
+            let total = node
+                .total_resources
+                .generic
+                .get(&name)
+                .copied()
+                .unwrap_or(0);
+            let already = node.alloc_resources.generic_count(&name);
+            let requested_total = slice.generic_count(&name);
+            if already
+                .checked_add(requested_total)
+                .is_none_or(|used| used > total)
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// A worker may already be executing after Begin even though the job is not
+/// published Running yet. Count such jobs against global admission limits,
+/// while leaving runtime accounting/fair-share tied to the visible lifecycle.
+fn holds_admission_capacity(job: &Job) -> bool {
+    matches!(
+        job.state,
+        JobState::Running | JobState::Suspended | JobState::Completing
+    ) || job.pending_dispatch.is_some()
+}
+
+fn execution_owns_node(job: &Job, node_name: &str) -> bool {
+    match job.pending_dispatch.as_ref() {
+        Some(dispatch) => dispatch
+            .target_nodes
+            .iter()
+            .any(|target| target == node_name),
+        None => {
+            job.state.is_active()
+                && !job.node_completions.contains_key(node_name)
+                && job.allocated_nodes.iter().any(|node| node == node_name)
+        }
+    }
+}
+
 /// Result of recording a per-node completion report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeCompleteResult {
-    /// Node recorded; waiting for remaining nodes.
-    Completing,
+    /// Matching worker exited after launch ACK but before Running commit; the
+    /// report is durably buffered on the pending dispatch.
+    Buffered,
+    /// Node recorded; waiting for the exact remaining execution targets.
+    Completing {
+        remaining_nodes: Vec<String>,
+        submission_generation: String,
+        run_attempt: u32,
+    },
     /// All allocated nodes have reported; job is now terminal.
     AllDone { state: JobState, exit_code: i32 },
     /// Job was already in a terminal state (duplicate or race with cancel/timeout).
@@ -70,6 +314,22 @@ pub enum NodeCompleteResult {
     /// Report came from a superseded run (older `run_attempt`); ignored so it
     /// cannot fail a job that has since been requeued and re-dispatched.
     StaleReport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DispatchDeferral {
+    NotOwned,
+    Won,
+    Lost,
+}
+
+#[derive(Debug)]
+pub(crate) enum StandaloneStartOutcome {
+    Started,
+    /// Raft may have committed the standalone owner even though this caller did
+    /// not receive the response. The caller must retain worker registrations and
+    /// let exact ownership reconciliation decide their fate.
+    Ambiguous(anyhow::Error),
 }
 
 /// Reservation CRUD errors for the gRPC boundary.
@@ -165,7 +425,104 @@ impl SubmitError {
 #[derive(Debug, Clone, Default)]
 pub struct SubmitOutcome {
     pub job_id: JobId,
+    pub submission_generation: Uuid,
     pub warnings: Vec<String>,
+}
+
+/// Exact identity returned by a durable submission-token cancellation fence.
+/// `None` means the fence committed before any submission bound the token.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CancelSubmissionTokenOutcome {
+    pub job_id: JobId,
+    pub submission_generation: Uuid,
+    pub cleanup_complete: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmissionTerminalOutcome {
+    pub job_id: JobId,
+    pub submission_generation: Uuid,
+    pub state: JobState,
+    pub exit_code: i32,
+    pub run_attempt: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SubmissionCompletionReceipt {
+    node_name: String,
+    run_attempt: u32,
+    worker_incarnation: String,
+    exit_code: i32,
+    signal: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    drain_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct SubmissionTerminalReceipt {
+    state: JobState,
+    exit_code: i32,
+    run_attempt: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionReceiptMatch {
+    New,
+    Exact,
+    Conflict,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SubmissionTokenRecord {
+    job_id: JobId,
+    submission_generation: Uuid,
+    user: String,
+    spec_sha256: String,
+    /// Permanent no-create fence. When a job was already bound, the same Raft
+    /// entry also records its exact cancellation/finalization intent.
+    #[serde(default)]
+    cancelled: bool,
+    #[serde(default)]
+    cleanup_complete: bool,
+    /// Per-node exact receipts let a lost ReportJobStatus response be retried
+    /// after the terminal Job has been evicted and after snapshot restore.
+    #[serde(default)]
+    completion_receipts: Vec<SubmissionCompletionReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_receipt: Option<SubmissionTerminalReceipt>,
+}
+
+impl SubmissionTokenRecord {
+    fn cancelled_tombstone() -> Self {
+        Self {
+            job_id: 0,
+            submission_generation: Uuid::nil(),
+            user: String::new(),
+            spec_sha256: String::new(),
+            cancelled: true,
+            cleanup_complete: true,
+            completion_receipts: Vec::new(),
+            terminal_receipt: None,
+        }
+    }
+
+    fn classify_completion_receipt(
+        &self,
+        job_id: JobId,
+        submission_generation: Uuid,
+        receipt: &SubmissionCompletionReceipt,
+    ) -> CompletionReceiptMatch {
+        if self.job_id != job_id || self.submission_generation != submission_generation {
+            return CompletionReceiptMatch::Conflict;
+        }
+        match self.completion_receipts.iter().find(|existing| {
+            existing.run_attempt == receipt.run_attempt && existing.node_name == receipt.node_name
+        }) {
+            Some(existing) if existing == receipt => CompletionReceiptMatch::Exact,
+            Some(_) => CompletionReceiptMatch::Conflict,
+            None => CompletionReceiptMatch::New,
+        }
+    }
 }
 
 /// Maximum serialized size of a single job submission, in bytes.
@@ -212,6 +569,21 @@ fn check_submission_size(spec: &JobSpec) -> Result<(), SubmitError> {
         )));
     }
     Ok(())
+}
+
+fn submission_spec_sha256(spec: &JobSpec) -> Result<String, SubmitError> {
+    // serde_json's default map representation is ordered, so converting to a
+    // Value canonicalizes nested HashMaps before hashing.
+    let canonical = serde_json::to_value(spec)
+        .and_then(|value| serde_json::to_vec(&value))
+        .map_err(|error| SubmitError::internal(format!("failed to encode job spec: {error}")))?;
+    let digest = Sha256::digest(canonical);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}")
+            .map_err(|error| SubmitError::internal(format!("failed to encode digest: {error}")))?;
+    }
+    Ok(encoded)
 }
 
 impl ReservationError {
@@ -281,6 +653,8 @@ impl PartitionError {
 pub enum PreemptOutcome {
     /// Kill the job's processes on every allocated node (cancel or requeue mode).
     Killed,
+    /// Durable execution cleanup owns process termination and capacity release.
+    CleanupDeferred,
     /// Stop (SIGSTOP) the job's processes; allocation is retained (suspend mode).
     Suspended,
 }
@@ -338,6 +712,48 @@ impl K0sRoleCounts {
     }
 }
 
+type FinalizationKey = (JobId, Uuid, u32);
+type FinalizationLock = Arc<tokio::sync::Mutex<()>>;
+type JobPublicationKey = (JobId, String, u32);
+type JobPublicationLock = Arc<tokio::sync::Mutex<()>>;
+const MAX_CONCURRENT_FINALIZATIONS: usize = 32;
+
+struct StartJobOptions {
+    srun_step_dispatch: bool,
+    reserved_run_attempt: Option<u32>,
+    standalone_node_incarnations: Option<HashMap<String, String>>,
+}
+
+#[derive(Clone, Copy)]
+enum DispatchReservationKind {
+    Batch,
+    Standalone,
+}
+
+async fn run_finalization_tasks_bounded<T, I, F, Fut>(items: I, limit: usize, mut task: F)
+where
+    T: Send + 'static,
+    I: IntoIterator<Item = T>,
+    F: FnMut(T) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    assert!(limit > 0, "finalization concurrency limit must be nonzero");
+    let mut set = tokio::task::JoinSet::new();
+    for item in items {
+        while set.len() >= limit {
+            if let Some(Err(error)) = set.join_next().await {
+                warn!(%error, "pending finalization task failed");
+            }
+        }
+        set.spawn(task(item));
+    }
+    while let Some(result) = set.join_next().await {
+        if let Err(error) = result {
+            warn!(%error, "pending finalization task failed");
+        }
+    }
+}
+
 /// Central cluster state manager.
 ///
 /// Thread-safe via RwLock. The scheduler and gRPC server both access this.
@@ -362,6 +778,9 @@ pub struct ClusterManager {
     /// None when running without a config file (e.g. in tests).
     config_path: Option<PathBuf>,
     jobs: RwLock<HashMap<JobId, Job>>,
+    /// Durable submit-token tombstones. They outlive terminal Job eviction so
+    /// a response lost after commit can always recover the original identity.
+    submission_tokens: RwLock<HashMap<String, SubmissionTokenRecord>>,
     nodes: RwLock<HashMap<String, Node>>,
     partitions: RwLock<Vec<Partition>>,
     /// Names of partitions that were runtime-deleted. Used to suppress config-file
@@ -394,18 +813,62 @@ pub struct ClusterManager {
     /// Serializes k0s phase-transition accounting so concurrent `set_k0s_phase` callers can't both
     /// read the same prior phase and double-count the edge.
     k0s_phase_accounting: parking_lot::Mutex<()>,
+    /// Serializes dispatch reservation. Batch runs reserve a monotonic epoch;
+    /// standalone runs reserve their exact attempt-zero owner before RPC.
+    dispatch_epoch_reservation: parking_lot::Mutex<()>,
+    /// Leader-local fanouts currently owned by this process. The recovery loop
+    /// skips these exact attempts; after restart/failover the set is empty and
+    /// their durable intents become recoverable immediately.
+    active_dispatches: parking_lot::Mutex<HashMap<(JobId, String, u32), u64>>,
+    /// Serializes the local publication window from atomic dispatch commit
+    /// through BEGIN/accounting side effects against worker completions for the
+    /// same job. Without it an immediate completion could publish END before
+    /// the corresponding BEGIN record.
+    job_publication_locks: parking_lot::Mutex<HashMap<JobPublicationKey, JobPublicationLock>>,
+    /// Coalesces duplicate leader-local scans for one exact finalization.  The
+    /// durable marker/Ack remains authoritative across restart and failover.
+    finalization_locks: parking_lot::Mutex<HashMap<FinalizationKey, FinalizationLock>>,
     raft: RwLock<Option<SpurRaft>>,
-    accounting: RwLock<Option<AccountingNotifier>>,
+    accounting: RwLock<Option<Arc<dyn AccountingSink>>>,
     fairshare_cache: Arc<FairshareCache>,
     qos_cache: Arc<QosCache>,
     association_cache: Arc<AssociationCache>,
     /// Wake signal for the scheduler loop.
     pub(crate) scheduler_notify: Arc<Notify>,
+    /// Fast-path wake for newly committed finalization markers.  The periodic
+    /// scanner remains authoritative when a write response is lost.
+    pub(crate) finalization_notify: Arc<Notify>,
     sched_stats: OnceLock<Arc<SchedStatsCollector>>,
     /// Last keepalive time per interactive allocation, used by the InactiveLimit
     /// reaper. Ephemeral soft state (like `Node::last_heartbeat`): keepalives
     /// arrive too often to persist, and on failover the reaper reseeds lazily.
     interactive_last_seen: RwLock<HashMap<JobId, DateTime<Utc>>>,
+}
+
+pub(crate) struct ActiveDispatchGuard {
+    cluster: Arc<ClusterManager>,
+    key: (JobId, String, u32),
+    term: u64,
+}
+
+impl Drop for ActiveDispatchGuard {
+    fn drop(&mut self) {
+        let mut active = self.cluster.active_dispatches.lock();
+        if active.get(&self.key) == Some(&self.term) {
+            active.remove(&self.key);
+        }
+    }
+}
+
+impl ActiveDispatchGuard {
+    /// Confirm this handler still owns leadership in the term that began the
+    /// fanout. Loss and later regain advances the term, so an old task cannot
+    /// suppress recovery or publish Running after long worker/prolog awaits.
+    pub(crate) async fn still_owned(&self) -> bool {
+        self.cluster.ensure_consensus_leader().await
+            && self.cluster.current_raft_term() == Some(self.term)
+            && self.cluster.active_dispatches.lock().get(&self.key) == Some(&self.term)
+    }
 }
 
 struct PendingJobClassification {
@@ -447,6 +910,7 @@ impl ClusterManager {
             scheduler_interval_secs,
             config_path,
             jobs: RwLock::new(HashMap::new()),
+            submission_tokens: RwLock::new(HashMap::new()),
             nodes: RwLock::new(HashMap::new()),
             partitions: RwLock::new(partitions),
             deleted_partition_names: RwLock::new(HashSet::new()),
@@ -461,12 +925,17 @@ impl ClusterManager {
             k8s_metrics: Arc::new(spur_metrics::K8sMetrics::new()),
             k0s_role_counts: K0sRoleCounts::default(),
             k0s_phase_accounting: parking_lot::Mutex::new(()),
+            dispatch_epoch_reservation: parking_lot::Mutex::new(()),
+            active_dispatches: parking_lot::Mutex::new(HashMap::new()),
+            job_publication_locks: parking_lot::Mutex::new(HashMap::new()),
+            finalization_locks: parking_lot::Mutex::new(HashMap::new()),
             raft: RwLock::new(None),
             accounting: RwLock::new(None),
             fairshare_cache,
             qos_cache,
             association_cache,
             scheduler_notify: Arc::new(Notify::new()),
+            finalization_notify: Arc::new(Notify::new()),
             sched_stats: OnceLock::new(),
             interactive_last_seen: RwLock::new(HashMap::new()),
         };
@@ -484,7 +953,62 @@ impl ClusterManager {
     }
 
     /// Submit a new job. If it has an array spec, expand into individual tasks.
-    pub fn submit_job(&self, mut spec: JobSpec) -> Result<SubmitOutcome, SubmitError> {
+    pub fn submit_job(&self, spec: JobSpec) -> Result<SubmitOutcome, SubmitError> {
+        self.submit_job_with_token(spec, None)
+    }
+
+    /// Submit with a durable caller token. Tokened submissions are scalar so a
+    /// retry always maps to one exact job ID and generation.
+    pub fn submit_job_with_token(
+        &self,
+        mut spec: JobSpec,
+        submission_token: Option<String>,
+    ) -> Result<SubmitOutcome, SubmitError> {
+        let idempotency = match submission_token {
+            Some(token) => {
+                if token.is_empty() || token.len() > 256 {
+                    return Err(SubmitError::invalid(
+                        "submission_token must contain 1 to 256 bytes",
+                    ));
+                }
+                if spec.srun_job {
+                    return Err(SubmitError::invalid(
+                        "idempotent submission tokens are not supported for standalone srun jobs",
+                    ));
+                }
+                if spec
+                    .array_spec
+                    .as_deref()
+                    .is_some_and(|array| !array.is_empty())
+                {
+                    return Err(SubmitError::invalid(
+                        "idempotent array submission requires per-task identities and is not supported",
+                    ));
+                }
+                let user = spec.user.clone();
+                let spec_sha256 = submission_spec_sha256(&spec)?;
+                if let Some(record) = self.submission_tokens.read().get(&token) {
+                    if record.cancelled {
+                        return Err(SubmitError::invalid(
+                            "submission_token has been permanently cancelled",
+                        ));
+                    }
+                    if record.user != user || record.spec_sha256 != spec_sha256 {
+                        return Err(SubmitError::invalid(
+                            "submission_token is already bound to a different user or job spec",
+                        ));
+                    }
+                    return Ok(SubmitOutcome {
+                        job_id: record.job_id,
+                        submission_generation: record.submission_generation,
+                        warnings: Vec::new(),
+                    });
+                }
+                Some((token, user, spec_sha256))
+            }
+            None => None,
+        };
+
         // One config/partitions snapshot for the whole submit path, so defaulting
         // and enforcement can't observe a concurrent reconfigure() mid-submit.
         let config = self.config();
@@ -590,26 +1114,75 @@ impl ClusterManager {
         let specs =
             expand_job_specs(spec, job_id).map_err(|e| SubmitError::invalid(e.to_string()))?;
 
+        let mut outcome_generation = Uuid::nil();
+        let mut submitted_any = false;
         for task_spec in specs {
             let task_id = if task_spec.array_job_id.is_some() {
                 self.next_job_id.fetch_add(1, Ordering::SeqCst)
             } else {
                 job_id
             };
-            self.propose(WalOperation::JobSubmit {
-                job_id: task_id,
-                spec: Box::new(task_spec),
-            })
-            .map_err(|e| SubmitError::internal(e.to_string()))?;
-            if let Some(stats) = self.sched_stats.get() {
-                stats.record_submitted(1);
+            let metadata = match &idempotency {
+                Some((token, user, spec_sha256)) => JobSubmissionMetadata::new_idempotent(
+                    Utc::now(),
+                    token.clone(),
+                    user.clone(),
+                    spec_sha256.clone(),
+                ),
+                None => JobSubmissionMetadata::new(Utc::now()),
+            };
+            let response = self
+                .propose(WalOperation::JobSubmit {
+                    job_id: task_id,
+                    spec: Box::new(task_spec),
+                    metadata: Some(metadata),
+                })
+                .map_err(|e| SubmitError::internal(e.to_string()))?;
+            if response.submission_conflict {
+                return Err(SubmitError::invalid(
+                    "submission_token is already bound to a different user or job spec",
+                ));
+            }
+            if response.submission_cancelled {
+                return Err(SubmitError::invalid(
+                    "submission_token has been permanently cancelled",
+                ));
+            }
+            if idempotency.is_some() {
+                if response.submission_job_id == 0 || response.submission_generation.is_nil() {
+                    return Err(SubmitError::internal(
+                        "committed idempotent submission omitted its exact identity",
+                    ));
+                }
+                if !response.submission_created {
+                    return Ok(SubmitOutcome {
+                        job_id: response.submission_job_id,
+                        submission_generation: response.submission_generation,
+                        warnings: Vec::new(),
+                    });
+                }
+                outcome_generation = response.submission_generation;
+            } else if task_id == job_id {
+                outcome_generation = response.submission_generation;
+            }
+            submitted_any |= response.submission_created;
+            if response.submission_created {
+                if let Some(stats) = self.sched_stats.get() {
+                    stats.record_submitted(1);
+                }
             }
         }
 
-        self.scheduler_notify.notify_one();
+        if submitted_any {
+            self.scheduler_notify.notify_one();
+        }
 
         info!(job_id, "job submitted");
-        Ok(SubmitOutcome { job_id, warnings })
+        Ok(SubmitOutcome {
+            job_id,
+            submission_generation: outcome_generation,
+            warnings,
+        })
     }
 
     /// Reject a submission whose (normalized) node count falls outside the
@@ -892,11 +1465,6 @@ impl ClusterManager {
         self.jobs.read().get(&job_id).cloned()
     }
 
-    /// A job's state by ID, without cloning the whole `Job`.
-    pub fn job_state(&self, job_id: JobId) -> Option<JobState> {
-        self.jobs.read().get(&job_id).map(|j| j.state)
-    }
-
     /// Get a job by ID, synthesizing an aggregate record for an array *parent*
     /// id (which has no stored job — Spur stores only per-task jobs) so
     /// `scontrol show job <array_parent>` matches Slurm instead of returning
@@ -1061,9 +1629,9 @@ impl ClusterManager {
     /// terminal, or has started running. Callers treat the error as non-fatal.
     pub fn deadline_job(&self, job_id: JobId) -> anyhow::Result<()> {
         {
-            let mut jobs = self.jobs.write();
+            let jobs = self.jobs.read();
             let job = jobs
-                .get_mut(&job_id)
+                .get(&job_id)
                 .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
             if job.state.is_terminal() {
                 anyhow::bail!("job {} is already {:?}", job_id, job.state);
@@ -1075,18 +1643,23 @@ impl ClusterManager {
                     job.state
                 );
             }
-            // Record the reason before the terminal transition so any
-            // observer (history, audit log, late `squeue` poll) sees DeadLine
-            // instead of whatever update_pending_reasons last wrote.
-            job.set_pending_reason(PendingReason::DeadLine);
         }
 
         let resp = self.propose(WalOperation::JobComplete {
             job_id,
             exit_code: -1,
             state: JobState::Deadline,
+            finalization_intent: None,
         })?;
-        self.run_all_finalized_side_effects(&resp);
+        self.wake_finalization_reconciler(&resp);
+
+        if !resp.terminal_cleanup_deferred
+            && !resp.jobs_finalized.iter().any(|finalized| {
+                finalized.job_id == job_id && finalized.state == JobState::Deadline
+            })
+        {
+            anyhow::bail!("job {} started before its deadline entry applied", job_id);
+        }
 
         info!(job_id, "job deadline passed — transitioned to DEADLINE");
         Ok(())
@@ -1098,9 +1671,90 @@ impl ClusterManager {
         spur_core::auth::check_job_owner(user, owner, action).map_err(Into::into)
     }
 
+    pub fn job_for_signal(&self, job_id: JobId, user: &str) -> anyhow::Result<Job> {
+        let jobs = self.jobs.read();
+        let job = jobs
+            .get(&job_id)
+            .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+        if job.state.is_terminal() {
+            anyhow::bail!("job {} is already {:?}", job_id, job.state);
+        }
+        if !job.state.is_active() {
+            anyhow::bail!("job {} is not active (state {:?})", job_id, job.state);
+        }
+        Self::check_job_owner(user, &job.spec.user, "signal")?;
+        Ok(job.clone())
+    }
+
+    /// Atomically snapshot an active standalone allocation for cancellation.
+    /// When `expected_submission_generation` is present, a missing, terminal,
+    /// or different-generation job is success-by-absence. Most importantly,
+    /// the generation check and clone happen under the same jobs read lock, so
+    /// a reused numeric ID can never send a worker RPC for the replacement.
+    pub fn standalone_job_for_cancel(
+        &self,
+        job_id: JobId,
+        user: &str,
+        expected_submission_generation: Option<Uuid>,
+    ) -> anyhow::Result<Option<Job>> {
+        let jobs = self.jobs.read();
+        let Some(job) = jobs.get(&job_id) else {
+            return Ok(None);
+        };
+        if expected_submission_generation
+            .is_some_and(|expected| job.submission_generation != expected)
+            || job.state.is_terminal()
+        {
+            return Ok(None);
+        }
+        if !job.srun_step_dispatch || job.run_attempt != 0 {
+            return Ok(None);
+        }
+        Self::check_job_owner(user, &job.spec.user, "cancel")?;
+        Ok(Some(job.clone()))
+    }
+
+    /// Commit cancellation after every worker that owns the standalone
+    /// allocation has acknowledged TERMINATE_AND_REAP.
+    pub fn cancel_standalone_job_after_reap(
+        &self,
+        job_id: JobId,
+        submission_generation: uuid::Uuid,
+    ) -> anyhow::Result<()> {
+        let resp = self.propose(WalOperation::JobStandaloneCancel {
+            job_id,
+            submission_generation,
+        })?;
+        self.wake_finalization_reconciler(&resp);
+        let applied = resp.jobs_finalized.iter().any(|finalized| {
+            finalized.job_id == job_id
+                && finalized.submission_generation == submission_generation
+                && finalized.run_attempt == 0
+                && finalized.state == JobState::Cancelled
+        });
+        if !applied {
+            // The exact standalone owner may have disappeared after its workers
+            // ACKed but before this proposal committed. That is idempotent
+            // success; only the same immutable submission remaining active is
+            // a lost cancellation that must be retried.
+            let exact_still_active = self.get_job(job_id).is_some_and(|job| {
+                job.submission_generation == submission_generation && !job.state.is_terminal()
+            });
+            if !exact_still_active {
+                return Ok(());
+            }
+            anyhow::bail!(
+                "job {} standalone cancellation lost its generation fence",
+                job_id
+            );
+        }
+        info!(job_id, %submission_generation, "standalone job cancelled after worker reap ACKs");
+        Ok(())
+    }
+
     /// Cancel a job. The requesting `user` must be the job owner, root, or
     /// empty (trusted internal/daemon calls).
-    pub fn cancel_job(&self, job_id: JobId, user: &str) -> anyhow::Result<()> {
+    pub fn cancel_job(&self, job_id: JobId, user: &str) -> anyhow::Result<bool> {
         {
             let jobs = self.jobs.read();
             let job = jobs
@@ -1110,6 +1764,12 @@ impl ClusterManager {
                 anyhow::bail!("job {} is already {:?}", job_id, job.state);
             }
             Self::check_job_owner(user, &job.spec.user, "cancel")?;
+            if job.srun_step_dispatch && job.run_attempt == 0 {
+                anyhow::bail!(
+                    "job {} is an active standalone allocation; worker reap acknowledgement is required",
+                    job_id
+                );
+            }
         }
 
         // Use JobComplete (not JobStateChange) so that resource deallocation
@@ -1119,11 +1779,161 @@ impl ClusterManager {
             job_id,
             exit_code: -1,
             state: JobState::Cancelled,
+            finalization_intent: None,
         })?;
-        self.run_all_finalized_side_effects(&resp);
+        self.wake_finalization_reconciler(&resp);
+
+        let applied = resp.terminal_cleanup_deferred
+            || resp.jobs_finalized.iter().any(|finalized| {
+                finalized.job_id == job_id && finalized.state == JobState::Cancelled
+            });
+        if !applied {
+            anyhow::bail!("job {} cancellation lost a concurrent state change", job_id);
+        }
 
         info!(job_id, "job cancelled");
-        Ok(())
+        Ok(resp.terminal_cleanup_deferred)
+    }
+
+    /// Idempotently cancel one immutable submission for an external reconciler.
+    /// A missing job, reused numeric ID, or already-terminal exact submission is
+    /// success-by-absence. The durable envelope repeats both the generation and
+    /// run-attempt checks in replicated apply, so a reuse or requeue between the
+    /// snapshot and commit cannot affect the replacement execution.
+    pub fn cancel_job_exact(
+        &self,
+        job_id: JobId,
+        expected_submission_generation: Uuid,
+        user: &str,
+    ) -> anyhow::Result<Option<bool>> {
+        let (run_attempt, targets, known_incarnations) = {
+            let jobs = self.jobs.read();
+            let Some(job) = jobs.get(&job_id) else {
+                return Ok(None);
+            };
+            if job.submission_generation != expected_submission_generation
+                || job.state.is_terminal()
+            {
+                return Ok(None);
+            }
+            Self::check_job_owner(user, &job.spec.user, "cancel")?;
+            if job.srun_step_dispatch && job.run_attempt == 0 {
+                anyhow::bail!(
+                    "job {} is an active standalone allocation; worker reap acknowledgement is required",
+                    job_id
+                );
+            }
+            let (targets, known_incarnations) = Self::finalization_ownership(job);
+            (job.run_attempt, targets, known_incarnations)
+        };
+
+        let context = self.finalization_context_for_execution(
+            expected_submission_generation,
+            run_attempt,
+            &targets,
+            &known_incarnations,
+            Utc::now(),
+        );
+        let resp = self.propose(WalOperation::DurableFinalization {
+            context,
+            operation: Box::new(WalOperation::JobCancelExact {
+                job_id,
+                expected_submission_generation,
+            }),
+        })?;
+        // Exact cancellation is an outbox write. The reconciler, not this RPC
+        // response, owns worker cleanup and the finalization ACK.
+        self.wake_finalization_reconciler(&resp);
+
+        let applied = resp.terminal_cleanup_deferred
+            || resp.jobs_finalized.iter().any(|finalized| {
+                finalized.job_id == job_id
+                    && finalized.submission_generation == expected_submission_generation
+                    && finalized.run_attempt == run_attempt
+                    && finalized.state == JobState::Cancelled
+            });
+        if !applied {
+            let exact_still_active = self.get_job(job_id).is_some_and(|job| {
+                job.submission_generation == expected_submission_generation
+                    && !job.state.is_terminal()
+            });
+            if exact_still_active {
+                anyhow::bail!(
+                    "job {} exact cancellation lost a concurrent state change",
+                    job_id
+                );
+            }
+            return Ok(None);
+        }
+
+        info!(job_id, %expected_submission_generation, run_attempt, "exact submission cancellation recorded");
+        Ok(Some(resp.terminal_cleanup_deferred))
+    }
+
+    /// Permanently fence a submission token and cancel the exact submission it
+    /// already owns, if any. The fence and terminal intent are one replicated
+    /// state-machine transition:
+    ///
+    /// * submit first: this operation resolves and cancels that exact identity;
+    /// * cancel first: this operation creates a no-create tombstone, so a later
+    ///   submit proposal is rejected in Raft apply.
+    ///
+    /// The durable finalization envelope also makes a controller crash after
+    /// commit harmless: restart reconciliation resumes worker cleanup without
+    /// requiring another external RPC.
+    pub fn cancel_job_by_submission_token(
+        &self,
+        token: &str,
+    ) -> anyhow::Result<CancelSubmissionTokenOutcome> {
+        if token.is_empty() || token.len() > 256 {
+            anyhow::bail!("submission_token must contain 1 to 256 bytes");
+        }
+        let response = self.propose(WalOperation::DurableFinalization {
+            // Apply replaces the node-lifecycle scope with the exact execution
+            // bound to the token, while retaining this replicated ID/time.
+            context: DurableFinalizationContext::node_lifecycle(Utc::now()),
+            operation: Box::new(WalOperation::SubmissionTokenCancel {
+                token: token.to_string(),
+            }),
+        })?;
+        if !response.submission_cancelled {
+            anyhow::bail!("submission-token cancellation fence was not committed");
+        }
+        self.wake_finalization_reconciler(&response);
+        Ok(CancelSubmissionTokenOutcome {
+            job_id: response.submission_job_id,
+            submission_generation: response.submission_generation,
+            cleanup_complete: response.submission_cleanup_complete,
+        })
+    }
+
+    /// Return the permanent terminal receipt for an evicted tokened
+    /// submission. Live jobs remain authoritative and are read through the
+    /// ordinary exact GetJob path.
+    pub fn terminal_submission_by_token(
+        &self,
+        token: &str,
+        expected_job_id: JobId,
+    ) -> anyhow::Result<Option<SubmissionTerminalOutcome>> {
+        if token.is_empty() || token.len() > 256 {
+            anyhow::bail!("submission_token must contain 1 to 256 bytes");
+        }
+        let submission_tokens = self.submission_tokens.read();
+        let Some(record) = submission_tokens.get(token) else {
+            return Ok(None);
+        };
+        if record.job_id != expected_job_id {
+            anyhow::bail!("submission_token is bound to a different job identity");
+        }
+        Ok(record
+            .terminal_receipt
+            .map(|terminal| SubmissionTerminalOutcome {
+                job_id: record.job_id,
+                submission_generation: record.submission_generation,
+                state: terminal.state,
+                exit_code: terminal.exit_code,
+                run_attempt: terminal.run_attempt,
+            }))
     }
 
     /// Complete a standalone srun allocation after its step finishes.
@@ -1219,6 +2029,7 @@ impl ClusterManager {
     /// Start a job on specific nodes.
     /// Transition a pending job to Running and record its allocation. Returns
     /// the run epoch assigned to this dispatch (threaded into the launch RPC).
+    #[allow(dead_code)] // public controller API retained for tests and non-scheduler callers
     pub fn start_job(
         &self,
         job_id: JobId,
@@ -1237,6 +2048,211 @@ impl ClusterManager {
         per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
         srun_step_dispatch: bool,
     ) -> anyhow::Result<u32> {
+        self.start_job_impl_with_attempt(
+            job_id,
+            node_names,
+            resources,
+            per_node_alloc,
+            StartJobOptions {
+                srun_step_dispatch,
+                reserved_run_attempt: None,
+                standalone_node_incarnations: None,
+            },
+        )
+    }
+
+    /// Publish a standalone srun allocation using exactly the generation and
+    /// worker incarnations that ACKed RegisterJobAllocation. The single WAL
+    /// entry makes publication idempotent and prevents a partially visible
+    /// Running allocation if the controller response is lost.
+    pub(crate) fn start_standalone_job_after_registration(
+        &self,
+        job_id: JobId,
+        submission_generation: uuid::Uuid,
+        node_names: Vec<String>,
+        resources: ResourceAllocations,
+        per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
+        target_incarnations: HashMap<String, String>,
+    ) -> anyhow::Result<StandaloneStartOutcome> {
+        if node_names
+            .iter()
+            .any(|name| !per_node_alloc.contains_key(name))
+        {
+            anyhow::bail!(
+                "job {} standalone allocation is missing a node slice",
+                job_id
+            );
+        }
+        let distinct_nodes: HashSet<_> = node_names.iter().collect();
+        if distinct_nodes.len() != node_names.len()
+            || target_incarnations.len() != distinct_nodes.len()
+            || node_names
+                .iter()
+                .any(|name| target_incarnations.get(name).is_none_or(String::is_empty))
+        {
+            anyhow::bail!(
+                "job {} standalone registration identities do not exactly match its nodes",
+                job_id
+            );
+        }
+
+        let (spec, submit_time) = {
+            let job = self
+                .get_job(job_id)
+                .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+            let exact_retry = job.submission_generation == submission_generation
+                && job.state == JobState::Running
+                && job.srun_step_dispatch
+                && job.run_attempt == 0
+                && job.allocated_nodes == node_names
+                && job
+                    .allocated_resources
+                    .as_ref()
+                    .is_some_and(|allocated| allocations_equivalent(allocated, &resources))
+                && job.per_node_alloc == per_node_alloc
+                && job.allocated_node_incarnations == target_incarnations;
+            if exact_retry {
+                return Ok(StandaloneStartOutcome::Started);
+            }
+            if job.submission_generation != submission_generation {
+                anyhow::bail!(
+                    "job {} submission generation changed after registration",
+                    job_id
+                );
+            }
+            let reservation_matches = job.pending_dispatch.as_ref().is_some_and(|dispatch| {
+                dispatch.submission_generation == submission_generation
+                    && dispatch.run_attempt == 0
+                    && dispatch.phase == PendingDispatchPhase::Launching
+                    && dispatch.target_nodes == node_names
+                    && allocations_equivalent(&dispatch.resources, &resources)
+                    && dispatch.per_node_alloc == per_node_alloc
+                    && dispatch.target_incarnations == target_incarnations
+            });
+            if job.state != JobState::Pending || job.run_attempt != 0 || !reservation_matches {
+                anyhow::bail!(
+                    "job {} cannot publish standalone registration from {:?}",
+                    job_id,
+                    job.state
+                );
+            }
+            (job.spec, job.submit_time)
+        };
+
+        for name in &node_names {
+            let current = self
+                .get_node(name)
+                .ok_or_else(|| anyhow::anyhow!("job {} node '{}' disappeared", job_id, name))?;
+            if target_incarnations.get(name) != Some(&current.incarnation) {
+                anyhow::bail!(
+                    "job {} node '{}' worker changed after allocation registration",
+                    job_id,
+                    name
+                );
+            }
+        }
+
+        let proposal = self.propose(WalOperation::JobStandaloneStart {
+            job_id,
+            submission_generation,
+            nodes: node_names.clone(),
+            resources: resources.clone(),
+            per_node_alloc: per_node_alloc.clone(),
+            target_incarnations: target_incarnations.clone(),
+        });
+        let applied = self.get_job(job_id).is_some_and(|job| {
+            job.submission_generation == submission_generation
+                && job.state == JobState::Running
+                && job.srun_step_dispatch
+                && job.run_attempt == 0
+                && job.allocated_nodes == node_names
+                && job
+                    .allocated_resources
+                    .as_ref()
+                    .is_some_and(|allocated| allocations_equivalent(allocated, &resources))
+                && job.per_node_alloc == per_node_alloc
+                && job.allocated_node_incarnations == target_incarnations
+        });
+        if !applied {
+            return match proposal {
+                Ok(_) => Err(anyhow::anyhow!(
+                    "job {} standalone start was not applied",
+                    job_id
+                )),
+                Err(error) => Ok(StandaloneStartOutcome::Ambiguous(error)),
+            };
+        }
+        if proposal.is_err() {
+            warn!(
+                job_id,
+                generation = %submission_generation,
+                "standalone start response was lost after exact state applied"
+            );
+        }
+        let start_time = self
+            .get_job(job_id)
+            .and_then(|job| job.start_time)
+            .unwrap_or_else(Utc::now);
+        self.run_job_start_side_effects(JobStartSideEffects {
+            job_id,
+            submission_generation,
+            run_attempt: 0,
+            spec: &spec,
+            submit_time,
+            start_time,
+            resources: &resources,
+        });
+        Ok(StandaloneStartOutcome::Started)
+    }
+
+    fn job_publication_lock(
+        &self,
+        job_id: JobId,
+        submission_generation: &str,
+        run_attempt: u32,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        self.job_publication_locks
+            .lock()
+            .entry((job_id, submission_generation.to_string(), run_attempt))
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// Finish a batch dispatch whose epoch was durably reserved before fanout.
+    pub(crate) fn start_job_after_dispatch(
+        &self,
+        job_id: JobId,
+        node_names: Vec<String>,
+        resources: ResourceAllocations,
+        per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
+        run_attempt: u32,
+    ) -> anyhow::Result<u32> {
+        self.start_job_impl_with_attempt(
+            job_id,
+            node_names,
+            resources,
+            per_node_alloc,
+            StartJobOptions {
+                srun_step_dispatch: false,
+                reserved_run_attempt: Some(run_attempt),
+                standalone_node_incarnations: None,
+            },
+        )
+    }
+
+    fn start_job_impl_with_attempt(
+        &self,
+        job_id: JobId,
+        node_names: Vec<String>,
+        resources: ResourceAllocations,
+        per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
+        options: StartJobOptions,
+    ) -> anyhow::Result<u32> {
+        let StartJobOptions {
+            srun_step_dispatch,
+            reserved_run_attempt,
+            standalone_node_incarnations,
+        } = options;
         for name in &node_names {
             if !per_node_alloc.contains_key(name) {
                 anyhow::bail!(
@@ -1246,11 +2262,29 @@ impl ClusterManager {
                 );
             }
         }
+        if srun_step_dispatch {
+            let incarnations = standalone_node_incarnations.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("job {} standalone start has no worker identities", job_id)
+            })?;
+            let nodes = self.nodes.read();
+            for name in &node_names {
+                let expected = incarnations.get(name).filter(|value| !value.is_empty());
+                let current = nodes.get(name).map(|node| &node.incarnation);
+                if expected.is_none() || current != expected {
+                    anyhow::bail!(
+                        "job {} standalone worker {} changed after registration",
+                        job_id,
+                        name
+                    );
+                }
+            }
+        }
 
         // Validate job exists and can transition
         let old_state;
         let spec_for_notify;
         let submit_time_for_notify;
+        let submission_generation;
         let run_attempt;
         {
             let jobs = self.jobs.read();
@@ -1260,27 +2294,181 @@ impl ClusterManager {
             old_state = job.state;
             spec_for_notify = job.spec.clone();
             submit_time_for_notify = job.submit_time;
-            // Next run epoch (first dispatch = 1), threaded to the agents.
-            run_attempt = job.run_attempt.saturating_add(1);
+            submission_generation = job.submission_generation;
             if job.state != JobState::Pending {
                 anyhow::bail!("job {} cannot start from state {:?}", job_id, job.state);
             }
+            run_attempt = match reserved_run_attempt {
+                Some(reserved)
+                    if reserved == job.run_attempt
+                        && reserved > 0
+                        && job.pending_dispatch.as_ref().is_some_and(|dispatch| {
+                            dispatch.run_attempt == reserved
+                                && dispatch.submission_generation == job.submission_generation
+                                && matches!(
+                                    dispatch.phase,
+                                    PendingDispatchPhase::Launching
+                                        | PendingDispatchPhase::Committed
+                                )
+                                && dispatch.target_nodes == node_names
+                                && allocations_equivalent(&dispatch.resources, &resources)
+                                && dispatch.per_node_alloc == per_node_alloc
+                        }) =>
+                {
+                    reserved
+                }
+                Some(reserved) => anyhow::bail!(
+                    "job {} dispatch epoch {} does not match current epoch {} and targets",
+                    job_id,
+                    reserved,
+                    job.run_attempt
+                ),
+                // Standalone registration is explicitly attempt zero on both
+                // controller and worker until it gains a durable pre-fanout
+                // reservation. Generation+incarnation still fence ID reuse.
+                None if srun_step_dispatch && job.pending_dispatch.is_none() => 0,
+                None if job.pending_dispatch.is_none() => job
+                    .run_attempt
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("job {} exhausted run epochs", job_id))?,
+                None => anyhow::bail!(
+                    "job {} has an unresolved batch dispatch and cannot use legacy start",
+                    job_id
+                ),
+            };
         }
 
-        // propose() handles: state transition, resource allocation, license subtraction
-        self.propose(WalOperation::job_state_change(
-            job_id,
-            old_state,
-            JobState::Running,
-        ))?;
-        self.propose(WalOperation::JobStart {
-            job_id,
-            nodes: node_names.clone(),
-            resources: resources.clone(),
-            per_node_alloc: per_node_alloc.clone(),
-            srun_step_dispatch,
-            run_attempt,
-        })?;
+        // A reserved batch fanout first records exact allocation + batch step
+        // as durable Committed preparation. BEGIN/accounting is emitted next,
+        // then Publish exposes Running and consumes buffered completions.
+        // Interactive/legacy starts retain the existing two-step path because
+        // they have no pre-launch worker fanout to recover.
+        let dispatch_already_published = if reserved_run_attempt.is_some() {
+            let proposal = self.propose(WalOperation::JobDispatchCommit {
+                job_id,
+                submission_generation,
+                nodes: node_names.clone(),
+                resources: resources.clone(),
+                per_node_alloc: per_node_alloc.clone(),
+                run_attempt,
+            });
+            match proposal {
+                Ok(_) => {}
+                Err(proposal_error) => {
+                    // ClientWrite can lose its response after the entry applied.
+                    // Only an exact local post-read with no remaining intent is
+                    // positive proof; Pending/Aborting stays ambiguous and is
+                    // left to the authoritative recovery loop.
+                    let Some(current) = self.get_job(job_id).filter(|current| {
+                        let awaiting_publication = current.state == JobState::Pending
+                            && current.pending_dispatch.as_ref().is_some_and(|dispatch| {
+                                dispatch.submission_generation == submission_generation
+                                    && dispatch.run_attempt == run_attempt
+                                    && dispatch.phase == PendingDispatchPhase::Committed
+                            });
+                        let published = (current.state.is_active()
+                            && current.pending_dispatch.as_ref().is_some_and(|dispatch| {
+                                dispatch.submission_generation == submission_generation
+                                    && dispatch.run_attempt == run_attempt
+                                    && matches!(
+                                        dispatch.phase,
+                                        PendingDispatchPhase::Published
+                                            | PendingDispatchPhase::Aborting
+                                    )
+                            }))
+                            || (current.state.is_terminal() && current.pending_dispatch.is_none());
+                        current.submission_generation == submission_generation
+                            && current.run_attempt == run_attempt
+                            && (awaiting_publication || published)
+                    }) else {
+                        return Err(proposal_error);
+                    };
+                    warn!(
+                        job_id,
+                        run_attempt,
+                        state = ?current.state,
+                        error = %proposal_error,
+                        "dispatch commit response was lost; recovering publication from applied state"
+                    );
+                }
+            }
+            let current = self.get_job(job_id).ok_or_else(|| {
+                anyhow::anyhow!("job {} disappeared after dispatch commit", job_id)
+            })?;
+            let awaiting_publication = current.run_attempt == run_attempt
+                && current.submission_generation == submission_generation
+                && current.state == JobState::Pending
+                && current.pending_dispatch.as_ref().is_some_and(|dispatch| {
+                    dispatch.submission_generation == submission_generation
+                        && dispatch.run_attempt == run_attempt
+                        && dispatch.phase == PendingDispatchPhase::Committed
+                });
+            let published = current.submission_generation == submission_generation
+                && current.run_attempt == run_attempt
+                && ((current.state.is_active()
+                    && current.pending_dispatch.as_ref().is_some_and(|dispatch| {
+                        dispatch.submission_generation == submission_generation
+                            && dispatch.run_attempt == run_attempt
+                            && matches!(
+                                dispatch.phase,
+                                PendingDispatchPhase::Published | PendingDispatchPhase::Aborting
+                            )
+                    }))
+                    || (current.state.is_terminal() && current.pending_dispatch.is_none()));
+            if !awaiting_publication && !published {
+                anyhow::bail!("job {} atomic dispatch commit was not applied", job_id);
+            }
+            published
+        } else {
+            // Even callers using the legacy, non-reserved start path must
+            // persist the exact worker that owns each allocation. Otherwise a
+            // later terminal proposal cannot prove which process it is safe to
+            // reap and correctly fails closed forever. Standalone registration
+            // supplies the identities captured before its worker handshake;
+            // legacy batch callers snapshot the current registered workers.
+            let allocated_node_incarnations = match standalone_node_incarnations {
+                Some(incarnations) => incarnations,
+                None => {
+                    let nodes = self.nodes.read();
+                    node_names
+                        .iter()
+                        .filter_map(|name| {
+                            nodes
+                                .get(name)
+                                .filter(|node| !node.incarnation.is_empty())
+                                .map(|node| (name.clone(), node.incarnation.clone()))
+                        })
+                        .collect()
+                }
+            };
+            if allocated_node_incarnations.len() != node_names.len()
+                || node_names.iter().any(|node| {
+                    allocated_node_incarnations
+                        .get(node)
+                        .is_none_or(String::is_empty)
+                })
+            {
+                anyhow::bail!(
+                    "job {} start is missing an exact worker incarnation",
+                    job_id
+                );
+            }
+            self.propose(WalOperation::job_state_change(
+                job_id,
+                old_state,
+                JobState::Running,
+            ))?;
+            self.propose(WalOperation::JobStart {
+                job_id,
+                nodes: node_names.clone(),
+                resources: resources.clone(),
+                per_node_alloc: per_node_alloc.clone(),
+                allocated_node_incarnations,
+                srun_step_dispatch,
+                run_attempt,
+            })?;
+            false
+        };
 
         let node_count = node_names.len().max(1) as u32;
         let per_node = node_names
@@ -1292,10 +2480,15 @@ impl ClusterManager {
                     resources.memory_mb / node_count as u64,
                 )
             });
-        if !srun_step_dispatch {
+        if !srun_step_dispatch && reserved_run_attempt.is_none() {
             let batch_step = JobStep {
                 job_id,
+                submission_generation: self
+                    .get_job(job_id)
+                    .map(|job| job.submission_generation)
+                    .unwrap_or_default(),
                 step_id: STEP_BATCH,
+                run_attempt,
                 name: "batch".into(),
                 state: StepState::Running,
                 num_tasks: 1,
@@ -1312,28 +2505,25 @@ impl ClusterManager {
             }
         }
 
-        if spec_for_notify
-            .mail_type
-            .iter()
-            .any(|t| t == "BEGIN" || t == "ALL")
-        {
-            self.send_notification(job_id, "BEGIN", &spec_for_notify);
-        }
-
-        if let Some(ref notifier) = *self.accounting.read() {
-            notifier.notify_job_start(JobStartRecord {
+        if reserved_run_attempt.is_some() {
+            // Publication deliberately runs in the dedicated asynchronous
+            // recovery task. BEGIN/accounting delivery is bounded, but may
+            // still wait on an unhealthy external sink and must not pin the
+            // scheduler's dispatch loop.
+            let _ = dispatch_already_published;
+        } else {
+            let start_time = self
+                .get_job(job_id)
+                .and_then(|job| job.start_time)
+                .unwrap_or_else(Utc::now);
+            self.run_job_start_side_effects(JobStartSideEffects {
                 job_id,
-                name: spec_for_notify.name.clone(),
-                user: spec_for_notify.user.clone(),
-                account: spec_for_notify.account.clone().unwrap_or_default(),
-                partition: spec_for_notify.partition.clone().unwrap_or_default(),
-                num_nodes: spec_for_notify.num_nodes,
-                num_tasks: spec_for_notify.num_tasks,
-                cpus_per_task: spec_for_notify.cpus_per_task,
-                memory_mb: resources.memory_mb,
+                submission_generation,
+                run_attempt,
+                spec: &spec_for_notify,
                 submit_time: submit_time_for_notify,
-                start_time: Utc::now(),
-                reservation: spec_for_notify.reservation.clone(),
+                start_time,
+                resources: &resources,
             });
         }
 
@@ -1341,7 +2531,242 @@ impl ClusterManager {
         Ok(run_attempt)
     }
 
+    fn run_job_start_side_effects(&self, delivery: JobStartSideEffects<'_>) {
+        let JobStartSideEffects {
+            job_id,
+            submission_generation,
+            run_attempt,
+            spec,
+            submit_time,
+            start_time,
+            resources,
+        } = delivery;
+        if spec
+            .mail_type
+            .iter()
+            .any(|mail_type| mail_type == "BEGIN" || mail_type == "ALL")
+        {
+            debug!(job_id, run_attempt, "publishing BEGIN notification");
+            self.send_notification(job_id, run_attempt, "BEGIN", spec);
+        }
+
+        let accounting = self.accounting.read().as_ref().cloned();
+        if let Some(accounting) = accounting {
+            let record = JobStartRecord {
+                job_id,
+                submission_generation,
+                run_attempt,
+                name: spec.name.clone(),
+                user: spec.user.clone(),
+                account: spec.account.clone().unwrap_or_default(),
+                partition: spec.partition.clone().unwrap_or_default(),
+                num_nodes: spec.num_nodes,
+                num_tasks: spec.num_tasks,
+                cpus_per_task: spec.cpus_per_task,
+                memory_mb: resources.memory_mb,
+                submit_time,
+                start_time,
+                reservation: spec.reservation.clone(),
+            };
+            tokio::spawn(async move {
+                if let Err(error) = accounting.record_start(record).await {
+                    warn!(job_id, run_attempt, %error, "asynchronous accounting start failed");
+                }
+            });
+        }
+    }
+
+    /// Attempt BEGIN/accounting delivery in order before a durable Committed
+    /// dispatch publishes Running. Attempts are bounded and best-effort: sink
+    /// unavailability is logged but never strands capacity in Committed.
+    async fn run_job_start_side_effects_ordered(&self, delivery: JobStartSideEffects<'_>) {
+        let JobStartSideEffects {
+            job_id,
+            submission_generation,
+            run_attempt,
+            spec,
+            submit_time,
+            start_time,
+            resources,
+        } = delivery;
+        if spec
+            .mail_type
+            .iter()
+            .any(|mail_type| mail_type == "BEGIN" || mail_type == "ALL")
+        {
+            debug!(job_id, run_attempt, "publishing ordered BEGIN notification");
+            self.send_notification_ordered(job_id, run_attempt, "BEGIN", spec)
+                .await;
+        }
+
+        // Clone outside the await so a parking_lot guard is never held across
+        // a suspension point (and the recovery future remains Send).
+        let accounting = self.accounting.read().as_ref().cloned();
+        if let Some(accounting) = accounting {
+            let _ = accounting
+                .record_start(JobStartRecord {
+                    job_id,
+                    submission_generation,
+                    run_attempt,
+                    name: spec.name.clone(),
+                    user: spec.user.clone(),
+                    account: spec.account.clone().unwrap_or_default(),
+                    partition: spec.partition.clone().unwrap_or_default(),
+                    num_nodes: spec.num_nodes,
+                    num_tasks: spec.num_tasks,
+                    cpus_per_task: spec.cpus_per_task,
+                    memory_mb: resources.memory_mb,
+                    submit_time,
+                    start_time,
+                    reservation: spec.reservation.clone(),
+                })
+                .await;
+        }
+    }
+
+    /// Emit the external start record for a durable Committed epoch, then make
+    /// Running visible and consume buffered completions. Caller holds this
+    /// job's publication lock.
+    async fn publish_committed_dispatch_locked(
+        &self,
+        job_id: JobId,
+        submission_generation: &str,
+        run_attempt: u32,
+    ) -> anyhow::Result<ClientResponse> {
+        let current = self
+            .get_job(job_id)
+            .ok_or_else(|| anyhow::anyhow!("job {} disappeared before publication", job_id))?;
+        if current.submission_generation.to_string() == submission_generation
+            && current.run_attempt == run_attempt
+            && ((current.state.is_active()
+                && current.pending_dispatch.as_ref().is_some_and(|dispatch| {
+                    dispatch.submission_generation.to_string() == submission_generation
+                        && matches!(
+                            dispatch.phase,
+                            PendingDispatchPhase::Published | PendingDispatchPhase::Aborting
+                        )
+                }))
+                || (current.state.is_terminal() && current.pending_dispatch.is_none()))
+        {
+            return Ok(ClientResponse {
+                dispatch_published: true,
+                ..Default::default()
+            });
+        }
+        let Some(_dispatch) = current.pending_dispatch.as_ref().filter(|dispatch| {
+            current.state == JobState::Pending
+                && current.submission_generation.to_string() == submission_generation
+                && dispatch.submission_generation.to_string() == submission_generation
+                && dispatch.run_attempt == run_attempt
+                && dispatch.phase == PendingDispatchPhase::Committed
+        }) else {
+            anyhow::bail!(
+                "job {} dispatch epoch {} is not awaiting publication",
+                job_id,
+                run_attempt
+            );
+        };
+        // BEGIN/accounting is necessarily at-least-once across a crash between
+        // this side effect and the following Raft write. Sinks should use
+        // (job_id, submission_generation, run_attempt) as an idempotency key.
+        // Keeping Committed durable until afterward guarantees recovery never
+        // publishes END first.
+        let start_time = current
+            .start_time
+            .ok_or_else(|| anyhow::anyhow!("committed dispatch has no start time"))?;
+        let resources = current
+            .allocated_resources
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("committed dispatch has no resources"))?;
+        self.run_job_start_side_effects_ordered(JobStartSideEffects {
+            job_id,
+            submission_generation: current.submission_generation,
+            run_attempt,
+            spec: &current.spec,
+            submit_time: current.submit_time,
+            start_time,
+            resources,
+        })
+        .await;
+        let proposal = self.propose(WalOperation::JobDispatchPublish {
+            job_id,
+            submission_generation: current.submission_generation,
+            run_attempt,
+        });
+        let response = match proposal {
+            Ok(response) => response,
+            Err(proposal_error) => {
+                let Some(_current) = self.get_job(job_id).filter(|current| {
+                    current.submission_generation.to_string() == submission_generation
+                        && current.run_attempt == run_attempt
+                        && ((current.state.is_active()
+                            && current.pending_dispatch.as_ref().is_some_and(|dispatch| {
+                                dispatch.submission_generation.to_string() == submission_generation
+                                    && matches!(
+                                        dispatch.phase,
+                                        PendingDispatchPhase::Published
+                                            | PendingDispatchPhase::Aborting
+                                    )
+                            }))
+                            || (current.state.is_terminal() && current.pending_dispatch.is_none()))
+                }) else {
+                    return Err(proposal_error);
+                };
+                ClientResponse {
+                    dispatch_published: true,
+                    ..Default::default()
+                }
+            }
+        };
+        if !response.dispatch_published {
+            anyhow::bail!("job {} dispatch publication was not applied", job_id);
+        }
+        Ok(response)
+    }
+
+    /// Resume start publication after leader failover/crash. The durable
+    /// Committed phase makes this safe to retry; BEGIN/accounting is
+    /// at-least-once, while Running/finalization is Raft-idempotent.
+    pub(crate) async fn recover_committed_dispatch_publication(
+        &self,
+        job_id: JobId,
+        submission_generation: &str,
+        run_attempt: u32,
+    ) -> anyhow::Result<()> {
+        let publication_lock =
+            self.job_publication_lock(job_id, submission_generation, run_attempt);
+        let _publication_guard = publication_lock.lock().await;
+        let response = self
+            .publish_committed_dispatch_locked(job_id, submission_generation, run_attempt)
+            .await?;
+        self.wake_finalization_reconciler(&response);
+        Ok(())
+    }
+
+    fn persist_completion_receipt(
+        &self,
+        submission_token: Option<&str>,
+        job_id: JobId,
+        submission_generation: Uuid,
+        receipt: &SubmissionCompletionReceipt,
+    ) -> CompletionReceiptMatch {
+        let Some(token) = submission_token else {
+            return CompletionReceiptMatch::New;
+        };
+        let mut submission_tokens = self.submission_tokens.write();
+        let Some(record) = submission_tokens.get_mut(token) else {
+            return CompletionReceiptMatch::Conflict;
+        };
+        let classification =
+            record.classify_completion_receipt(job_id, submission_generation, receipt);
+        if classification == CompletionReceiptMatch::New {
+            record.completion_receipts.push(receipt.clone());
+        }
+        classification
+    }
+
     /// Record completion from one allocated node (multi-node COMPLETING flow).
+    #[cfg(test)]
     pub fn node_complete(
         &self,
         job_id: JobId,
@@ -1350,57 +2775,300 @@ impl ClusterManager {
         signal: i32,
         run_attempt: u32,
     ) -> Result<NodeCompleteResult, NodeCompleteError> {
-        {
+        self.node_complete_with_drain(job_id, node_name, exit_code, signal, run_attempt, None)
+    }
+
+    #[cfg(test)]
+    pub fn node_complete_with_drain(
+        &self,
+        job_id: JobId,
+        node_name: &str,
+        exit_code: i32,
+        signal: i32,
+        run_attempt: u32,
+        drain_reason: Option<String>,
+    ) -> Result<NodeCompleteResult, NodeCompleteError> {
+        let (submission_generation, submission_token, worker_incarnation) = {
             let jobs = self.jobs.read();
             let job = jobs
                 .get(&job_id)
                 .ok_or(NodeCompleteError::JobNotFound { job_id })?;
-            if job.state.is_terminal() {
-                return Ok(NodeCompleteResult::AlreadyTerminal);
+            let incarnation = job
+                .pending_dispatch
+                .as_ref()
+                .and_then(|dispatch| dispatch.target_incarnations.get(node_name))
+                .or_else(|| job.allocated_node_incarnations.get(node_name))
+                .cloned()
+                .unwrap_or_default();
+            (
+                job.submission_generation.to_string(),
+                job.submission_token.clone().unwrap_or_default(),
+                incarnation,
+            )
+        };
+        self.node_complete_exact_with_drain(
+            job_id,
+            &submission_generation,
+            &submission_token,
+            node_name,
+            &worker_incarnation,
+            exit_code,
+            signal,
+            run_attempt,
+            drain_reason,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn node_complete_exact_with_drain(
+        &self,
+        job_id: JobId,
+        reported_generation: &str,
+        reported_token: &str,
+        node_name: &str,
+        worker_incarnation: &str,
+        exit_code: i32,
+        signal: i32,
+        run_attempt: u32,
+        drain_reason: Option<String>,
+    ) -> Result<NodeCompleteResult, NodeCompleteError> {
+        let requested_receipt = SubmissionCompletionReceipt {
+            node_name: node_name.to_string(),
+            run_attempt,
+            worker_incarnation: worker_incarnation.to_string(),
+            exit_code,
+            signal,
+            drain_reason: drain_reason.clone(),
+        };
+        let stale_result = || {
+            if reported_token.is_empty() {
+                Ok(NodeCompleteResult::StaleReport)
+            } else {
+                Err(NodeCompleteError::ReceiptConflict {
+                    job_id,
+                    node: node_name.to_string(),
+                })
             }
-            // Drop a report from a superseded run (older epoch); e.g. the
-            // delayed SIGKILL of a preemption-requeued process. Epoch 0 on
-            // either side (legacy) disables the check.
-            if run_attempt != 0 && job.run_attempt != 0 && run_attempt < job.run_attempt {
-                return Ok(NodeCompleteResult::StaleReport);
-            }
-            if !job.allocated_nodes.iter().any(|n| n == node_name) {
-                return Err(NodeCompleteError::NodeNotAllocated {
+        };
+        if !reported_token.is_empty() {
+            let submission_tokens = self.submission_tokens.read();
+            let record = submission_tokens.get(reported_token).ok_or_else(|| {
+                NodeCompleteError::ReceiptConflict {
+                    job_id,
+                    node: node_name.to_string(),
+                }
+            })?;
+            if record.job_id != job_id
+                || record.submission_generation.to_string() != reported_generation
+            {
+                return Err(NodeCompleteError::ReceiptConflict {
                     job_id,
                     node: node_name.to_string(),
                 });
             }
+            if let Some(existing) = record.completion_receipts.iter().find(|receipt| {
+                receipt.run_attempt == run_attempt && receipt.node_name == node_name
+            }) {
+                return if existing == &requested_receipt {
+                    Ok(NodeCompleteResult::AlreadyTerminal)
+                } else {
+                    Err(NodeCompleteError::ReceiptConflict {
+                        job_id,
+                        node: node_name.to_string(),
+                    })
+                };
+            }
+            if record.terminal_receipt.is_some() {
+                // A terminal summary proves only that this submission ended;
+                // it is not a receipt for an arbitrary node outcome. Exact
+                // tokened GetJob is the separate convergence path for an
+                // independently terminalized submission.
+                return Err(NodeCompleteError::JobNotFound { job_id });
+            }
         }
+
+        let (submission_generation, effective_run_attempt) = {
+            let jobs = self.jobs.read();
+            let job = jobs
+                .get(&job_id)
+                .ok_or(NodeCompleteError::JobNotFound { job_id })?;
+            if job.submission_generation.to_string() != reported_generation {
+                return stale_result();
+            }
+            if !reported_token.is_empty() && job.submission_token.as_deref() != Some(reported_token)
+            {
+                return Err(NodeCompleteError::ReceiptConflict {
+                    job_id,
+                    node: node_name.to_string(),
+                });
+            }
+            if job.state.is_terminal() {
+                if reported_token.is_empty() {
+                    return Ok(NodeCompleteResult::AlreadyTerminal);
+                }
+                let exact_terminal_owner = run_attempt != 0
+                    && job.run_attempt == run_attempt
+                    && job.allocated_nodes.iter().any(|node| node == node_name)
+                    && job
+                        .allocated_node_incarnations
+                        .get(node_name)
+                        .map(String::as_str)
+                        == Some(worker_incarnation);
+                if !exact_terminal_owner {
+                    // The exact submission ended without retaining this node
+                    // owner (for example, cancellation during Launching). This
+                    // is not a receipt; report NotFound so a provenance-bound
+                    // operator can separately prove the exact terminal job via
+                    // tokened GetJob.
+                    return Err(NodeCompleteError::JobNotFound { job_id });
+                }
+            }
+            if job.state == JobState::Pending {
+                match &job.pending_dispatch {
+                    Some(dispatch)
+                        if run_attempt != 0
+                            && run_attempt == dispatch.run_attempt
+                            && matches!(
+                                dispatch.phase,
+                                PendingDispatchPhase::Launching
+                                    | PendingDispatchPhase::Committed
+                                    | PendingDispatchPhase::Aborting
+                            )
+                            && dispatch.target_nodes.iter().any(|node| node == node_name)
+                            && dispatch
+                                .target_incarnations
+                                .get(node_name)
+                                .map(String::as_str)
+                                == Some(worker_incarnation) =>
+                    {
+                        // Accepted below through Raft so an immediate worker
+                        // exit cannot be lost before the Running commit.
+                    }
+                    Some(_) => return stale_result(),
+                    None => {
+                        return Err(NodeCompleteError::NodeNotAllocated {
+                            job_id,
+                            node: node_name.to_string(),
+                        })
+                    }
+                }
+            } else {
+                if let Some(dispatch) = job.pending_dispatch.as_ref() {
+                    if run_attempt == 0
+                        || run_attempt != dispatch.run_attempt
+                        || !matches!(
+                            dispatch.phase,
+                            PendingDispatchPhase::Published | PendingDispatchPhase::Aborting
+                        )
+                        || !dispatch.target_nodes.iter().any(|n| n == node_name)
+                    {
+                        return stale_result();
+                    }
+                    if dispatch
+                        .target_incarnations
+                        .get(node_name)
+                        .map(String::as_str)
+                        != Some(worker_incarnation)
+                    {
+                        return stale_result();
+                    }
+                } else {
+                    // Epoch zero remains the compatibility path for executions
+                    // that predate durable ownership.
+                    if run_attempt != 0 && job.run_attempt != 0 && run_attempt != job.run_attempt {
+                        return stale_result();
+                    }
+                    if !job.allocated_nodes.iter().any(|n| n == node_name) {
+                        return Err(NodeCompleteError::NodeNotAllocated {
+                            job_id,
+                            node: node_name.to_string(),
+                        });
+                    }
+                    if job
+                        .allocated_node_incarnations
+                        .get(node_name)
+                        .map(String::as_str)
+                        .unwrap_or_default()
+                        != worker_incarnation
+                    {
+                        return stale_result();
+                    }
+                }
+            }
+            (
+                job.submission_generation,
+                if run_attempt == 0 {
+                    job.run_attempt
+                } else {
+                    run_attempt
+                },
+            )
+        };
 
         let resp = self
             .propose(WalOperation::JobNodeComplete {
                 job_id,
+                submission_generation,
+                worker_incarnation: worker_incarnation.to_string(),
                 node_name: node_name.to_string(),
                 exit_code,
                 signal,
+                drain_reason,
+                run_attempt: effective_run_attempt,
+                submission_token: (!reported_token.is_empty()).then(|| reported_token.to_string()),
             })
             .map_err(|source| NodeCompleteError::RaftPropose { source })?;
 
-        self.run_all_finalized_side_effects(&resp);
+        self.wake_finalization_reconciler(&resp);
+        if resp.completion_conflict {
+            return Err(NodeCompleteError::ReceiptConflict {
+                job_id,
+                node: node_name.to_string(),
+            });
+        }
+        if resp.completion_buffered {
+            return Ok(NodeCompleteResult::Buffered);
+        }
         if let Some(f) = resp.jobs_finalized.first() {
             return Ok(NodeCompleteResult::AllDone {
                 state: f.state,
                 exit_code: f.exit_code,
             });
         }
-
-        let jobs = self.jobs.read();
-        if jobs.get(&job_id).is_some_and(|job| job.state.is_terminal()) {
-            return Ok(NodeCompleteResult::AlreadyTerminal);
+        if resp.completion_accepted {
+            return Ok(NodeCompleteResult::Completing {
+                remaining_nodes: resp.completion_remaining_nodes,
+                submission_generation: resp.completion_submission_generation,
+                run_attempt: resp.completion_run_attempt,
+            });
         }
-
-        Ok(NodeCompleteResult::Completing)
+        Ok(NodeCompleteResult::StaleReport)
     }
 
     /// Complete a job (controller-initiated or force-finish from COMPLETING timeout).
     pub fn complete_job(
         &self,
         job_id: JobId,
+        exit_code: i32,
+        state: JobState,
+    ) -> anyhow::Result<()> {
+        let (submission_generation, run_attempt) = {
+            let jobs = self.jobs.read();
+            let job = jobs
+                .get(&job_id)
+                .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+            (job.submission_generation, job.run_attempt)
+        };
+        self.complete_job_exact(job_id, submission_generation, run_attempt, exit_code, state)
+    }
+
+    /// Exact-execution completion used after any asynchronous worker/RPC wait.
+    /// A delayed decision for an older run is a deterministic no-op in apply.
+    pub(crate) fn complete_job_exact(
+        &self,
+        job_id: JobId,
+        submission_generation: Uuid,
+        run_attempt: u32,
         exit_code: i32,
         state: JobState,
     ) -> anyhow::Result<()> {
@@ -1417,6 +3085,10 @@ impl ClusterManager {
             let job = jobs
                 .get(&job_id)
                 .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+            if job.submission_generation != submission_generation || job.run_attempt != run_attempt
+            {
+                anyhow::bail!("job {} execution changed before completion", job_id);
+            }
             if job.state.is_terminal() {
                 anyhow::bail!("invalid transition from {:?} to {:?}", job.state, state);
             }
@@ -1431,12 +3103,26 @@ impl ClusterManager {
 
         // propose() handles: state transition, exit_code, end_time,
         // resource deallocation, step completion, license return
-        let resp = self.propose(WalOperation::JobComplete {
-            job_id,
-            exit_code,
-            state,
-        })?;
-        self.run_all_finalized_side_effects(&resp);
+        let resp = self.propose_for_exact_execution(
+            WalOperation::JobComplete {
+                job_id,
+                exit_code,
+                state,
+                finalization_intent: None,
+            },
+            submission_generation,
+            run_attempt,
+            Utc::now(),
+        )?;
+        self.wake_finalization_reconciler(&resp);
+        if !resp.terminal_cleanup_deferred
+            && !resp
+                .jobs_finalized
+                .iter()
+                .any(|finalized| finalized.job_id == job_id && finalized.state == state)
+        {
+            anyhow::bail!("job {} completion lost a concurrent state change", job_id);
+        }
 
         debug!(job_id, exit_code, "job completed");
         Ok(())
@@ -1447,8 +3133,30 @@ impl ClusterManager {
     /// completion path report `Timeout` instead of reading the terminating
     /// signal as an ordinary failure — a job that exits promptly on SIGTERM
     /// reports back long before the grace period is up.
+    #[cfg(test)]
     pub fn signal_time_limit(&self, job_id: JobId, at: DateTime<Utc>) -> anyhow::Result<()> {
-        self.propose(WalOperation::JobTimeLimitSignaled { job_id, at })?;
+        let (submission_generation, run_attempt) = self
+            .jobs
+            .read()
+            .get(&job_id)
+            .map(|job| (job.submission_generation, job.run_attempt))
+            .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+        self.signal_time_limit_exact(job_id, submission_generation, run_attempt, at)
+    }
+
+    pub(crate) fn signal_time_limit_exact(
+        &self,
+        job_id: JobId,
+        submission_generation: Uuid,
+        run_attempt: u32,
+        at: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        self.propose_for_exact_execution(
+            WalOperation::JobTimeLimitSignaled { job_id, at },
+            submission_generation,
+            run_attempt,
+            at,
+        )?;
         Ok(())
     }
 
@@ -1456,7 +3164,7 @@ impl ClusterManager {
     /// controller-side state change; the caller dispatches the signal named by
     /// the returned `PreemptOutcome`. `Off` is rejected.
     pub fn preempt_job(&self, job_id: JobId, mode: PreemptMode) -> anyhow::Result<PreemptOutcome> {
-        {
+        let (submission_generation, run_attempt, user_begin) = {
             let jobs = self.jobs.read();
             let job = jobs
                 .get(&job_id)
@@ -1464,7 +3172,12 @@ impl ClusterManager {
             if job.state != JobState::Running {
                 anyhow::bail!("job {} is not running (state {:?})", job_id, job.state);
             }
-        }
+            (
+                job.submission_generation,
+                job.run_attempt,
+                job.spec.begin_time,
+            )
+        };
 
         match mode {
             PreemptMode::Off => anyhow::bail!("preemption disabled for job {}", job_id),
@@ -1474,9 +3187,31 @@ impl ClusterManager {
                 Ok(PreemptOutcome::Suspended)
             }
             PreemptMode::Cancel => {
-                self.complete_job(job_id, -1, JobState::Cancelled)?;
+                let resp = self.propose_for_exact_execution(
+                    WalOperation::JobComplete {
+                        job_id,
+                        exit_code: -1,
+                        state: JobState::Cancelled,
+                        finalization_intent: None,
+                    },
+                    submission_generation,
+                    run_attempt,
+                    Utc::now(),
+                )?;
+                self.wake_finalization_reconciler(&resp);
+                if !resp.terminal_cleanup_deferred
+                    && !resp.jobs_finalized.iter().any(|finalized| {
+                        finalized.job_id == job_id && finalized.state == JobState::Cancelled
+                    })
+                {
+                    anyhow::bail!("job {} preemption lost a concurrent state change", job_id);
+                }
                 info!(job_id, "job preempted (cancel)");
-                Ok(PreemptOutcome::Killed)
+                Ok(if resp.terminal_cleanup_deferred {
+                    PreemptOutcome::CleanupDeferred
+                } else {
+                    PreemptOutcome::Killed
+                })
             }
             PreemptMode::Requeue => {
                 // Single atomic op: free nodes, end the run for accounting, and
@@ -1493,165 +3228,327 @@ impl ClusterManager {
                 let hold = Utc::now() + chrono::Duration::seconds(hold_secs);
                 // Honor a later user --begin: compute the max on the leader so
                 // followers apply one verbatim instant (no per-replica clock).
-                let begin_time = self
-                    .jobs
-                    .read()
-                    .get(&job_id)
-                    .and_then(|j| j.spec.begin_time)
-                    .map_or(hold, |user_begin| user_begin.max(hold));
-                let resp = self.propose(WalOperation::JobPreemptRequeue { job_id, begin_time })?;
-                self.run_all_finalized_side_effects(&resp);
-                info!(job_id, hold_secs, "job preempted (requeue)");
-                Ok(PreemptOutcome::Killed)
-            }
-        }
-    }
-
-    fn run_job_finalized_side_effects(&self, finalized: JobFinalized) {
-        if let Some(stats) = self.sched_stats.get() {
-            stats.record_finalized();
-        }
-        self.run_epilog_slurmctld(finalized.job_id);
-        self.notify_job_finished(finalized.job_id, finalized.state, finalized.exit_code);
-    }
-
-    fn run_all_finalized_side_effects(&self, resp: &ClientResponse) {
-        for f in &resp.jobs_finalized {
-            self.run_job_finalized_side_effects(*f);
-        }
-    }
-
-    fn run_epilog_slurmctld(&self, job_id: JobId) {
-        let Some(epilog_ctld) = self.config().hooks.epilog_slurmctld.clone() else {
-            return;
-        };
-        let job = self.get_job(job_id);
-        let ctx = spur_core::hooks::HookContext {
-            job_id,
-            work_dir: job
-                .as_ref()
-                .map(|j| j.spec.work_dir.clone())
-                .unwrap_or_else(|| "/tmp".into()),
-            uid: job.as_ref().map(|j| j.spec.uid).unwrap_or(0),
-            gid: job.as_ref().map(|j| j.spec.gid).unwrap_or(0),
-            partition: job
-                .as_ref()
-                .and_then(|j| j.spec.partition.clone())
-                .unwrap_or_default(),
-            nodelist: job
-                .as_ref()
-                .map(|j| j.allocated_nodes.join(","))
-                .unwrap_or_default(),
-            script_context: "epilog_slurmctld".into(),
-            gpu_devices: Vec::new(),
-            cpus: job.as_ref().map(|j| j.spec.cpus_per_task).unwrap_or(1),
-            memory_mb: job
-                .as_ref()
-                .and_then(|j| j.spec.memory_per_node_mb)
-                .unwrap_or(0),
-        };
-        tokio::spawn(async move {
-            if let Err(e) = spur_core::hooks::run_hook(&epilog_ctld, &ctx).await {
-                warn!(job_id, error = %e, "EpilogSlurmctld failed");
-            }
-        });
-    }
-
-    fn notify_job_finished(&self, job_id: JobId, state: JobState, exit_code: i32) {
-        let spec_for_notify = self.jobs.read().get(&job_id).map(|j| j.spec.clone());
-        if let Some(spec) = spec_for_notify {
-            let is_success = state == JobState::Completed;
-            let is_failure = matches!(
-                state,
-                JobState::Failed | JobState::Timeout | JobState::NodeFail | JobState::Deadline
-            );
-            if is_success && spec.mail_type.iter().any(|t| t == "END" || t == "ALL") {
-                self.send_notification(job_id, "END", &spec);
-            }
-            if is_failure && spec.mail_type.iter().any(|t| t == "FAIL" || t == "ALL") {
-                self.send_notification(job_id, "FAIL", &spec);
-            }
-        }
-
-        if let Some(ref notifier) = *self.accounting.read() {
-            let (exit_signal, derived_exit_code) = self
-                .jobs
-                .read()
-                .get(&job_id)
-                .map(|j| (j.exit_signal, j.derived_exit_code))
-                .unwrap_or((0, 0));
-            notifier.notify_job_end(
-                job_id,
-                state,
-                exit_code,
-                Utc::now(),
-                exit_signal,
-                derived_exit_code,
-            );
-        }
-
-        // Preempted excluded: preempt_job owns its requeue (with hold).
-        let should_requeue = matches!(state, JobState::Timeout | JobState::NodeFail);
-        if should_requeue {
-            if let Err(e) = self.maybe_requeue(job_id) {
-                warn!(job_id, error = %e, "failed to requeue job");
-            }
-        }
-    }
-
-    /// Requeue a job if spec.requeue is set and attempt limit not exceeded.
-    fn maybe_requeue(&self, job_id: JobId) -> anyhow::Result<()> {
-        let max = self.config().controller.max_batch_requeue;
-        let (old_state, backoff) = {
-            let jobs = self.jobs.read();
-            let Some(job) = jobs.get(&job_id) else {
-                return Ok(());
-            };
-            if job.requeue_count >= max {
-                if matches!(
-                    job.state,
-                    JobState::Preempted | JobState::Timeout | JobState::NodeFail
-                ) {
-                    drop(jobs);
-                    return self.hold_job_at_max_requeue(job_id);
+                let begin_time = user_begin.map_or(hold, |user_begin| user_begin.max(hold));
+                let resp = self.propose_for_exact_execution(
+                    WalOperation::JobPreemptRequeue { job_id, begin_time },
+                    submission_generation,
+                    run_attempt,
+                    Utc::now(),
+                )?;
+                self.wake_finalization_reconciler(&resp);
+                if !resp.terminal_cleanup_deferred
+                    && !resp.jobs_finalized.iter().any(|finalized| {
+                        finalized.job_id == job_id && finalized.state == JobState::Preempted
+                    })
+                {
+                    anyhow::bail!("job {} preemption lost a concurrent state change", job_id);
                 }
-                return Ok(());
+                info!(job_id, hold_secs, "job preempted (requeue)");
+                Ok(if resp.terminal_cleanup_deferred {
+                    PreemptOutcome::CleanupDeferred
+                } else {
+                    PreemptOutcome::Killed
+                })
             }
-            if !job.spec.requeue {
-                return Ok(());
-            }
-            // The eviction tagged the cause, so a launch failure gets the same
-            // backoff the all-nodes-failed path gets. Without it a job with one
-            // broken node in its allocation burns its whole requeue budget in
-            // seconds. Node health and timeout requeues keep today's immediate
-            // retry: the blocking condition is already gone by then.
-            let launch_failed = job.pending_reason == PendingReason::JobLaunchFailure;
-            (
-                job.state,
-                launch_failed.then(|| self.launch_backoff_until(job)),
-            )
-        };
+        }
+    }
 
-        // Computed before the proposal so every replica applies one verbatim
-        // instant rather than reading its own clock.
-        let op = match backoff {
-            Some(hold) => WalOperation::job_state_change_backoff_pending(
+    fn wake_finalization_reconciler(&self, resp: &ClientResponse) {
+        if !resp.jobs_finalized.is_empty() {
+            // A response is only a low-latency wake.  The snapshot-persisted
+            // markers are the source of truth when this response is lost.
+            self.finalization_notify.notify_one();
+        }
+    }
+
+    /// Continuously recover finalizations abandoned by a crashed or deposed
+    /// leader.  Notification wakes minimize latency; polling guarantees
+    /// progress when the terminal write response never reaches its caller.
+    pub(crate) async fn run_finalization_reconciler(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = self.finalization_notify.notified() => {}
+                _ = interval.tick() => {}
+            }
+            self.reconcile_pending_finalizations_once().await;
+        }
+    }
+
+    pub(crate) async fn reconcile_pending_finalizations_once(self: &Arc<Self>) {
+        let pending: Vec<(JobId, PendingFinalization)> = self
+            .jobs
+            .read()
+            .values()
+            .filter_map(|job| {
+                job.pending_finalization
+                    .clone()
+                    .map(|marker| (job.job_id, marker))
+            })
+            .collect();
+        if pending.is_empty() || !self.ensure_consensus_leader().await {
+            return;
+        }
+
+        run_finalization_tasks_bounded(
+            pending,
+            MAX_CONCURRENT_FINALIZATIONS,
+            |(job_id, marker)| {
+                let cluster = self.clone();
+                async move {
+                    cluster
+                        .reconcile_one_pending_finalization(job_id, marker)
+                        .await;
+                }
+            },
+        )
+        .await;
+    }
+
+    async fn reconcile_one_pending_finalization(
+        self: Arc<Self>,
+        job_id: JobId,
+        marker: PendingFinalization,
+    ) {
+        let key = (job_id, marker.submission_generation, marker.run_attempt);
+        let lock = self
+            .finalization_locks
+            .lock()
+            .entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let guard = lock.lock().await;
+        'reconcile: {
+            // Re-read after serialization.  Another wake may have already
+            // Acked this marker, or the job ID may now name another generation.
+            let Some(job) = self.jobs.read().get(&job_id).cloned() else {
+                break 'reconcile;
+            };
+            if job.pending_finalization.as_ref() != Some(&marker)
+                || !self.ensure_consensus_leader().await
+            {
+                break 'reconcile;
+            }
+
+            if let Err(error) = self.deliver_finalization_sinks(&job, &marker).await {
+                warn!(job_id, run_attempt = marker.run_attempt, %error, "required finalization sink failed; retaining durable marker for retry");
+                break 'reconcile;
+            }
+
+            // Leadership and policy can change while a bounded sink is in
+            // flight.  Reconfirm both, then derive the Ack action from the
+            // latest exact job snapshot rather than the pre-sink clone.
+            if !self.ensure_consensus_leader().await {
+                break 'reconcile;
+            }
+            let Some(current_job) = self.jobs.read().get(&job_id).cloned() else {
+                break 'reconcile;
+            };
+            if current_job.pending_finalization.as_ref() != Some(&marker) {
+                break 'reconcile;
+            }
+            let action = self.finalization_action(&current_job, &marker);
+            let requeues = matches!(action, FinalizationAction::Requeue { .. });
+            match self.propose(WalOperation::JobFinalizationAck {
                 job_id,
-                old_state,
-                PendingReason::JobLaunchFailure,
-                hold,
-            ),
-            None => WalOperation::job_state_change(job_id, old_state, JobState::Pending),
-        };
-        self.propose(op)?;
+                marker: marker.clone(),
+                action,
+            }) {
+                Ok(response) if response.finalization_acked => {
+                    if let Some(stats) = self.sched_stats.get() {
+                        stats.record_finalized();
+                    }
+                    if requeues {
+                        self.scheduler_notify.notify_one();
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(job_id, run_attempt = marker.run_attempt, %error, "failed to acknowledge pending finalization");
+                }
+            }
+        }
 
-        info!(job_id, from = %old_state, hold_until = ?backoff, "job requeued");
+        // Every exit path releases the leader-local coalescing entry.  Durable
+        // retry is driven by the marker, so retaining a stale local lock has no
+        // correctness value and leaks one allocation per completed run.
+        drop(guard);
+        let mut locks = self.finalization_locks.lock();
+        if Arc::strong_count(&lock) == 2
+            && locks.get(&key).is_some_and(|held| Arc::ptr_eq(held, &lock))
+        {
+            locks.remove(&key);
+        }
+    }
+
+    async fn deliver_finalization_sinks(
+        &self,
+        job: &Job,
+        marker: &PendingFinalization,
+    ) -> anyhow::Result<()> {
+        // Accounting is the only required sink. It is transactionally
+        // idempotent by exact execution/finalization identity; failure keeps
+        // the replicated marker pending and prevents JobFinalizationAck.
+        let accounting = self.accounting.read().as_ref().cloned();
+        if let Some(accounting) = accounting {
+            accounting
+                .record_finalization(JobEndRecord {
+                    job_id: job.job_id,
+                    submission_generation: marker.submission_generation,
+                    run_attempt: marker.run_attempt,
+                    finalization_id: marker.finalization_id,
+                    state: marker.state,
+                    exit_code: marker.exit_code,
+                    end_time: marker.end_time,
+                    exit_signal: marker.exit_signal,
+                    derived_exit_code: marker.derived_exit_code,
+                    user: job.spec.user.clone(),
+                    account: job.spec.account.clone().unwrap_or_default(),
+                    start_time: job.start_time.unwrap_or(job.submit_time),
+                    num_tasks: job.spec.num_tasks,
+                    cpus_per_task: job.spec.cpus_per_task,
+                })
+                .await?;
+        }
+
+        self.deliver_best_effort_finalization_notifications(job, marker)
+            .await;
         Ok(())
     }
 
+    /// Epilog and mail/webhook delivery are explicitly best-effort and
+    /// at-least-once. A crash after delivery but before the Raft ACK can repeat
+    /// them; their errors never alter accounting, resources, or lifecycle.
+    async fn deliver_best_effort_finalization_notifications(
+        &self,
+        job: &Job,
+        marker: &PendingFinalization,
+    ) {
+        const EPILOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+        if let Some(epilog_ctld) = self.config().hooks.epilog_slurmctld.clone() {
+            let ctx = Self::finalization_hook_context(job);
+            match spur_core::hooks::run_hook_with_timeout(&epilog_ctld, &ctx, EPILOG_TIMEOUT).await
+            {
+                Ok(()) => {}
+                Err(error) => warn!(job_id = job.job_id, %error, "EpilogSlurmctld failed"),
+            }
+        }
+
+        let is_success = marker.state == JobState::Completed;
+        let is_failure = matches!(
+            marker.state,
+            JobState::Failed
+                | JobState::Timeout
+                | JobState::NodeFail
+                | JobState::Deadline
+                | JobState::OutOfMemory
+        );
+        if is_success
+            && job
+                .spec
+                .mail_type
+                .iter()
+                .any(|kind| kind == "END" || kind == "ALL")
+        {
+            self.send_notification_ordered(job.job_id, marker.run_attempt, "END", &job.spec)
+                .await;
+        }
+        if is_failure
+            && job
+                .spec
+                .mail_type
+                .iter()
+                .any(|kind| kind == "FAIL" || kind == "ALL")
+        {
+            self.send_notification_ordered(job.job_id, marker.run_attempt, "FAIL", &job.spec)
+                .await;
+        }
+    }
+
+    fn finalization_hook_context(job: &Job) -> spur_core::hooks::HookContext {
+        spur_core::hooks::HookContext {
+            job_id: job.job_id,
+            work_dir: job.spec.work_dir.clone(),
+            uid: job.spec.uid,
+            gid: job.spec.gid,
+            partition: job.spec.partition.clone().unwrap_or_default(),
+            nodelist: job.allocated_nodes.join(","),
+            script_context: "epilog_slurmctld".into(),
+            gpu_devices: Vec::new(),
+            cpus: job.spec.cpus_per_task,
+            memory_mb: job.spec.memory_per_node_mb.unwrap_or(0),
+        }
+    }
+
+    fn finalization_action(&self, job: &Job, marker: &PendingFinalization) -> FinalizationAction {
+        let max = self.config().controller.max_batch_requeue;
+        let max_hold = || FinalizationAction::Requeue {
+            begin_time: None,
+            pending_reason: PendingReason::JobHoldMaxRequeue,
+            pending_reason_desc: None,
+            priority: Some(0),
+            counter: FinalizationRequeueCounter::None,
+        };
+        match &marker.intent {
+            FinalizationIntent::KeepTerminal => FinalizationAction::KeepTerminal,
+            FinalizationIntent::AutoRequeue => {
+                if job.requeue_count >= max {
+                    max_hold()
+                } else if !job.spec.requeue {
+                    FinalizationAction::KeepTerminal
+                } else if job.pending_reason == PendingReason::JobLaunchFailure {
+                    FinalizationAction::Requeue {
+                        begin_time: Some(self.launch_backoff_until(job)),
+                        pending_reason: PendingReason::JobLaunchFailure,
+                        pending_reason_desc: None,
+                        priority: None,
+                        counter: FinalizationRequeueCounter::Ordinary,
+                    }
+                } else {
+                    FinalizationAction::Requeue {
+                        begin_time: None,
+                        pending_reason: PendingReason::None,
+                        pending_reason_desc: None,
+                        priority: None,
+                        counter: FinalizationRequeueCounter::Ordinary,
+                    }
+                }
+            }
+            FinalizationIntent::LaunchFailure { hold, begin_time } => {
+                if !*hold && job.requeue_count >= max {
+                    max_hold()
+                } else {
+                    FinalizationAction::Requeue {
+                        begin_time: (!*hold).then_some(*begin_time),
+                        pending_reason: if *hold {
+                            PendingReason::Held
+                        } else {
+                            PendingReason::JobLaunchFailure
+                        },
+                        pending_reason_desc: hold.then(|| LAUNCH_FAILURE_HELD_DESC.to_string()),
+                        priority: hold.then_some(0),
+                        counter: if job.requeue_count < max {
+                            FinalizationRequeueCounter::Ordinary
+                        } else {
+                            FinalizationRequeueCounter::None
+                        },
+                    }
+                }
+            }
+            FinalizationIntent::PreemptRequeue { begin_time } => FinalizationAction::Requeue {
+                begin_time: Some(*begin_time),
+                pending_reason: PendingReason::BeginTime,
+                pending_reason_desc: None,
+                priority: None,
+                counter: FinalizationRequeueCounter::Preempt,
+            },
+        }
+    }
+
     /// Requeue a job back to Pending after a dispatch failure.
-    /// Unlike `maybe_requeue`, this is unconditional and doesn't require
-    /// the requeue flag on the spec. Used when the agent rejects a job
+    /// Unlike Timeout/NodeFail auto-requeue, this is unconditional and doesn't
+    /// require the requeue flag on the spec. Used when the agent rejects a job
     /// (e.g., container image not found) so it can be retried after the
     /// user fixes the issue. (Issue #91)
     pub fn requeue_job(&self, job_id: JobId) -> anyhow::Result<()> {
@@ -1674,15 +3571,15 @@ impl ClusterManager {
             if job.state.is_terminal() {
                 return Ok(());
             }
-            if !hold && job.requeue_count >= self.config().controller.max_batch_requeue {
-                drop(jobs);
-                return self.hold_job_at_max_requeue(job_id);
-            }
             // A job that never reached Running has nothing to requeue: Pending ->
             // Failed is not a legal transition and Pending -> Pending applies as a
             // NoOp, so both proposals below would be discarded and the hold lost.
             // Callers that fail before dispatch fall to the next scheduler tick.
             if job.state == JobState::Pending {
+                if !hold && job.requeue_count >= self.config().controller.max_batch_requeue {
+                    drop(jobs);
+                    return self.hold_job_at_max_requeue(job_id);
+                }
                 debug!(
                     job_id,
                     "requeue requested for a job that never started; no backoff hold applied"
@@ -1692,35 +3589,20 @@ impl ClusterManager {
             (job.state, self.launch_backoff_until(job))
         };
 
-        // transition to Failed via JobComplete so node resources,
-        // licenses, and steps are properly cleaned up.
-        self.propose(WalOperation::JobComplete {
+        // Terminalize and persist the eventual requeue/hold in one entry.  The
+        // finalization Ack performs the Pending transition only after the ended
+        // run's sinks have had a bounded delivery attempt.
+        let resp = self.propose(WalOperation::JobComplete {
             job_id,
             exit_code: -1,
             state: JobState::Failed,
+            finalization_intent: Some(FinalizationIntent::LaunchFailure { hold, begin_time }),
         })?;
-
+        self.wake_finalization_reconciler(&resp);
         if hold {
-            self.propose(WalOperation::job_state_change_held_pending_desc(
-                job_id,
-                JobState::Failed,
-                PendingReason::Held,
-                LAUNCH_FAILURE_HELD_DESC,
-            ))?;
             info!(job_id, from = %old_state, "job requeued and held after launch failure");
             return Ok(());
         }
-
-        // Failed → Pending resets allocation fields and makes the job
-        // schedulable again, but only once the backoff hold lapses: without it
-        // the next scheduler tick re-dispatches to the same node, which for a
-        // node-local fault burns the whole requeue budget in seconds.
-        self.propose(WalOperation::job_state_change_backoff_pending(
-            job_id,
-            JobState::Failed,
-            PendingReason::JobLaunchFailure,
-            begin_time,
-        ))?;
 
         info!(job_id, from = %old_state, hold_until = %begin_time, "job requeued after dispatch failure");
         Ok(())
@@ -1735,7 +3617,7 @@ impl ClusterManager {
         &self,
         job_id: JobId,
     ) -> anyhow::Result<()> {
-        let begin_time = {
+        let (submission_generation, begin_time) = {
             let jobs = self.jobs.read();
             let Some(job) = jobs.get(&job_id) else {
                 return Ok(());
@@ -1749,12 +3631,335 @@ impl ClusterManager {
                 drop(jobs);
                 return self.hold_job_at_max_requeue(job_id);
             }
-            self.launch_backoff_until(job)
+            (job.submission_generation, self.launch_backoff_until(job))
         };
 
-        self.propose(WalOperation::JobDispatchBackoff { job_id, begin_time })?;
+        self.propose(WalOperation::JobDispatchBackoff {
+            job_id,
+            submission_generation,
+            begin_time,
+        })?;
         info!(job_id, hold_until = %begin_time, "job's batch dispatch failed before it started; backing off");
         Ok(())
+    }
+
+    /// Durably remember node or GPU resources whose prolog reported temporary
+    /// external occupancy for this pending job. These scheduler-only placement
+    /// constraints expire at `retry_after`; no ordinary launch retry is
+    /// consumed because another resource may be usable immediately.
+    pub(crate) fn reject_transient_capacity(
+        &self,
+        job_id: JobId,
+        whole_nodes: Vec<String>,
+        gpu_ids: HashMap<String, Vec<u32>>,
+        retry_after: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        if whole_nodes.is_empty() && gpu_ids.is_empty() {
+            return Ok(());
+        }
+        let submission_generation = self
+            .get_job(job_id)
+            .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?
+            .submission_generation;
+        self.propose(WalOperation::JobTransientCapacityReject {
+            job_id,
+            submission_generation,
+            whole_nodes,
+            gpu_ids,
+            retry_after,
+        })?;
+        Ok(())
+    }
+
+    /// Reserve the next batch-dispatch epoch through Raft before touching any
+    /// worker. Failed/partial fanout leaves the job Pending but keeps this
+    /// monotonic epoch, so the next retry cannot reuse it.
+    pub(crate) fn begin_pending_dispatch(
+        self: &Arc<Self>,
+        job_id: JobId,
+        target_nodes: Vec<String>,
+        resources: ResourceAllocations,
+        per_node_alloc: HashMap<String, ResourceAllocations>,
+    ) -> anyhow::Result<(u32, ActiveDispatchGuard)> {
+        self.begin_dispatch_reservation(
+            job_id,
+            target_nodes,
+            resources,
+            per_node_alloc,
+            DispatchReservationKind::Batch,
+        )
+    }
+
+    pub(crate) fn begin_standalone_dispatch(
+        self: &Arc<Self>,
+        job_id: JobId,
+        target_nodes: Vec<String>,
+        resources: ResourceAllocations,
+        per_node_alloc: HashMap<String, ResourceAllocations>,
+    ) -> anyhow::Result<(HashMap<String, String>, ActiveDispatchGuard)> {
+        let (_, guard) = self.begin_dispatch_reservation(
+            job_id,
+            target_nodes,
+            resources,
+            per_node_alloc,
+            DispatchReservationKind::Standalone,
+        )?;
+        let target_incarnations = self
+            .get_job(job_id)
+            .and_then(|job| job.pending_dispatch)
+            .filter(|dispatch| dispatch.run_attempt == 0)
+            .map(|dispatch| dispatch.target_incarnations)
+            .ok_or_else(|| anyhow::anyhow!("job {} standalone reservation disappeared", job_id))?;
+        Ok((target_incarnations, guard))
+    }
+
+    fn begin_dispatch_reservation(
+        self: &Arc<Self>,
+        job_id: JobId,
+        target_nodes: Vec<String>,
+        resources: ResourceAllocations,
+        per_node_alloc: HashMap<String, ResourceAllocations>,
+        kind: DispatchReservationKind,
+    ) -> anyhow::Result<(u32, ActiveDispatchGuard)> {
+        let _reservation = self.dispatch_epoch_reservation.lock();
+        let mut unique_targets = target_nodes.clone();
+        unique_targets.sort();
+        unique_targets.dedup();
+        if target_nodes.is_empty() {
+            anyhow::bail!("job {} dispatch has no worker targets", job_id);
+        }
+        if unique_targets.len() != target_nodes.len()
+            || per_node_alloc.len() != target_nodes.len()
+            || target_nodes
+                .iter()
+                .any(|name| !per_node_alloc.contains_key(name))
+        {
+            anyhow::bail!("job {} dispatch allocation does not match targets", job_id);
+        }
+        let (submission_generation, expected_run_attempt, run_attempt) = {
+            let jobs = self.jobs.read();
+            let job = jobs
+                .get(&job_id)
+                .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+            if job.state != JobState::Pending {
+                anyhow::bail!("job {} cannot dispatch from state {:?}", job_id, job.state);
+            }
+            if let Some(dispatch) = &job.pending_dispatch {
+                anyhow::bail!(
+                    "job {} still has unresolved dispatch epoch {}",
+                    job_id,
+                    dispatch.run_attempt
+                );
+            }
+            let next = match kind {
+                DispatchReservationKind::Batch => job
+                    .run_attempt
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("job {} exhausted dispatch epochs", job_id))?,
+                DispatchReservationKind::Standalone => {
+                    if !job.spec.srun_job || job.run_attempt != 0 {
+                        anyhow::bail!(
+                            "job {} cannot reserve standalone attempt from epoch {}",
+                            job_id,
+                            job.run_attempt
+                        );
+                    }
+                    0
+                }
+            };
+            (job.submission_generation, job.run_attempt, next)
+        };
+        let target_incarnations = {
+            let nodes = self.nodes.read();
+            target_nodes
+                .iter()
+                .map(|name| {
+                    let node = nodes
+                        .get(name)
+                        .ok_or_else(|| anyhow::anyhow!("dispatch target {} not found", name))?;
+                    if node.incarnation.is_empty() {
+                        anyhow::bail!(
+                            "dispatch target {} has no registered worker incarnation",
+                            name
+                        );
+                    }
+                    Ok((name.clone(), node.incarnation.clone()))
+                })
+                .collect::<anyhow::Result<HashMap<_, _>>>()?
+        };
+        let term = self
+            .current_raft_term()
+            .ok_or_else(|| anyhow::anyhow!("job {} has no active Raft term", job_id))?;
+        let key = (job_id, submission_generation.to_string(), run_attempt);
+        let mut active_dispatches = self.active_dispatches.lock();
+        if active_dispatches.contains_key(&key) {
+            anyhow::bail!(
+                "job {} dispatch epoch {} is already active",
+                job_id,
+                run_attempt
+            );
+        }
+        active_dispatches.insert(key.clone(), term);
+        drop(active_dispatches);
+        let guard = ActiveDispatchGuard {
+            cluster: self.clone(),
+            key,
+            term,
+        };
+        let response = self.propose(WalOperation::JobDispatchBegin {
+            job_id,
+            submission_generation,
+            expected_run_attempt,
+            run_attempt,
+            target_nodes,
+            target_incarnations,
+            resources,
+            per_node_alloc,
+        });
+        let response = response?;
+        if !response.dispatch_begun {
+            anyhow::bail!("job {} dispatch reservation CAS did not apply", job_id);
+        }
+        Ok((run_attempt, guard))
+    }
+
+    pub(crate) fn dispatch_is_locally_active(
+        &self,
+        job_id: JobId,
+        submission_generation: &str,
+        run_attempt: u32,
+    ) -> bool {
+        self.current_raft_term().is_some_and(|term| {
+            self.active_dispatches.lock().get(&(
+                job_id,
+                submission_generation.to_string(),
+                run_attempt,
+            )) == Some(&term)
+        })
+    }
+
+    /// Put a matching intent into the irrevocable Aborting phase before any
+    /// external cancel RPC. If Commit won the Raft race first, this returns
+    /// false and the caller must not touch the workers.
+    pub(crate) fn authorize_pending_dispatch_abort(
+        &self,
+        job_id: JobId,
+        submission_generation: &str,
+        run_attempt: u32,
+    ) -> anyhow::Result<bool> {
+        let exact_generation = self
+            .get_job(job_id)
+            .and_then(|job| job.pending_dispatch)
+            .filter(|dispatch| {
+                dispatch.run_attempt == run_attempt
+                    && dispatch.submission_generation.to_string() == submission_generation
+            })
+            .ok_or_else(|| anyhow::anyhow!("job {} dispatch identity changed", job_id))?
+            .submission_generation;
+        let response = self.propose(WalOperation::JobDispatchAbortBegin {
+            job_id,
+            submission_generation: exact_generation,
+            run_attempt,
+        })?;
+        Ok(response.dispatch_abort_authorized)
+    }
+
+    /// Forget a durable fanout intent after every target ACKed cleanup. A
+    /// mismatched/stale clear is a deterministic no-op in WAL apply.
+    pub(crate) fn clear_pending_dispatch(
+        &self,
+        job_id: JobId,
+        submission_generation: &str,
+        run_attempt: u32,
+    ) -> anyhow::Result<()> {
+        let exact_generation = self
+            .get_job(job_id)
+            .and_then(|job| job.pending_dispatch)
+            .filter(|dispatch| {
+                dispatch.run_attempt == run_attempt
+                    && dispatch.submission_generation.to_string() == submission_generation
+            })
+            .ok_or_else(|| anyhow::anyhow!("job {} dispatch identity changed", job_id))?
+            .submission_generation;
+        let response = self.propose(WalOperation::JobDispatchClear {
+            job_id,
+            submission_generation: exact_generation,
+            run_attempt,
+        })?;
+        if !response.dispatch_cleared {
+            anyhow::bail!(
+                "job {} dispatch epoch {} was not cleared",
+                job_id,
+                run_attempt
+            );
+        }
+        // This intentionally preserves Spur's existing best-effort delivery
+        // semantics; worker cleanup safety does not depend on external sinks.
+        self.wake_finalization_reconciler(&response);
+        Ok(())
+    }
+
+    pub(crate) fn clear_dispatch_target(
+        &self,
+        job_id: JobId,
+        submission_generation: &str,
+        run_attempt: u32,
+        node_name: &str,
+    ) -> anyhow::Result<()> {
+        let current = self
+            .get_job(job_id)
+            .ok_or_else(|| anyhow::anyhow!("job {} disappeared", job_id))?;
+        if current.submission_generation.to_string() != submission_generation
+            || current.run_attempt != run_attempt
+        {
+            anyhow::bail!("job {} dispatch identity changed", job_id);
+        }
+        let Some(dispatch) = current.pending_dispatch else {
+            return Ok(());
+        };
+        if dispatch.submission_generation.to_string() != submission_generation
+            || dispatch.run_attempt != run_attempt
+        {
+            anyhow::bail!("job {} dispatch identity changed", job_id);
+        }
+        if !dispatch
+            .target_nodes
+            .iter()
+            .any(|target| target == node_name)
+        {
+            return Ok(());
+        }
+        let response = self.propose(WalOperation::JobDispatchTargetClear {
+            job_id,
+            submission_generation: dispatch.submission_generation,
+            run_attempt,
+            node_name: node_name.to_string(),
+        })?;
+        if response.dispatch_target_cleared {
+            return Ok(());
+        }
+        let cleared = self.get_job(job_id).is_some_and(|job| {
+            job.submission_generation.to_string() == submission_generation
+                && job.run_attempt == run_attempt
+                && job.pending_dispatch.as_ref().is_none_or(|dispatch| {
+                    dispatch.submission_generation.to_string() == submission_generation
+                        && dispatch.run_attempt == run_attempt
+                        && !dispatch
+                            .target_nodes
+                            .iter()
+                            .any(|target| target == node_name)
+                })
+        });
+        if cleared {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "job {} dispatch epoch {} target {} was not cleared",
+                job_id,
+                run_attempt,
+                node_name
+            )
+        }
     }
 
     /// Instant until which a job requeued after a launch failure is held. A user
@@ -1773,8 +3978,8 @@ impl ClusterManager {
     }
 
     /// Evict a running job to NodeFail: frees allocations and feeds the
-    /// existing auto-requeue path in `notify_job_finished`, same as the
-    /// health-check path (`evict_jobs_on_node`) that runs when an entire
+    /// durable auto-requeue finalization path, same as the health-check path
+    /// (`evict_jobs_on_node`) that runs when an entire
     /// node goes Down, but scoped to a single job. Unlike the health-check
     /// path, this does not by itself cancel the job on nodes that *did*
     /// launch it — a caller evicting a job with launched-but-unconfirmed
@@ -1809,11 +4014,12 @@ impl ClusterManager {
             }
         }
         let resp = self.propose(WalOperation::JobEvict { job_id, detail })?;
-        self.run_all_finalized_side_effects(&resp);
+        self.wake_finalization_reconciler(&resp);
         Ok(())
     }
 
     /// Register a node agent.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn register_node(
         &self,
@@ -1827,11 +4033,51 @@ impl ClusterManager {
         source: NodeSource,
         labels: HashMap<String, String>,
     ) -> anyhow::Result<()> {
+        self.register_node_exact(
+            name,
+            hostname,
+            resources,
+            address,
+            port,
+            wg_pubkey,
+            version,
+            source,
+            labels,
+            String::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_node_exact(
+        &self,
+        name: String,
+        hostname: String,
+        resources: ResourceSet,
+        address: String,
+        port: u16,
+        wg_pubkey: String,
+        version: String,
+        source: NodeSource,
+        labels: HashMap<String, String>,
+        incarnation: String,
+    ) -> anyhow::Result<()> {
         let hostname = if hostname.is_empty() {
             name.clone()
         } else {
             hostname
         };
+        if let Some(existing) = self.get_node(&name) {
+            if existing.incarnation != incarnation
+                && self.node_execution_owned_by_incarnation(&name, &existing.incarnation)
+            {
+                anyhow::bail!(
+                    "node {} incarnation {} still owns an execution; refusing replacement {}",
+                    name,
+                    existing.incarnation,
+                    incarnation
+                );
+            }
+        }
         let action = {
             let nodes = self.nodes.read();
             evaluate_registration(nodes.get(&name), &resources)
@@ -1843,16 +4089,19 @@ impl ClusterManager {
                 self.sync_node_labels(&name, labels)?;
                 if let Some(existing) = self.get_node(&name) {
                     let needs_update = existing.address.as_deref() != Some(address.as_str())
+                        || existing.incarnation != incarnation
                         || existing.hostname != hostname
                         || existing.port != port
+                        || existing.source != source
                         || (!wg_pubkey.is_empty()
                             && existing.wg_pubkey.as_deref() != Some(wg_pubkey.as_str()))
                         || (!version.is_empty()
                             && existing.version.as_deref() != Some(version.as_str()));
                     if needs_update {
-                        self.propose(WalOperation::NodeUpdate {
+                        let response = self.propose(WalOperation::NodeUpdate {
                             name: name.clone(),
                             hostname: hostname.clone(),
+                            incarnation: incarnation.clone(),
                             resources: existing.total_resources.clone(),
                             address,
                             port,
@@ -1860,19 +4109,18 @@ impl ClusterManager {
                             version,
                             source: source.clone(),
                         })?;
-                        info!(node = %name, "node comm address or metadata updated");
-                    }
-                    if existing.source != source {
-                        if let Some(node) = self.nodes.write().get_mut(&name) {
-                            node.source = source;
+                        if !response.node_registration_accepted {
+                            anyhow::bail!("node {} registration lost an ownership race", name);
                         }
+                        info!(node = %name, "node comm address or metadata updated");
                     }
                 }
             }
             RegistrationAction::Update => {
-                self.propose(WalOperation::NodeUpdate {
+                let response = self.propose(WalOperation::NodeUpdate {
                     name: name.clone(),
                     hostname: hostname.clone(),
+                    incarnation: incarnation.clone(),
                     resources,
                     address,
                     port,
@@ -1880,16 +4128,17 @@ impl ClusterManager {
                     version,
                     source: source.clone(),
                 })?;
-                self.sync_node_labels(&name, labels)?;
-                if let Some(node) = self.nodes.write().get_mut(&name) {
-                    node.source = source;
+                if !response.node_registration_accepted {
+                    anyhow::bail!("node {} registration lost an ownership race", name);
                 }
+                self.sync_node_labels(&name, labels)?;
                 info!(node = %name, "node updated (resources changed)");
             }
             RegistrationAction::Register => {
-                self.propose(WalOperation::NodeRegister {
+                let response = self.propose(WalOperation::NodeRegister {
                     name: name.clone(),
                     hostname: hostname.clone(),
+                    incarnation,
                     resources,
                     address,
                     port,
@@ -1898,14 +4147,38 @@ impl ClusterManager {
                     labels,
                     source: source.clone(),
                 })?;
-                if let Some(node) = self.nodes.write().get_mut(&name) {
-                    node.source = source;
-                    node.agent_start_time = Some(Utc::now());
+                if !response.node_registration_accepted {
+                    anyhow::bail!("node {} registration was rejected", name);
                 }
                 info!(node = %name, "node registered");
             }
         }
         Ok(())
+    }
+
+    fn node_execution_owned_by_incarnation(&self, node_name: &str, incarnation: &str) -> bool {
+        Self::jobs_own_node_incarnation(&self.jobs.read(), node_name, incarnation)
+    }
+
+    fn jobs_own_node_incarnation(
+        jobs: &HashMap<JobId, Job>,
+        node_name: &str,
+        incarnation: &str,
+    ) -> bool {
+        jobs.values().any(|job| {
+            job.pending_dispatch.as_ref().is_some_and(|dispatch| {
+                dispatch
+                    .target_incarnations
+                    .get(node_name)
+                    .map(String::as_str)
+                    == Some(incarnation)
+            }) || (job.state.is_active()
+                && job
+                    .allocated_node_incarnations
+                    .get(node_name)
+                    .map(String::as_str)
+                    == Some(incarnation))
+        })
     }
 
     /// Sync node labels if they differ from the expected set.
@@ -1916,6 +4189,9 @@ impl ClusterManager {
         new_labels: HashMap<String, String>,
     ) -> anyhow::Result<()> {
         if let Some(existing) = self.get_node(node_name) {
+            if self.node_execution_owned_by_incarnation(node_name, &existing.incarnation) {
+                return Ok(());
+            }
             if existing.labels != new_labels {
                 let remove: Vec<String> = existing
                     .labels
@@ -1939,9 +4215,18 @@ impl ClusterManager {
     /// Returns `true` if the node was found, `false` if unknown.
     /// State recovery is handled separately by `check_node_health`, which
     /// detects the fresh `last_heartbeat` and proposes a WAL-backed transition.
-    pub fn update_heartbeat(&self, name: &str, cpu_load: u32, free_memory_mb: u64) -> bool {
+    pub fn update_heartbeat_exact(
+        &self,
+        name: &str,
+        incarnation: &str,
+        cpu_load: u32,
+        free_memory_mb: u64,
+    ) -> bool {
         let mut nodes = self.nodes.write();
-        if let Some(node) = nodes.get_mut(name) {
+        if let Some(node) = nodes
+            .get_mut(name)
+            .filter(|node| node.incarnation == incarnation)
+        {
             node.cpu_load = cpu_load;
             node.free_memory_mb = free_memory_mb;
             node.last_heartbeat = Some(Utc::now());
@@ -2135,7 +4420,7 @@ impl ClusterManager {
 
     /// Hold a job that exhausted automatic requeues (`JobHoldMaxRequeue`).
     fn hold_job_at_max_requeue(&self, job_id: JobId) -> anyhow::Result<()> {
-        let mut state = {
+        let state = {
             let jobs = self.jobs.read();
             let job = jobs
                 .get(&job_id)
@@ -2144,12 +4429,15 @@ impl ClusterManager {
         };
 
         if state == JobState::Running {
-            self.propose(WalOperation::JobComplete {
+            let resp = self.propose(WalOperation::JobComplete {
                 job_id,
                 exit_code: -1,
                 state: JobState::Failed,
+                finalization_intent: Some(FinalizationIntent::AutoRequeue),
             })?;
-            state = JobState::Failed;
+            self.wake_finalization_reconciler(&resp);
+            info!(job_id, "job finalization will hold at max requeue limit");
+            return Ok(());
         }
 
         if matches!(
@@ -2345,7 +4633,7 @@ impl ClusterManager {
         state: NodeState,
         reason: Option<String>,
     ) -> anyhow::Result<()> {
-        let (old_state, effective_state) = {
+        let (old_state, effective_state, expected_incarnation) = {
             let nodes = self.nodes.read();
             let node = nodes
                 .get(name)
@@ -2362,7 +4650,7 @@ impl ClusterManager {
             } else {
                 requested
             };
-            (old, effective)
+            (old, effective, node.incarnation.clone())
         };
 
         // Admin-initiated state changes that move into a hold state are
@@ -2370,14 +4658,70 @@ impl ClusterManager {
         // Resuming to Idle clears the lock.
         let admin_locked = effective_state.is_admin_hold();
 
-        self.propose(WalOperation::NodeStateChange {
+        let response = self.propose(WalOperation::NodeStateChange {
             name: name.to_string(),
+            expected_incarnation,
             old_state,
             new_state: effective_state,
             reason,
             admin_locked,
         })?;
+        if !response.node_state_changed {
+            anyhow::bail!(
+                "node '{}' changed while its state update was committing",
+                name
+            );
+        }
         info!(node = %name, old = ?old_state, new = ?effective_state, "node state updated");
+        Ok(())
+    }
+
+    /// Apply an asynchronous node-state observation only to the worker object
+    /// that produced it. Both incarnation and observed old state are checked in
+    /// replicated apply so a delayed event cannot mutate a same-name replacement.
+    pub fn update_node_state_exact(
+        &self,
+        name: &str,
+        expected_incarnation: &str,
+        state: NodeState,
+        reason: Option<String>,
+    ) -> anyhow::Result<()> {
+        let (old_state, effective_state) = {
+            let nodes = self.nodes.read();
+            let node = nodes
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("node {} not found", name))?;
+            if node.incarnation != expected_incarnation {
+                anyhow::bail!("node '{}' worker incarnation is stale", name);
+            }
+            let requested = node
+                .state
+                .transition(&NodeEvent::AdminSetState(state), node.admin_locked)
+                .unwrap_or(state);
+            let effective = if requested == NodeState::Drain
+                && (node.alloc_resources.cpus > 0 || node.alloc_resources.has_devices())
+            {
+                NodeState::Draining
+            } else {
+                requested
+            };
+            (node.state, effective)
+        };
+        let response = self.propose(WalOperation::NodeStateChangeExact {
+            name: name.to_string(),
+            expected_incarnation: expected_incarnation.to_string(),
+            expected_old_state: Some(old_state),
+            new_state: effective_state,
+            reason,
+            admin_locked: effective_state.is_admin_hold(),
+        })?;
+        if !response.node_state_changed {
+            anyhow::bail!(
+                "node '{}' exact state update lost an incarnation race",
+                name
+            );
+        }
+        info!(node = %name, old = ?old_state, new = ?effective_state, %expected_incarnation, "exact node state updated");
         Ok(())
     }
 
@@ -2573,23 +4917,28 @@ impl ClusterManager {
             match action {
                 HealthAction::MarkDown {
                     name,
+                    incarnation,
                     old_state,
                     admin_locked,
                 } => {
-                    warn!(node = %name, "node marked DOWN (heartbeat timeout)");
-                    match self.propose(WalOperation::NodeStateChange {
+                    match self.propose(WalOperation::NodeStateChangeExact {
                         name: name.clone(),
-                        old_state,
+                        expected_incarnation: incarnation,
+                        expected_old_state: Some(old_state),
                         new_state: NodeState::Down,
                         reason: Some("Not responding".into()),
                         admin_locked,
                     }) {
                         Ok(resp) => {
+                            if !resp.node_state_changed {
+                                continue;
+                            }
+                            warn!(node = %name, "node marked DOWN (heartbeat timeout)");
                             // A node that stopped heartbeating won't refresh its k0s unit gauge, so
                             // reflect the unreachable unit as down rather than leaving a stale 1.
                             self.k8s_metrics
                                 .set_node_up(&self.config().cluster_name, &name, false);
-                            self.run_all_finalized_side_effects(&resp);
+                            self.wake_finalization_reconciler(&resp);
                             evicted.extend(resp.jobs_finalized);
                         }
                         Err(e) => {
@@ -2598,17 +4947,25 @@ impl ClusterManager {
                         }
                     }
                 }
-                HealthAction::Recover { name, old_state } => {
-                    let recovered_state = recovered_node_state(self.get_node(&name).as_ref());
-                    info!(node = %name, state = ?recovered_state, "node recovered (heartbeat resumed)");
-                    if let Err(e) = self.propose(WalOperation::NodeStateChange {
-                        name,
-                        old_state,
+                HealthAction::Recover {
+                    name,
+                    incarnation,
+                    old_state,
+                    recovered_state,
+                } => {
+                    match self.propose(WalOperation::NodeStateChangeExact {
+                        name: name.clone(),
+                        expected_incarnation: incarnation,
+                        expected_old_state: Some(old_state),
                         new_state: recovered_state,
                         reason: None,
                         admin_locked: false,
                     }) {
-                        warn!(error = %e, "failed to propose node recovery");
+                        Ok(response) if response.node_state_changed => {
+                            info!(node = %name, state = ?recovered_state, "node recovered (heartbeat resumed)");
+                        }
+                        Ok(_) => {}
+                        Err(e) => warn!(error = %e, "failed to propose node recovery"),
                     }
                 }
             }
@@ -2623,7 +4980,7 @@ impl ClusterManager {
         name: &str,
         reason: Option<String>,
     ) -> anyhow::Result<(NodeState, u32)> {
-        let (old_state, running_count) = {
+        let (old_state, running_count, expected_incarnation) = {
             // Lock order is jobs before nodes, matching apply_operation. Taking
             // nodes first deadlocks against a raft apply that already holds jobs
             // and is waiting on nodes: parking_lot queues writers ahead of new
@@ -2637,28 +4994,69 @@ impl ClusterManager {
                 .ok_or_else(|| anyhow::anyhow!("node '{}' not found", name))?;
             let count = jobs
                 .values()
-                .filter(|j| {
-                    matches!(
-                        j.state,
-                        JobState::Running | JobState::Completing | JobState::Suspended
-                    ) && j.allocated_nodes.iter().any(|n| n == name)
-                })
+                .filter(|job| execution_owns_node(job, name))
                 .count() as u32;
-            (node.state, count)
+            (node.state, count, node.incarnation.clone())
         };
         let target_state = if running_count > 0 {
             NodeState::Draining
         } else {
             NodeState::Drain
         };
-        self.propose(WalOperation::NodeStateChange {
+        let response = self.propose(WalOperation::NodeStateChange {
             name: name.to_string(),
+            expected_incarnation,
             old_state,
             new_state: target_state,
             reason,
             admin_locked: true,
         })?;
+        if !response.node_state_changed {
+            anyhow::bail!("node '{}' changed while its drain was committing", name);
+        }
         info!(node = %name, state = %target_state, "node drain requested");
+        Ok((target_state, running_count))
+    }
+
+    pub fn drain_node_exact(
+        &self,
+        name: &str,
+        expected_incarnation: &str,
+        reason: Option<String>,
+    ) -> anyhow::Result<(NodeState, u32)> {
+        let (target_state, running_count) = {
+            let jobs = self.jobs.read();
+            let nodes = self.nodes.read();
+            let node = nodes
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("node '{}' not found", name))?;
+            if node.incarnation != expected_incarnation {
+                anyhow::bail!("node '{}' worker incarnation is stale", name);
+            }
+            let running_count = jobs
+                .values()
+                .filter(|job| execution_owns_node(job, name))
+                .count() as u32;
+            (
+                if running_count > 0 {
+                    NodeState::Draining
+                } else {
+                    NodeState::Drain
+                },
+                running_count,
+            )
+        };
+        let response = self.propose(WalOperation::NodeStateChangeExact {
+            name: name.to_string(),
+            expected_incarnation: expected_incarnation.to_string(),
+            expected_old_state: None,
+            new_state: target_state,
+            reason,
+            admin_locked: true,
+        })?;
+        if !response.node_state_changed {
+            anyhow::bail!("node '{}' exact drain lost an incarnation race", name);
+        }
         Ok((target_state, running_count))
     }
 
@@ -2670,20 +5068,29 @@ impl ClusterManager {
         force: bool,
         reason: Option<String>,
     ) -> anyhow::Result<Vec<JobFinalized>> {
-        {
+        let expected_incarnation = {
             let nodes = self.nodes.read();
-            if !nodes.contains_key(name) {
-                anyhow::bail!("node '{}' not found", name);
-            }
+            nodes
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("node '{}' not found", name))?
+                .incarnation
+                .clone()
+        };
+        if !force
+            && self.jobs.read().values().any(|job| {
+                job.pending_dispatch
+                    .as_ref()
+                    .is_some_and(|dispatch| dispatch.target_nodes.iter().any(|node| node == name))
+            })
+        {
+            anyhow::bail!(
+                "node '{}' is reserved by an unresolved dispatch; reconcile it before removal",
+                name
+            );
         }
         if !force {
             let jobs = self.jobs.read();
-            let has_running = jobs.values().any(|j| {
-                matches!(
-                    j.state,
-                    JobState::Running | JobState::Completing | JobState::Suspended
-                ) && j.allocated_nodes.iter().any(|n| n == name)
-            });
+            let has_running = jobs.values().any(|job| execution_owns_node(job, name));
             if has_running {
                 anyhow::bail!(
                     "node '{}' has running jobs; use --force to evict them",
@@ -2694,12 +5101,38 @@ impl ClusterManager {
 
         let resp = self.propose(WalOperation::NodeRemove {
             name: name.to_string(),
+            expected_incarnation,
             reason,
         })?;
+        if !resp.node_removed {
+            anyhow::bail!(
+                "node '{}' was not removed (it may be targeted by an unresolved dispatch)",
+                name
+            );
+        }
         self.k8s_metrics
             .remove_node(&self.config().cluster_name, name);
-        self.run_all_finalized_side_effects(&resp);
+        self.wake_finalization_reconciler(&resp);
         Ok(resp.jobs_finalized)
+    }
+
+    pub fn remove_node_exact(
+        &self,
+        name: &str,
+        expected_incarnation: &str,
+        reason: Option<String>,
+    ) -> anyhow::Result<()> {
+        let response = self.propose(WalOperation::NodeRemoveExact {
+            name: name.to_string(),
+            expected_incarnation: expected_incarnation.to_string(),
+            reason,
+        })?;
+        if !response.node_removed {
+            anyhow::bail!("node '{}' exact deregistration was rejected", name);
+        }
+        self.k8s_metrics
+            .remove_node(&self.config().cluster_name, name);
+        Ok(())
     }
 
     /// Create a job step durably via Raft.
@@ -2719,11 +5152,25 @@ impl ClusterManager {
     pub fn record_step_complete(
         &self,
         job_id: JobId,
+        submission_generation: &str,
+        run_attempt: u32,
         step_id: u32,
         exit_code: i32,
     ) -> anyhow::Result<()> {
+        let exact_generation = self
+            .steps
+            .read()
+            .get(&(job_id, step_id))
+            .filter(|step| {
+                step.run_attempt == run_attempt
+                    && step.submission_generation.to_string() == submission_generation
+            })
+            .ok_or_else(|| anyhow::anyhow!("job {} step {} identity changed", job_id, step_id))?
+            .submission_generation;
         self.propose(WalOperation::JobStepComplete {
             job_id,
+            submission_generation: exact_generation,
+            run_attempt,
             step_id,
             exit_code,
         })?;
@@ -2760,7 +5207,7 @@ impl ClusterManager {
         let now = Utc::now();
         let running_array_counts: HashMap<JobId, u32> = jobs
             .values()
-            .filter(|job| job.state == JobState::Running)
+            .filter(|job| holds_admission_capacity(job))
             .filter_map(|job| job.spec.array_job_id)
             .fold(HashMap::new(), |mut counts, array_id| {
                 *counts.entry(array_id).or_insert(0) += 1;
@@ -2769,6 +5216,11 @@ impl ClusterManager {
         let mut candidates: Vec<PendingJobCandidate> = jobs
             .values()
             .filter(|job| job.state == JobState::Pending)
+            // A pre-commit fanout already owns exact provisional capacity and
+            // is recovered by the dedicated reconciler. Never classify it for
+            // scheduling/preemption until cleanup durably clears the intent.
+            .filter(|job| job.pending_dispatch.is_none())
+            .filter(|job| job.pending_finalization.is_none())
             .filter(|job| !job.pending_reason.is_scheduling_hold())
             .filter_map(|job| {
                 let before_begin_time = job.spec.begin_time.is_some_and(|begin| now < begin);
@@ -2978,15 +5430,12 @@ impl ClusterManager {
         }
     }
 
-    /// Licenses held by jobs actively occupying resources
-    /// (Running/Suspended/Completing). Pending and terminal jobs hold none.
+    /// Licenses held by visible active jobs and pre-commit fanouts that may
+    /// already be executing. Ordinary Pending and terminal jobs hold none.
     fn licenses_in_use(jobs: &HashMap<JobId, Job>) -> HashMap<String, u64> {
         let mut used: HashMap<String, u64> = HashMap::new();
         for job in jobs.values() {
-            if matches!(
-                job.state,
-                JobState::Running | JobState::Suspended | JobState::Completing
-            ) {
+            if holds_admission_capacity(job) {
                 for (lic, n) in extract_license_requirements(&job.spec) {
                     *used.entry(lic).or_insert(0) += n;
                 }
@@ -3028,10 +5477,14 @@ impl ClusterManager {
     fn bb_capacity_in_use(jobs: &HashMap<JobId, Job>) -> u64 {
         let mut used = 0u64;
         for job in jobs.values() {
-            let holds = match job.state {
-                JobState::Running | JobState::Suspended | JobState::Completing => true,
-                JobState::Pending => job.bb_stage_state != BbStageState::None,
-                _ => false,
+            let holds = if job.pending_dispatch.is_some() {
+                true
+            } else {
+                match job.state {
+                    JobState::Running | JobState::Suspended | JobState::Completing => true,
+                    JobState::Pending => job.bb_stage_state != BbStageState::None,
+                    _ => false,
+                }
             };
             if holds {
                 used = used.saturating_add(extract_bb_requirement(&job.spec));
@@ -3219,9 +5672,10 @@ impl ClusterManager {
                 job_id: id,
                 exit_code: -1,
                 state: JobState::Cancelled,
+                finalization_intent: None,
             }) {
                 Ok(resp) => {
-                    self.run_all_finalized_side_effects(&resp);
+                    self.wake_finalization_reconciler(&resp);
                     info!(job_id = id, "job cancelled: dependency never satisfied");
                     cancelled.push(id);
                 }
@@ -3383,10 +5837,7 @@ impl ClusterManager {
             )));
         }
         for job in self.jobs.read().values() {
-            if !matches!(
-                job.state,
-                JobState::Running | JobState::Completing | JobState::Suspended
-            ) {
+            if !holds_admission_capacity(job) {
                 continue;
             }
             if job.spec.partition.as_deref() == Some(name) {
@@ -3678,10 +6129,7 @@ impl ClusterManager {
         }
 
         for job in self.jobs.read().values() {
-            if !matches!(
-                job.state,
-                JobState::Running | JobState::Completing | JobState::Suspended
-            ) {
+            if !holds_admission_capacity(job) {
                 continue;
             }
             if job.spec.reservation.as_deref() == Some(name) {
@@ -3711,10 +6159,8 @@ impl ClusterManager {
             .collect();
         for name in expired {
             let in_use = self.jobs.read().values().any(|job| {
-                matches!(
-                    job.state,
-                    JobState::Running | JobState::Completing | JobState::Suspended
-                ) && job.spec.reservation.as_deref() == Some(name.as_str())
+                holds_admission_capacity(job)
+                    && job.spec.reservation.as_deref() == Some(name.as_str())
             });
             if in_use {
                 continue;
@@ -3753,6 +6199,8 @@ impl ClusterManager {
             .iter()
             .filter(|(id, j)| {
                 j.state.is_finalized()
+                    && j.pending_dispatch.is_none()
+                    && j.pending_finalization.is_none()
                     && j.end_time.is_some_and(|t| t < before)
                     && !referenced.contains(id)
                     && j.spec.array_job_id.is_none_or(|p| !referenced.contains(&p))
@@ -4066,93 +6514,32 @@ impl ClusterManager {
         }
     }
 
-    /// Send a job event notification via webhook (if configured).
-    ///
-    /// Uses `curl` as a subprocess to avoid pulling in an HTTP client dependency.
-    fn send_notification(&self, job_id: JobId, event: &str, spec: &JobSpec) {
+    /// Queue an ordinary best-effort job notification.
+    fn send_notification(&self, job_id: JobId, run_attempt: u32, event: &str, spec: &JobSpec) {
         let config = self.config();
-        let webhook_url = config.notifications.webhook_url.clone();
-        if let Some(url) = webhook_url {
-            let event = event.to_string();
-            let user = spec.user.clone();
-            let mail_user = spec.mail_user.clone();
-            let job_name = spec.name.clone();
-            tokio::spawn(async move {
-                let payload = serde_json::json!({
-                    "job_id": job_id,
-                    "event": event,
-                    "job_name": job_name,
-                    "user": user,
-                    "mail_user": mail_user,
-                });
-                let payload_str = payload.to_string();
-                match tokio::process::Command::new("curl")
-                    .args([
-                        "-s",
-                        "-X",
-                        "POST",
-                        "-H",
-                        "Content-Type: application/json",
-                        "-d",
-                        &payload_str,
-                        &url,
-                    ])
-                    .output()
-                    .await
-                {
-                    Ok(output) => {
-                        if !output.status.success() {
-                            tracing::warn!(
-                                job_id,
-                                %event,
-                                "notification webhook returned non-zero exit"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            job_id,
-                            %event,
-                            error = %e,
-                            "failed to send notification webhook"
-                        );
-                    }
-                }
-            });
-        }
+        let delivery = notification_delivery(&config, job_id, run_attempt, event, spec);
+        tokio::spawn(deliver_job_notification(delivery));
+    }
 
-        // SMTP email notification via sendmail-compatible command
-        if let Some(ref smtp_cmd) = config.notifications.smtp_command {
-            let from = config
-                .notifications
-                .from_address
-                .as_deref()
-                .unwrap_or("spur@localhost");
-            let user = spec.user.clone();
-            let mail_user = spec.mail_user.clone();
-            let to = mail_user.as_deref().unwrap_or(&user).to_string();
-            let subject = format!("Spur Job {}: {}", job_id, event);
-            let body = format!("Job ID: {}\nEvent: {}\nUser: {}\n", job_id, event, user);
-            let email = format!(
-                "From: {}\nTo: {}\nSubject: {}\n\n{}",
-                from, to, subject, body
-            );
-
-            let smtp_cmd = smtp_cmd.clone();
-            tokio::spawn(async move {
-                let mut child = tokio::process::Command::new("sh")
-                    .args(["-c", &smtp_cmd])
-                    .stdin(std::process::Stdio::piped())
-                    .spawn();
-                if let Ok(ref mut child) = child {
-                    if let Some(ref mut stdin) = child.stdin.take() {
-                        use tokio::io::AsyncWriteExt;
-                        let _ = stdin.write_all(email.as_bytes()).await;
-                    }
-                    let _ = child.wait().await;
-                }
-            });
-        }
+    /// Await the bounded BEGIN attempt before publishing Running. Failure is
+    /// logged by the delivery helper and never makes sink availability part of
+    /// scheduling correctness.
+    async fn send_notification_ordered(
+        &self,
+        job_id: JobId,
+        run_attempt: u32,
+        event: &str,
+        spec: &JobSpec,
+    ) {
+        let config = self.config();
+        deliver_job_notification(notification_delivery(
+            &config,
+            job_id,
+            run_attempt,
+            event,
+            spec,
+        ))
+        .await;
     }
 
     pub fn set_raft(&self, raft: SpurRaft) {
@@ -4160,7 +6547,12 @@ impl ClusterManager {
     }
 
     pub fn set_accounting(&self, notifier: AccountingNotifier) {
-        *self.accounting.write() = Some(notifier);
+        *self.accounting.write() = Some(Arc::new(notifier));
+    }
+
+    #[cfg(test)]
+    fn set_accounting_sink(&self, sink: Arc<dyn AccountingSink>) {
+        *self.accounting.write() = Some(sink);
     }
 
     pub fn set_sched_stats(&self, stats: Arc<SchedStatsCollector>) {
@@ -4252,8 +6644,163 @@ impl ClusterManager {
         }
     }
 
+    fn record_node_completion_locked(
+        job_id: JobId,
+        job: &mut Job,
+        node_name: &str,
+        completion: spur_core::job::NodeCompletion,
+        timestamp: DateTime<Utc>,
+        finalization: Option<&DurableFinalizationContext>,
+    ) -> Option<JobFinalized> {
+        job.node_completions
+            .insert(node_name.to_string(), completion);
+        if matches!(job.state, JobState::Running | JobState::Suspended) {
+            if let Err(error) = job.transition(JobState::Completing) {
+                warn!(job_id, %error, "invalid transition to Completing");
+            }
+            job.end_time = Some(timestamp);
+        }
+        if !job.all_nodes_completed() {
+            return None;
+        }
+
+        let primary = job.allocated_nodes.first().cloned().unwrap_or_default();
+        let oom = job
+            .node_completions
+            .values()
+            .any(|completion| completion.signal & spur_core::job::OOM_SIGNAL_FLAG != 0);
+        let (derived_state, final_exit, raw_signal) =
+            Job::derived_completion(&job.node_completions, &primary);
+        let final_signal = raw_signal & !spur_core::job::OOM_SIGNAL_FLAG;
+        let (final_state, final_reason) =
+            job.completion_verdict(derived_state, final_exit, final_signal, oom);
+        if let Err(error) = job.transition(final_state) {
+            warn!(job_id, %error, "invalid final completion transition");
+            return None;
+        }
+        job.exit_code = Some(final_exit);
+        job.exit_signal = final_signal;
+        job.set_pending_reason(final_reason);
+        job.end_time = Some(timestamp);
+        job.node_completions.clear();
+        Some(Self::record_pending_finalization(
+            job,
+            FinalizationIntent::for_terminal_state(final_state),
+            finalization,
+        ))
+    }
+
+    /// Apply a completion for a run without retained dispatch ownership.
+    fn apply_node_completion_locked(
+        job_id: JobId,
+        job: &mut Job,
+        nodes: &mut HashMap<String, Node>,
+        node_name: &str,
+        completion: spur_core::job::NodeCompletion,
+        timestamp: DateTime<Utc>,
+        finalization: Option<&DurableFinalizationContext>,
+    ) -> Option<JobFinalized> {
+        if !job.node_completions.contains_key(node_name) {
+            if let Some(ref total) = job.allocated_resources {
+                let node_count = job.allocated_nodes.len().max(1) as u32;
+                if let Some(node) = nodes.get_mut(node_name) {
+                    let slice = job.per_node_alloc.get(node_name).cloned().unwrap_or_else(|| {
+                        warn!(job_id, node = %node_name, "per_node_alloc missing at node deallocation, using scalar fallback");
+                        ResourceAllocations::with_scalar(
+                            total.cpus / node_count,
+                            total.memory_mb / node_count as u64,
+                        )
+                    });
+                    node.alloc_resources.subtract(&slice);
+                    node.update_state_from_alloc();
+                    if node.state == NodeState::Draining
+                        && node.alloc_resources.cpus == 0
+                        && !node.alloc_resources.has_devices()
+                    {
+                        node.state = NodeState::Drain;
+                    }
+                }
+            }
+        }
+        Self::record_node_completion_locked(
+            job_id,
+            job,
+            node_name,
+            completion,
+            timestamp,
+            finalization,
+        )
+    }
+
+    /// Release one exact target from the durable ownership record.
+    fn release_owned_target_locked(
+        job_id: JobId,
+        job: &mut Job,
+        nodes: &mut HashMap<String, Node>,
+        node_name: &str,
+    ) -> bool {
+        let Some(dispatch) = job.pending_dispatch.as_ref() else {
+            return false;
+        };
+        let Some(slice) = dispatch.per_node_alloc.get(node_name).cloned() else {
+            return false;
+        };
+        let Some(node) = nodes.get(node_name) else {
+            warn!(job_id, node = %node_name, "owned completion target disappeared");
+            return false;
+        };
+        if !allocation_contains(&node.alloc_resources, &slice) {
+            warn!(job_id, node = %node_name, "owned completion slice is missing");
+            return false;
+        }
+
+        let node = nodes
+            .get_mut(node_name)
+            .expect("owned completion target was validated");
+        node.alloc_resources.subtract(&slice);
+        node.update_state_from_alloc();
+        if node.state == NodeState::Draining
+            && node.alloc_resources.cpus == 0
+            && !node.alloc_resources.has_devices()
+        {
+            node.state = NodeState::Drain;
+        }
+
+        let dispatch = job
+            .pending_dispatch
+            .as_mut()
+            .expect("dispatch ownership was validated");
+        dispatch.target_nodes.retain(|name| name != node_name);
+        dispatch.target_incarnations.remove(node_name);
+        dispatch.per_node_alloc.remove(node_name);
+        dispatch.early_completions.remove(node_name);
+        dispatch.resources.subtract(&slice);
+        true
+    }
+
+    fn apply_completion_drain_locked(
+        nodes: &mut HashMap<String, Node>,
+        node_name: &str,
+        drain_reason: &Option<String>,
+    ) {
+        let Some(reason) = drain_reason.as_ref() else {
+            return;
+        };
+        let Some(node) = nodes.get_mut(node_name) else {
+            return;
+        };
+        node.state = if node.alloc_resources.cpus == 0 && !node.alloc_resources.has_devices() {
+            NodeState::Drain
+        } else {
+            NodeState::Draining
+        };
+        node.state_reason = Some(reason.clone());
+        node.admin_locked = true;
+    }
+
     #[allow(clippy::result_large_err)]
     fn propose(&self, op: WalOperation) -> anyhow::Result<ClientResponse> {
+        let op = self.prepare_durable_finalization(op)?;
         let raft = self
             .raft
             .read()
@@ -4266,6 +6813,238 @@ impl ClusterManager {
         .map_err(|e| anyhow::anyhow!("raft propose failed: {}", e))
     }
 
+    /// Wrap every new terminal-capable proposal in an explicit format epoch.
+    /// Unwrapped operations exist only for replay of a pre-outbox WAL (and for
+    /// focused compatibility tests that call `apply_operation` directly).
+    fn prepare_durable_finalization(&self, op: WalOperation) -> anyhow::Result<WalOperation> {
+        if let WalOperation::DurableFinalization { operation, .. } = &op {
+            if matches!(operation.as_ref(), WalOperation::DurableFinalization { .. }) {
+                anyhow::bail!("nested durable-finalization WAL envelope");
+            }
+            return Ok(op);
+        }
+
+        if matches!(
+            &op,
+            WalOperation::JobStateChange { new_state, .. } if new_state.is_finalized()
+        ) {
+            anyhow::bail!("terminal JobStateChange bypasses durable finalization");
+        }
+
+        let context = match &op {
+            WalOperation::JobComplete { job_id, .. }
+            | WalOperation::JobTimeLimitSignaled { job_id, .. }
+            | WalOperation::JobPreemptRequeue { job_id, .. }
+            | WalOperation::JobEvict { job_id, .. } => {
+                let (generation, attempt, targets, known) = {
+                    let jobs = self.jobs.read();
+                    let job = jobs
+                        .get(job_id)
+                        .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+                    let (targets, known) = Self::finalization_ownership(job);
+                    (job.submission_generation, job.run_attempt, targets, known)
+                };
+                Some(self.finalization_context_for_execution(
+                    generation,
+                    attempt,
+                    &targets,
+                    &known,
+                    Utc::now(),
+                ))
+            }
+            WalOperation::JobNodeComplete {
+                job_id,
+                submission_generation,
+                run_attempt,
+                ..
+            }
+            | WalOperation::JobDispatchPublish {
+                job_id,
+                submission_generation,
+                run_attempt,
+                ..
+            } => {
+                let (targets, known) = self
+                    .jobs
+                    .read()
+                    .get(job_id)
+                    .map(Self::finalization_ownership)
+                    .unwrap_or_default();
+                Some(self.finalization_context_for_execution(
+                    *submission_generation,
+                    *run_attempt,
+                    &targets,
+                    &known,
+                    Utc::now(),
+                ))
+            }
+            WalOperation::JobStandaloneCancel {
+                job_id,
+                submission_generation,
+            } => {
+                let (targets, known) = self
+                    .jobs
+                    .read()
+                    .get(job_id)
+                    .map(|job| {
+                        (
+                            job.allocated_nodes.clone(),
+                            job.allocated_node_incarnations.clone(),
+                        )
+                    })
+                    .unwrap_or_default();
+                Some(self.finalization_context_for_execution(
+                    *submission_generation,
+                    0,
+                    &targets,
+                    &known,
+                    Utc::now(),
+                ))
+            }
+            WalOperation::JobCancelExact {
+                job_id,
+                expected_submission_generation,
+            } => {
+                let (attempt, targets, known) = self
+                    .jobs
+                    .read()
+                    .get(job_id)
+                    .filter(|job| job.submission_generation == *expected_submission_generation)
+                    .map(|job| {
+                        let (targets, known) = Self::finalization_ownership(job);
+                        (job.run_attempt, targets, known)
+                    })
+                    .unwrap_or_default();
+                Some(self.finalization_context_for_execution(
+                    *expected_submission_generation,
+                    attempt,
+                    &targets,
+                    &known,
+                    Utc::now(),
+                ))
+            }
+            WalOperation::NodeStateChange { new_state, .. } if *new_state == NodeState::Down => {
+                Some(self.finalization_context_for_node_lifecycle(Utc::now()))
+            }
+            WalOperation::NodeStateChangeExact { new_state, .. }
+                if *new_state == NodeState::Down =>
+            {
+                Some(self.finalization_context_for_node_lifecycle(Utc::now()))
+            }
+            WalOperation::NodeRemove { .. } => {
+                Some(self.finalization_context_for_node_lifecycle(Utc::now()))
+            }
+            _ => None,
+        };
+
+        Ok(match context {
+            Some(context) => WalOperation::DurableFinalization {
+                context,
+                operation: Box::new(op),
+            },
+            None => op,
+        })
+    }
+
+    fn finalization_context_for_execution(
+        &self,
+        submission_generation: Uuid,
+        run_attempt: u32,
+        targets: &[String],
+        known: &HashMap<String, String>,
+        end_time: DateTime<Utc>,
+    ) -> DurableFinalizationContext {
+        let incarnations = targets
+            .iter()
+            .filter_map(|target| {
+                known
+                    .get(target)
+                    .filter(|incarnation| !incarnation.is_empty())
+                    .cloned()
+                    .map(|incarnation| (target.clone(), incarnation))
+            })
+            .collect();
+        DurableFinalizationContext::exact(submission_generation, run_attempt, end_time)
+            .with_node_incarnations(incarnations)
+    }
+
+    /// Snapshot one execution's durable cleanup ownership. A pending dispatch
+    /// is authoritative before publication and remains authoritative while its
+    /// exact targets are being reaped; allocated fields are the compatibility
+    /// source only when no dispatch record exists.
+    fn finalization_ownership(job: &Job) -> (Vec<String>, HashMap<String, String>) {
+        job.pending_dispatch.as_ref().map_or_else(
+            || {
+                (
+                    job.allocated_nodes.clone(),
+                    job.allocated_node_incarnations.clone(),
+                )
+            },
+            |dispatch| {
+                (
+                    dispatch.target_nodes.clone(),
+                    dispatch.target_incarnations.clone(),
+                )
+            },
+        )
+    }
+
+    fn finalization_context_for_node_lifecycle(
+        &self,
+        end_time: DateTime<Utc>,
+    ) -> DurableFinalizationContext {
+        DurableFinalizationContext::node_lifecycle(end_time)
+    }
+
+    fn propose_for_exact_execution(
+        &self,
+        op: WalOperation,
+        submission_generation: Uuid,
+        run_attempt: u32,
+        end_time: DateTime<Utc>,
+    ) -> anyhow::Result<ClientResponse> {
+        let (targets, known) = self
+            .jobs
+            .read()
+            .get(&match &op {
+                WalOperation::JobComplete { job_id, .. }
+                | WalOperation::JobTimeLimitSignaled { job_id, .. }
+                | WalOperation::JobPreemptRequeue { job_id, .. }
+                | WalOperation::JobEvict { job_id, .. } => *job_id,
+                _ => anyhow::bail!("exact finalization envelope used for unsupported operation"),
+            })
+            .map(Self::finalization_ownership)
+            .unwrap_or_default();
+        self.propose(WalOperation::DurableFinalization {
+            context: self.finalization_context_for_execution(
+                submission_generation,
+                run_attempt,
+                &targets,
+                &known,
+                end_time,
+            ),
+            operation: Box::new(op),
+        })
+    }
+
+    /// Consensus-backed leadership check for external side effects that Raft
+    /// cannot roll back (notably worker cancel RPCs). The cheap scheduler-loop
+    /// leadership cache may be stale after a network partition.
+    pub(crate) async fn ensure_consensus_leader(&self) -> bool {
+        let raft = self.raft.read().clone();
+        match raft {
+            Some(raft) => raft.ensure_linearizable().await.is_ok(),
+            None => false,
+        }
+    }
+
+    pub(crate) fn current_raft_term(&self) -> Option<u64> {
+        self.raft
+            .read()
+            .as_ref()
+            .map(|raft| raft.metrics().borrow().current_term)
+    }
+
     /// Clear a job's run-state fields so it's schedulable again after requeue.
     /// Does not bump either counter; callers do that based on why they're requeuing.
     fn clear_run_state_for_requeue(job: &mut Job) {
@@ -4274,12 +7053,489 @@ impl ClusterManager {
         job.allocated_nodes.clear();
         job.allocated_resources = None;
         job.per_node_alloc.clear();
+        job.allocated_node_incarnations.clear();
+        job.node_completions.clear();
         job.time_limit_signaled_at = None;
         job.pending_reason = PendingReason::None;
         job.pending_reason_desc = None;
         // Stale after requeue (points at nodes the job left); next dispatch resets it.
         job.actual_stdout_path = None;
         job.actual_stderr_path = None;
+    }
+
+    fn finalization_context_matches_job(
+        context: &DurableFinalizationContext,
+        job: &Job,
+        allow_node_lifecycle: bool,
+    ) -> bool {
+        context.matches_execution(job.submission_generation, job.run_attempt)
+            || (allow_node_lifecycle && context.is_node_lifecycle())
+    }
+
+    /// Install the immutable outbox marker for one ended run when and only
+    /// when its WAL entry opted into the durable protocol.  An unwrapped legacy
+    /// entry still returns the historical `JobFinalized` response but never
+    /// manufactures new persisted work during replay.
+    fn record_pending_finalization(
+        job: &mut Job,
+        intent: FinalizationIntent,
+        context: Option<&DurableFinalizationContext>,
+    ) -> JobFinalized {
+        if let Some(context) = context.filter(|_| job.pending_finalization.is_none()) {
+            job.pending_finalization = Some(PendingFinalization {
+                finalization_id: context.finalization_id,
+                submission_generation: job.submission_generation,
+                run_attempt: job.run_attempt,
+                state: job.state,
+                exit_code: job.exit_code.unwrap_or(-1),
+                exit_signal: job.exit_signal,
+                derived_exit_code: job.derived_exit_code,
+                end_time: context.end_time,
+                intent,
+            });
+        }
+        match job.pending_finalization.as_ref() {
+            Some(pending) => JobFinalized {
+                job_id: job.job_id,
+                submission_generation: pending.submission_generation,
+                run_attempt: pending.run_attempt,
+                state: pending.state,
+                exit_code: pending.exit_code,
+            },
+            None => JobFinalized {
+                job_id: job.job_id,
+                submission_generation: job.submission_generation,
+                run_attempt: job.run_attempt,
+                state: job.state,
+                exit_code: job.exit_code.unwrap_or(-1),
+            },
+        }
+    }
+
+    fn finalization_action_matches_intent(
+        marker: &PendingFinalization,
+        action: &FinalizationAction,
+    ) -> bool {
+        match (&marker.intent, action) {
+            (FinalizationIntent::KeepTerminal, FinalizationAction::KeepTerminal) => {
+                marker.state.is_finalized()
+            }
+            (FinalizationIntent::AutoRequeue, FinalizationAction::KeepTerminal) => {
+                matches!(marker.state, JobState::Timeout | JobState::NodeFail)
+            }
+            (
+                FinalizationIntent::AutoRequeue,
+                FinalizationAction::Requeue {
+                    begin_time,
+                    pending_reason,
+                    pending_reason_desc,
+                    priority,
+                    counter,
+                },
+            ) => {
+                if !matches!(marker.state, JobState::Timeout | JobState::NodeFail) {
+                    return false;
+                }
+                let immediate = begin_time.is_none()
+                    && pending_reason == &PendingReason::None
+                    && pending_reason_desc.is_none()
+                    && priority.is_none()
+                    && *counter == FinalizationRequeueCounter::Ordinary;
+                let launch_backoff = begin_time.is_some()
+                    && pending_reason == &PendingReason::JobLaunchFailure
+                    && pending_reason_desc.is_none()
+                    && priority.is_none()
+                    && *counter == FinalizationRequeueCounter::Ordinary;
+                let max_hold = begin_time.is_none()
+                    && pending_reason == &PendingReason::JobHoldMaxRequeue
+                    && pending_reason_desc.is_none()
+                    && *priority == Some(0)
+                    && *counter == FinalizationRequeueCounter::None;
+                immediate || launch_backoff || max_hold
+            }
+            (
+                FinalizationIntent::LaunchFailure {
+                    hold,
+                    begin_time: expected_begin,
+                },
+                FinalizationAction::Requeue {
+                    begin_time,
+                    pending_reason,
+                    pending_reason_desc,
+                    counter,
+                    priority,
+                },
+            ) => {
+                if marker.state != JobState::Failed {
+                    return false;
+                }
+                let requested_hold = *hold
+                    && begin_time.is_none()
+                    && pending_reason == &PendingReason::Held
+                    && pending_reason_desc == &Some(LAUNCH_FAILURE_HELD_DESC.to_string())
+                    && *priority == Some(0)
+                    && matches!(
+                        counter,
+                        FinalizationRequeueCounter::Ordinary | FinalizationRequeueCounter::None
+                    );
+                let retry = !*hold
+                    && pending_reason == &PendingReason::JobLaunchFailure
+                    && pending_reason_desc.is_none()
+                    && begin_time == &Some(*expected_begin)
+                    && priority.is_none()
+                    && *counter == FinalizationRequeueCounter::Ordinary;
+                let max_hold = !*hold
+                    && begin_time.is_none()
+                    && pending_reason == &PendingReason::JobHoldMaxRequeue
+                    && pending_reason_desc.is_none()
+                    && *priority == Some(0)
+                    && *counter == FinalizationRequeueCounter::None;
+                requested_hold || retry || max_hold
+            }
+            (
+                FinalizationIntent::PreemptRequeue {
+                    begin_time: expected_begin,
+                },
+                FinalizationAction::Requeue {
+                    begin_time: Some(begin_time),
+                    pending_reason: PendingReason::BeginTime,
+                    pending_reason_desc: None,
+                    priority: None,
+                    counter: FinalizationRequeueCounter::Preempt,
+                },
+            ) => marker.state == JobState::Preempted && begin_time == expected_begin,
+            _ => false,
+        }
+    }
+
+    fn terminal_disposition(
+        state: JobState,
+        exit_code: i32,
+        pending_reason: Option<PendingReason>,
+        detail: Option<String>,
+        finalization: Option<DurableFinalizationContext>,
+    ) -> PendingDispatchDisposition {
+        let pending_reason = pending_reason.or(match state {
+            JobState::Deadline => Some(PendingReason::DeadLine),
+            JobState::Timeout => Some(PendingReason::TimeLimit),
+            _ => None,
+        });
+        PendingDispatchDisposition {
+            state,
+            exit_code,
+            exit_signal: 0,
+            natural_completion: false,
+            pending_reason,
+            detail,
+            finalization_intent: FinalizationIntent::for_terminal_state(state),
+            finalization,
+        }
+    }
+
+    fn natural_completion_disposition(
+        job: &Job,
+        completions: &HashMap<String, spur_core::job::NodeCompletion>,
+        primary: &str,
+        finalization: Option<DurableFinalizationContext>,
+    ) -> PendingDispatchDisposition {
+        let oom = completions
+            .values()
+            .any(|completion| completion.signal & spur_core::job::OOM_SIGNAL_FLAG != 0);
+        let (derived_state, exit_code, raw_signal) = Job::derived_completion(completions, primary);
+        let exit_signal = raw_signal & !spur_core::job::OOM_SIGNAL_FLAG;
+        let (state, pending_reason) =
+            job.completion_verdict(derived_state, exit_code, exit_signal, oom);
+        PendingDispatchDisposition {
+            state,
+            exit_code,
+            exit_signal,
+            natural_completion: true,
+            pending_reason: Some(pending_reason),
+            detail: None,
+            finalization_intent: FinalizationIntent::for_terminal_state(state),
+            finalization,
+        }
+    }
+
+    /// Returns true when exact worker cleanup owns the terminal transition.
+    /// Committed remains irrevocable so BEGIN publication always precedes END.
+    fn defer_terminal_for_dispatch(
+        job: &mut Job,
+        disposition: PendingDispatchDisposition,
+    ) -> DispatchDeferral {
+        if job.pending_dispatch.is_none() && !job.allocated_nodes.is_empty() {
+            if let Some(context) = disposition.finalization.as_ref() {
+                let target_nodes: Vec<_> = job
+                    .allocated_nodes
+                    .iter()
+                    .filter(|node| !job.node_completions.contains_key(*node))
+                    .cloned()
+                    .collect();
+                if target_nodes.is_empty() {
+                    return DispatchDeferral::NotOwned;
+                }
+                if target_nodes.iter().any(|node| {
+                    context
+                        .expected_node_incarnations
+                        .get(node)
+                        .is_none_or(String::is_empty)
+                }) {
+                    warn!(
+                        job_id = job.job_id,
+                        "retaining allocation: terminal cleanup lacks worker incarnation"
+                    );
+                    return DispatchDeferral::Lost;
+                }
+                if target_nodes
+                    .iter()
+                    .any(|node| !job.per_node_alloc.contains_key(node))
+                {
+                    warn!(
+                        job_id = job.job_id,
+                        "refusing terminal transition without exact node slices"
+                    );
+                    return DispatchDeferral::Lost;
+                }
+                let per_node_alloc: HashMap<_, _> = target_nodes
+                    .iter()
+                    .map(|node| {
+                        (
+                            node.clone(),
+                            job.per_node_alloc
+                                .get(node)
+                                .expect("outstanding slice was validated")
+                                .clone(),
+                        )
+                    })
+                    .collect();
+                let mut resources = ResourceAllocations::default();
+                for slice in per_node_alloc.values() {
+                    resources.add(slice);
+                }
+                let target_incarnations = target_nodes
+                    .iter()
+                    .map(|node| {
+                        (
+                            node.clone(),
+                            context
+                                .expected_node_incarnations
+                                .get(node)
+                                .expect("outstanding owner was validated")
+                                .clone(),
+                        )
+                    })
+                    .collect();
+                job.pending_dispatch = Some(PendingDispatch {
+                    submission_generation: job.submission_generation,
+                    run_attempt: job.run_attempt,
+                    target_nodes,
+                    target_incarnations,
+                    phase: PendingDispatchPhase::Aborting,
+                    resources,
+                    per_node_alloc,
+                    early_completions: HashMap::new(),
+                    terminal_after_cleanup: Some(disposition),
+                    backoff_after_cleanup: None,
+                    preempt_requeue_after_cleanup: None,
+                    preempt_finalization_after_cleanup: None,
+                });
+                return DispatchDeferral::Won;
+            }
+        }
+        let Some(dispatch) = job.pending_dispatch.as_mut() else {
+            return DispatchDeferral::NotOwned;
+        };
+        if let Some(context) = disposition.finalization.as_ref() {
+            for target in &dispatch.target_nodes {
+                let Some(expected) = context.expected_node_incarnations.get(target) else {
+                    warn!(job_id = job.job_id, node = %target, "retaining allocation: terminal cleanup lacks worker incarnation");
+                    return DispatchDeferral::Lost;
+                };
+                if expected.is_empty()
+                    || dispatch
+                        .target_incarnations
+                        .get(target)
+                        .is_some_and(|current| current != expected)
+                {
+                    warn!(job_id = job.job_id, node = %target, "retaining allocation: terminal cleanup worker incarnation changed");
+                    return DispatchDeferral::Lost;
+                }
+                dispatch
+                    .target_incarnations
+                    .entry(target.clone())
+                    .or_insert_with(|| expected.clone());
+            }
+        }
+        if let Some(existing) = dispatch.terminal_after_cleanup.as_ref() {
+            return if existing == &disposition {
+                DispatchDeferral::Won
+            } else {
+                DispatchDeferral::Lost
+            };
+        }
+        if dispatch.preempt_requeue_after_cleanup.is_some() {
+            return DispatchDeferral::Lost;
+        }
+        dispatch.terminal_after_cleanup = Some(disposition);
+        dispatch.backoff_after_cleanup = None;
+        if matches!(
+            dispatch.phase,
+            PendingDispatchPhase::Launching | PendingDispatchPhase::Published
+        ) {
+            dispatch.phase = PendingDispatchPhase::Aborting;
+        }
+        DispatchDeferral::Won
+    }
+
+    fn defer_preempt_requeue_for_dispatch(
+        job: &mut Job,
+        begin_time: DateTime<Utc>,
+        finalization: Option<DurableFinalizationContext>,
+    ) -> DispatchDeferral {
+        if job.pending_dispatch.is_none() && !job.allocated_nodes.is_empty() {
+            if let Some(context) = finalization.as_ref() {
+                if job.allocated_nodes.iter().any(|node| {
+                    context
+                        .expected_node_incarnations
+                        .get(node)
+                        .is_none_or(String::is_empty)
+                }) {
+                    warn!(
+                        job_id = job.job_id,
+                        "retaining allocation: preemption cleanup lacks worker incarnation"
+                    );
+                    return DispatchDeferral::Lost;
+                }
+                let Some(resources) = job.allocated_resources.clone() else {
+                    warn!(
+                        job_id = job.job_id,
+                        "refusing preemption without owned resource total"
+                    );
+                    return DispatchDeferral::Lost;
+                };
+                if job.per_node_alloc.len() != job.allocated_nodes.len()
+                    || job
+                        .allocated_nodes
+                        .iter()
+                        .any(|node| !job.per_node_alloc.contains_key(node))
+                {
+                    warn!(
+                        job_id = job.job_id,
+                        "refusing preemption without exact node slices"
+                    );
+                    return DispatchDeferral::Lost;
+                }
+                job.pending_dispatch = Some(PendingDispatch {
+                    submission_generation: job.submission_generation,
+                    run_attempt: job.run_attempt,
+                    target_nodes: job.allocated_nodes.clone(),
+                    target_incarnations: context.expected_node_incarnations.clone(),
+                    phase: PendingDispatchPhase::Aborting,
+                    resources,
+                    per_node_alloc: job.per_node_alloc.clone(),
+                    early_completions: HashMap::new(),
+                    terminal_after_cleanup: None,
+                    backoff_after_cleanup: None,
+                    preempt_requeue_after_cleanup: Some(begin_time),
+                    preempt_finalization_after_cleanup: finalization,
+                });
+                return DispatchDeferral::Won;
+            }
+        }
+        let Some(dispatch) = job.pending_dispatch.as_mut() else {
+            return DispatchDeferral::NotOwned;
+        };
+        if let Some(context) = finalization.as_ref() {
+            for target in &dispatch.target_nodes {
+                let Some(expected) = context.expected_node_incarnations.get(target) else {
+                    warn!(job_id = job.job_id, node = %target, "retaining allocation: preemption cleanup lacks worker incarnation");
+                    return DispatchDeferral::Lost;
+                };
+                if expected.is_empty()
+                    || dispatch
+                        .target_incarnations
+                        .get(target)
+                        .is_some_and(|current| current != expected)
+                {
+                    warn!(job_id = job.job_id, node = %target, "retaining allocation: preemption worker incarnation changed");
+                    return DispatchDeferral::Lost;
+                }
+                dispatch
+                    .target_incarnations
+                    .entry(target.clone())
+                    .or_insert_with(|| expected.clone());
+            }
+        }
+        if dispatch.terminal_after_cleanup.is_some() {
+            return DispatchDeferral::Lost;
+        }
+        if let Some(existing) = dispatch.preempt_requeue_after_cleanup {
+            return if existing == begin_time {
+                DispatchDeferral::Won
+            } else {
+                DispatchDeferral::Lost
+            };
+        }
+        dispatch.preempt_requeue_after_cleanup = Some(begin_time);
+        dispatch.preempt_finalization_after_cleanup = finalization;
+        dispatch.backoff_after_cleanup = None;
+        if dispatch.phase == PendingDispatchPhase::Published {
+            dispatch.phase = PendingDispatchPhase::Aborting;
+        }
+        DispatchDeferral::Won
+    }
+
+    fn apply_terminal_disposition(
+        job: &mut Job,
+        disposition: &PendingDispatchDisposition,
+        legacy_timestamp: DateTime<Utc>,
+    ) -> Option<JobFinalized> {
+        if disposition
+            .finalization
+            .as_ref()
+            .is_some_and(|context| !Self::finalization_context_matches_job(context, job, true))
+        {
+            warn!(
+                job_id = job.job_id,
+                "dispatch finalization execution fence did not match"
+            );
+            return None;
+        }
+        let timestamp = disposition
+            .finalization
+            .as_ref()
+            .map(|context| context.end_time)
+            .unwrap_or(legacy_timestamp);
+        if job.state != disposition.state {
+            if let Err(error) = job.transition(disposition.state) {
+                warn!(
+                    job_id = job.job_id,
+                    from = ?job.state,
+                    to = ?disposition.state,
+                    %error,
+                    "cannot stage dispatch finalization"
+                );
+                return None;
+            }
+        }
+        job.exit_code = Some(disposition.exit_code);
+        job.exit_signal = disposition.exit_signal;
+        job.end_time = Some(timestamp);
+        if let Some(reason) = disposition.pending_reason.clone() {
+            job.set_pending_reason(reason);
+        }
+        if let Some(detail) = disposition.detail.clone() {
+            job.launch_failure_detail = Some(detail);
+        }
+        if let Some(since) = job.suspended_at.take() {
+            job.suspended_secs += (timestamp - since).num_seconds().max(0);
+        }
+        job.node_completions.clear();
+        Some(Self::record_pending_finalization(
+            job,
+            disposition.finalization_intent.clone(),
+            disposition.finalization.as_ref(),
+        ))
     }
 
     pub fn set_job_launch_failure_detail(
@@ -4317,8 +7573,14 @@ impl ClusterManager {
         nodes: &mut HashMap<String, Node>,
         timestamp: chrono::DateTime<Utc>,
         reason: PendingReason,
+        finalization: Option<&DurableFinalizationContext>,
     ) -> Option<JobFinalized> {
         let job = jobs.get_mut(&job_id)?;
+        if finalization
+            .is_some_and(|context| !Self::finalization_context_matches_job(context, job, true))
+        {
+            return None;
+        }
 
         if let Some(since) = job.suspended_at.take() {
             job.suspended_secs += (timestamp - since).num_seconds().max(0);
@@ -4363,11 +7625,11 @@ impl ClusterManager {
             }
         }
 
-        Some(JobFinalized {
-            job_id,
-            state: JobState::NodeFail,
-            exit_code: -1,
-        })
+        Some(Self::record_pending_finalization(
+            job,
+            FinalizationIntent::AutoRequeue,
+            finalization,
+        ))
     }
 
     /// Fail all running/completing/suspended jobs on a node, releasing
@@ -4378,22 +7640,75 @@ impl ClusterManager {
         nodes: &mut HashMap<String, Node>,
         timestamp: chrono::DateTime<Utc>,
         response: &mut ClientResponse,
+        finalization: Option<&DurableFinalizationContext>,
     ) {
         let affected: Vec<JobId> = jobs
             .iter()
-            .filter(|(_, j)| {
-                matches!(
-                    j.state,
-                    JobState::Running | JobState::Completing | JobState::Suspended
-                ) && j.allocated_nodes.iter().any(|n| n == node_name)
-            })
+            .filter(|(_, job)| execution_owns_node(job, node_name))
             .map(|(&id, _)| id)
             .collect();
 
         for jid in affected {
-            if let Some(fin) =
-                Self::evict_job_locked(jid, jobs, nodes, timestamp, PendingReason::NodeDown)
-            {
+            let job_finalization = jobs.get(&jid).and_then(|job| {
+                finalization.map(|context| {
+                    let mut context = context.clone();
+                    context.expected_node_incarnations = job
+                        .pending_dispatch
+                        .as_ref()
+                        .map(|dispatch| dispatch.target_incarnations.clone())
+                        .unwrap_or_else(|| job.allocated_node_incarnations.clone());
+                    context
+                })
+            });
+            let deferred = jobs
+                .get_mut(&jid)
+                .map_or(DispatchDeferral::NotOwned, |job| {
+                    Self::defer_terminal_for_dispatch(
+                        job,
+                        Self::terminal_disposition(
+                            JobState::NodeFail,
+                            -1,
+                            Some(PendingReason::NodeDown),
+                            None,
+                            job_finalization.clone(),
+                        ),
+                    )
+                });
+            match deferred {
+                DispatchDeferral::Won => {
+                    let can_release_failed_target = jobs
+                        .get(&jid)
+                        .and_then(|job| job.pending_dispatch.as_ref())
+                        .is_some_and(|dispatch| {
+                            dispatch.phase == PendingDispatchPhase::Aborting
+                                && dispatch.target_incarnations.get(node_name).is_some_and(
+                                    |incarnation| {
+                                        !incarnation.is_empty()
+                                            && job_finalization.as_ref().is_some_and(|context| {
+                                                context.expected_node_incarnations.get(node_name)
+                                                    == Some(incarnation)
+                                            })
+                                    },
+                                )
+                        });
+                    if can_release_failed_target {
+                        let job = jobs.get_mut(&jid).expect("affected job was just validated");
+                        let _ = Self::release_owned_target_locked(jid, job, nodes, node_name);
+                    }
+                    response.terminal_cleanup_deferred = true;
+                    continue;
+                }
+                DispatchDeferral::Lost => continue,
+                DispatchDeferral::NotOwned => {}
+            }
+            if let Some(fin) = Self::evict_job_locked(
+                jid,
+                jobs,
+                nodes,
+                timestamp,
+                PendingReason::NodeDown,
+                job_finalization.as_ref(),
+            ) {
                 response.jobs_finalized.push(fin);
             }
         }
@@ -4401,16 +7716,90 @@ impl ClusterManager {
 
     /// Apply a WalOperation to in-memory state.
     /// Called by Raft's `apply_to_state_machine` on commit.
-    fn apply_operation(&self, op: &WalOperation) -> ClientResponse {
+    fn apply_operation(&self, logged_op: &WalOperation) -> ClientResponse {
+        let (op, durable_finalization) = match logged_op {
+            WalOperation::DurableFinalization { context, operation } => {
+                if matches!(operation.as_ref(), WalOperation::DurableFinalization { .. }) {
+                    warn!("refusing nested durable-finalization WAL envelope");
+                    return ClientResponse::default();
+                }
+                (operation.as_ref(), Some(context))
+            }
+            // Absence is an explicit legacy-format signal. Never synthesize a
+            // marker while replaying an operation written by an old controller.
+            operation => (operation, None),
+        };
         let mut response = ClientResponse::default();
         let mut jobs = self.jobs.write();
         let mut nodes = self.nodes.write();
         let mut next_id = self.next_job_id.load(Ordering::Relaxed);
-        let timestamp = Utc::now();
+        let timestamp = durable_finalization
+            .map(|context| context.end_time)
+            .unwrap_or_else(Utc::now);
 
         match op {
-            WalOperation::JobSubmit { job_id, spec } => {
-                let mut job = Job::new(*job_id, (**spec).clone());
+            WalOperation::JobSubmit {
+                job_id,
+                spec,
+                metadata,
+            } => {
+                let metadata = metadata
+                    .clone()
+                    .unwrap_or_else(JobSubmissionMetadata::legacy);
+                let mut submission_tokens = self.submission_tokens.write();
+                if let Some(idempotency) = &metadata.idempotency {
+                    if idempotency.token.is_empty()
+                        || idempotency.user.is_empty()
+                        || idempotency.spec_sha256.is_empty()
+                        || metadata.generation.is_nil()
+                    {
+                        warn!(
+                            job_id = *job_id,
+                            "refusing incomplete submit idempotency metadata"
+                        );
+                        response.submission_conflict = true;
+                        return response;
+                    }
+                    if let Some(existing) = submission_tokens.get(&idempotency.token) {
+                        response.submission_job_id = existing.job_id;
+                        response.submission_generation = existing.submission_generation;
+                        if existing.cancelled {
+                            response.submission_cancelled = true;
+                            return response;
+                        }
+                        response.submission_conflict = existing.user != idempotency.user
+                            || existing.spec_sha256 != idempotency.spec_sha256;
+                        return response;
+                    }
+                }
+                if let Some(existing) = jobs.get(job_id) {
+                    if existing.submission_generation != metadata.generation {
+                        warn!(job_id = *job_id, "refusing to reuse a live job id");
+                    }
+                    return response;
+                }
+                if self
+                    .steps
+                    .read()
+                    .keys()
+                    .any(|(existing_job_id, _)| existing_job_id == job_id)
+                {
+                    warn!(
+                        job_id = *job_id,
+                        "refusing to reuse a job id with retained steps"
+                    );
+                    return response;
+                }
+                let mut job = Job::new_with_submission(
+                    *job_id,
+                    (**spec).clone(),
+                    metadata.generation,
+                    metadata.submitted_at,
+                );
+                job.submission_token = metadata
+                    .idempotency
+                    .as_ref()
+                    .map(|idempotency| idempotency.token.clone());
                 if let Some(het_group) = spec.het_group {
                     job.het_group = Some(het_group);
                     if het_group > 0 {
@@ -4426,6 +7815,24 @@ impl ClusterManager {
                     }
                 }
                 jobs.insert(*job_id, job);
+                if let Some(idempotency) = &metadata.idempotency {
+                    submission_tokens.insert(
+                        idempotency.token.clone(),
+                        SubmissionTokenRecord {
+                            job_id: *job_id,
+                            submission_generation: metadata.generation,
+                            user: idempotency.user.clone(),
+                            spec_sha256: idempotency.spec_sha256.clone(),
+                            cancelled: false,
+                            cleanup_complete: false,
+                            completion_receipts: Vec::new(),
+                            terminal_receipt: None,
+                        },
+                    );
+                }
+                response.submission_job_id = *job_id;
+                response.submission_generation = metadata.generation;
+                response.submission_created = true;
                 next_id = next_id.max(job_id + 1);
             }
             WalOperation::JobStateChange {
@@ -4438,6 +7845,20 @@ impl ClusterManager {
                 ..
             } => {
                 if let Some(job) = jobs.get_mut(job_id) {
+                    // Terminal transitions must use a canonical operation that
+                    // installs PendingFinalization in the same entry.  Likewise,
+                    // only JobFinalizationAck may requeue an ended run while its
+                    // marker is outstanding.
+                    if (durable_finalization.is_some() && new_state.is_finalized())
+                        || (*new_state == JobState::Pending && job.pending_finalization.is_some())
+                    {
+                        warn!(
+                            job_id = *job_id,
+                            state = ?new_state,
+                            "refusing JobStateChange that bypasses durable finalization"
+                        );
+                        return ClientResponse::default();
+                    }
                     let outcome = match job.apply_transition(*new_state) {
                         Ok(outcome) => outcome,
                         Err(e) => {
@@ -4468,7 +7889,11 @@ impl ClusterManager {
                     }
                 }
             }
-            WalOperation::JobDispatchBackoff { job_id, begin_time } => {
+            WalOperation::JobDispatchBackoff {
+                job_id,
+                submission_generation,
+                begin_time,
+            } => {
                 // NoOp if the job left Pending since the leader proposed this
                 // (e.g. a concurrent cancel).
                 let Some(job) = jobs.get_mut(job_id) else {
@@ -4477,16 +7902,391 @@ impl ClusterManager {
                 if job.state != JobState::Pending {
                     return ClientResponse::default();
                 }
+                if job.submission_generation != *submission_generation {
+                    return ClientResponse::default();
+                }
+                if let Some(dispatch) = job.pending_dispatch.as_mut() {
+                    if dispatch.terminal_after_cleanup.is_some()
+                        || dispatch.preempt_requeue_after_cleanup.is_some()
+                    {
+                        return response;
+                    }
+                    match dispatch.phase {
+                        PendingDispatchPhase::Launching | PendingDispatchPhase::Aborting => {
+                            dispatch.phase = PendingDispatchPhase::Aborting;
+                            dispatch.backoff_after_cleanup = Some(
+                                dispatch
+                                    .backoff_after_cleanup
+                                    .map_or(*begin_time, |current| current.max(*begin_time)),
+                            );
+                        }
+                        PendingDispatchPhase::Committed | PendingDispatchPhase::Published => {}
+                    }
+                    return response;
+                }
                 Self::reset_job_for_requeue(job);
                 job.spec.begin_time = Some(*begin_time);
                 job.set_pending_reason(PendingReason::JobLaunchFailure);
             }
+            WalOperation::JobDispatchBegin {
+                job_id,
+                submission_generation,
+                expected_run_attempt,
+                run_attempt,
+                target_nodes,
+                target_incarnations,
+                resources,
+                per_node_alloc,
+            } => {
+                let Some(job) = jobs.get(job_id) else {
+                    return ClientResponse::default();
+                };
+                if job.state != JobState::Pending || job.pending_finalization.is_some() {
+                    return ClientResponse::default();
+                }
+                if job.submission_generation != *submission_generation {
+                    return ClientResponse::default();
+                }
+                // Idempotent replay of the exact same begin is harmless.
+                if job.pending_dispatch.as_ref().is_some_and(|dispatch| {
+                    dispatch.run_attempt == *run_attempt
+                        && dispatch.target_nodes == *target_nodes
+                        && dispatch.target_incarnations == *target_incarnations
+                        && allocations_equivalent(&dispatch.resources, resources)
+                        && dispatch.per_node_alloc == *per_node_alloc
+                }) {
+                    return ClientResponse::default();
+                }
+                // CAS: never overwrite an unresolved fanout or advance from a
+                // state different from what the leader read.
+                if job.pending_dispatch.is_some()
+                    || job.run_attempt != *expected_run_attempt
+                    || if *run_attempt == 0 {
+                        !job.spec.srun_job || *expected_run_attempt != 0
+                    } else {
+                        expected_run_attempt.checked_add(1) != Some(*run_attempt)
+                    }
+                {
+                    return ClientResponse::default();
+                }
+
+                let mut unique_targets = target_nodes.clone();
+                unique_targets.sort();
+                unique_targets.dedup();
+                if unique_targets.is_empty()
+                    || unique_targets.len() != target_nodes.len()
+                    || per_node_alloc.len() != unique_targets.len()
+                    || unique_targets
+                        .iter()
+                        .any(|name| !per_node_alloc.contains_key(name))
+                {
+                    warn!(
+                        job_id = *job_id,
+                        targets = ?target_nodes,
+                        "dispatch begin has non-canonical targets or allocation slices"
+                    );
+                    return ClientResponse::default();
+                }
+                let mut aggregate = ResourceAllocations::default();
+                if target_incarnations.len() != unique_targets.len()
+                    || unique_targets.iter().any(|name| {
+                        nodes.get(name).is_none_or(|node| {
+                            node.incarnation.is_empty()
+                                || target_incarnations.get(name).is_none_or(String::is_empty)
+                                || target_incarnations.get(name) != Some(&node.incarnation)
+                        })
+                    })
+                {
+                    warn!(
+                        job_id = *job_id,
+                        "dispatch target incarnation changed before reservation"
+                    );
+                    return ClientResponse::default();
+                }
+                for name in &unique_targets {
+                    let slice = &per_node_alloc[name];
+                    let Some(node) = nodes.get(name) else {
+                        warn!(job_id = *job_id, node = %name, "dispatch target disappeared before reservation");
+                        return ClientResponse::default();
+                    };
+                    if !exact_provisional_slice_fits(node, slice) {
+                        warn!(job_id = *job_id, node = %name, "dispatch target cannot fit exact provisional slice");
+                        return ClientResponse::default();
+                    }
+                    aggregate.add(slice);
+                }
+                if !allocations_equivalent(&aggregate, resources) {
+                    warn!(
+                        job_id = *job_id,
+                        "dispatch aggregate does not match per-node slices"
+                    );
+                    return ClientResponse::default();
+                }
+
+                let job = jobs
+                    .get_mut(job_id)
+                    .expect("job existence was validated under the same write lock");
+                job.run_attempt = *run_attempt;
+                job.pending_dispatch = Some(PendingDispatch {
+                    submission_generation: *submission_generation,
+                    run_attempt: *run_attempt,
+                    target_nodes: target_nodes.clone(),
+                    target_incarnations: target_incarnations.clone(),
+                    phase: PendingDispatchPhase::Launching,
+                    resources: resources.clone(),
+                    per_node_alloc: per_node_alloc.clone(),
+                    early_completions: HashMap::new(),
+                    terminal_after_cleanup: None,
+                    backoff_after_cleanup: None,
+                    preempt_requeue_after_cleanup: None,
+                    preempt_finalization_after_cleanup: None,
+                });
+                for name in &unique_targets {
+                    let node = nodes
+                        .get_mut(name)
+                        .expect("target existence was validated under the same write lock");
+                    node.alloc_resources.add(&per_node_alloc[name]);
+                    node.update_state_from_alloc();
+                }
+                response.dispatch_begun = true;
+            }
+            WalOperation::JobDispatchAbortBegin {
+                job_id,
+                submission_generation,
+                run_attempt,
+            } => {
+                let Some(job) = jobs.get_mut(job_id) else {
+                    return ClientResponse::default();
+                };
+                let Some(dispatch) = job.pending_dispatch.as_mut() else {
+                    return ClientResponse::default();
+                };
+                if job.submission_generation != *submission_generation
+                    || dispatch.submission_generation != *submission_generation
+                    || dispatch.run_attempt != *run_attempt
+                {
+                    return ClientResponse::default();
+                }
+                match dispatch.phase {
+                    PendingDispatchPhase::Aborting => {
+                        response.dispatch_abort_authorized = true;
+                    }
+                    PendingDispatchPhase::Launching if job.state == JobState::Pending => {
+                        dispatch.phase = PendingDispatchPhase::Aborting;
+                        response.dispatch_abort_authorized = true;
+                    }
+                    // Every launch ACK is already durable. A terminal request
+                    // must finish BEGIN/Running publication before cleanup.
+                    PendingDispatchPhase::Committed
+                    | PendingDispatchPhase::Published
+                    | PendingDispatchPhase::Launching => {}
+                }
+            }
+            WalOperation::JobDispatchTargetClear {
+                job_id,
+                submission_generation,
+                run_attempt,
+                node_name,
+            } => {
+                let exact_target = jobs.get(job_id).is_some_and(|job| {
+                    job.submission_generation == *submission_generation
+                        && job.pending_dispatch.as_ref().is_some_and(|dispatch| {
+                            dispatch.submission_generation == *submission_generation
+                                && dispatch.run_attempt == *run_attempt
+                                && dispatch.phase == PendingDispatchPhase::Aborting
+                                && dispatch
+                                    .target_nodes
+                                    .iter()
+                                    .any(|target| target == node_name)
+                        })
+                });
+                if !exact_target {
+                    return response;
+                }
+                let job = jobs
+                    .get_mut(job_id)
+                    .expect("cleanup target job was validated");
+                if Self::release_owned_target_locked(*job_id, job, &mut nodes, node_name) {
+                    response.dispatch_target_cleared = true;
+                }
+            }
+            WalOperation::JobDispatchClear {
+                job_id,
+                submission_generation,
+                run_attempt,
+            } => {
+                let Some(dispatch) = jobs.get(job_id).and_then(|job| {
+                    job.pending_dispatch
+                        .as_ref()
+                        .filter(|dispatch| {
+                            dispatch.run_attempt == *run_attempt
+                                && dispatch.submission_generation == *submission_generation
+                                && dispatch.phase == PendingDispatchPhase::Aborting
+                        })
+                        .cloned()
+                }) else {
+                    return ClientResponse::default();
+                };
+                if !dispatch.target_nodes.is_empty()
+                    || !dispatch.per_node_alloc.is_empty()
+                    || !allocations_equivalent(&dispatch.resources, &ResourceAllocations::default())
+                {
+                    return response;
+                }
+                if dispatch.per_node_alloc.iter().any(|(name, slice)| {
+                    nodes
+                        .get(name)
+                        .is_none_or(|node| !allocation_contains(&node.alloc_resources, slice))
+                }) {
+                    warn!(
+                        job_id = *job_id,
+                        run_attempt = *run_attempt,
+                        "cannot clear dispatch intent: provisional node accounting is missing"
+                    );
+                    return ClientResponse::default();
+                }
+                for (name, slice) in &dispatch.per_node_alloc {
+                    let node = nodes
+                        .get_mut(name)
+                        .expect("provisional allocation existence was validated");
+                    node.alloc_resources.subtract(slice);
+                    node.update_state_from_alloc();
+                    if node.state == NodeState::Draining
+                        && node.alloc_resources.cpus == 0
+                        && !node.alloc_resources.has_devices()
+                    {
+                        node.state = NodeState::Drain;
+                    }
+                }
+                let mut completed = None;
+                let mut completion_time = timestamp;
+                let job = jobs.get_mut(job_id).expect("job existence was validated");
+                job.pending_dispatch = None;
+                if let Some(disposition) = dispatch.terminal_after_cleanup.as_ref() {
+                    completion_time = disposition
+                        .finalization
+                        .as_ref()
+                        .map(|context| context.end_time)
+                        .unwrap_or(timestamp);
+                    completed = Self::apply_terminal_disposition(job, disposition, timestamp);
+                } else if let Some(begin_time) = dispatch.preempt_requeue_after_cleanup {
+                    let mut disposition = Self::terminal_disposition(
+                        JobState::Preempted,
+                        -1,
+                        None,
+                        None,
+                        dispatch.preempt_finalization_after_cleanup.clone(),
+                    );
+                    disposition.finalization_intent =
+                        FinalizationIntent::PreemptRequeue { begin_time };
+                    completion_time = disposition
+                        .finalization
+                        .as_ref()
+                        .map(|context| context.end_time)
+                        .unwrap_or(timestamp);
+                    completed = Self::apply_terminal_disposition(job, &disposition, timestamp);
+                    if completed.is_some() && disposition.finalization.is_none() {
+                        match job.transition(JobState::Pending) {
+                            Ok(()) => {
+                                Self::reset_job_for_preempt_requeue(job);
+                                job.spec.begin_time = Some(begin_time);
+                                job.set_pending_reason(PendingReason::BeginTime);
+                            }
+                            Err(error) => {
+                                warn!(job_id = *job_id, %error, "cannot replay cleaned legacy preemption");
+                            }
+                        }
+                    }
+                } else if job.state == JobState::Pending {
+                    if let Some(begin_time) = dispatch.backoff_after_cleanup {
+                        Self::reset_job_for_requeue(job);
+                        job.spec.begin_time = Some(begin_time);
+                        job.set_pending_reason(PendingReason::JobLaunchFailure);
+                    } else {
+                        let held = job
+                            .pending_reason
+                            .is_scheduling_hold()
+                            .then(|| (job.pending_reason.clone(), job.pending_reason_desc.clone()));
+                        Self::clear_run_state_for_requeue(job);
+                        if let Some((reason, description)) = held {
+                            match description {
+                                Some(description) => {
+                                    job.set_pending_reason_desc(reason, description)
+                                }
+                                None => job.set_pending_reason(reason),
+                            }
+                        }
+                    }
+                    job.srun_step_dispatch = false;
+                    let mut steps = self.steps.write();
+                    if steps.get(&(*job_id, STEP_BATCH)).is_some_and(|step| {
+                        step.run_attempt == *run_attempt && !step.state.is_terminal()
+                    }) {
+                        steps.remove(&(*job_id, STEP_BATCH));
+                    }
+                }
+                response.dispatch_cleared = true;
+                if let Some(finalized) = completed {
+                    let exit_code = finalized.exit_code;
+                    response.jobs_finalized.push(finalized);
+                    drop(jobs);
+                    drop(nodes);
+                    self.complete_job_steps(job_id, exit_code, completion_time);
+                    self.next_job_id.store(next_id, Ordering::Relaxed);
+                    return response;
+                }
+            }
+            WalOperation::JobTransientCapacityReject {
+                job_id,
+                submission_generation,
+                whole_nodes,
+                gpu_ids,
+                retry_after,
+            } => {
+                // NoOp after a concurrent start/cancel. Reapplying the same
+                // entry is deterministic: HashMap insertion is idempotent.
+                let Some(job) = jobs.get_mut(job_id) else {
+                    return ClientResponse::default();
+                };
+                if job.state != JobState::Pending {
+                    return ClientResponse::default();
+                }
+                if job.submission_generation != *submission_generation {
+                    return ClientResponse::default();
+                }
+                for node in whole_nodes {
+                    let rejection = job
+                        .transient_capacity_rejections
+                        .entry(node.clone())
+                        .or_default();
+                    rejection.whole_node_until = Some(
+                        rejection
+                            .whole_node_until
+                            .map_or(*retry_after, |current| current.max(*retry_after)),
+                    );
+                }
+                for (node, ids) in gpu_ids {
+                    let rejection = job
+                        .transient_capacity_rejections
+                        .entry(node.clone())
+                        .or_default();
+                    for id in ids {
+                        rejection
+                            .gpu_until
+                            .entry(*id)
+                            .and_modify(|current| *current = (*current).max(*retry_after))
+                            .or_insert(*retry_after);
+                    }
+                }
+            }
             WalOperation::JobPreemptRequeue { job_id, begin_time } => {
-                // Only a running job is preempted; on replay the job is already
-                // Pending, so this is a NoOp (no re-dealloc, no double requeue).
+                // Only a running job is preempted; on replay it is already
+                // Preempted with a marker (or Pending after Ack), so this is a
+                // NoOp with no double deallocation/requeue.
                 let freed_nodes;
                 let allocated_resources;
                 let per_node_map;
+                let finalized;
                 {
                     let Some(job) = jobs.get_mut(job_id) else {
                         return ClientResponse::default();
@@ -4494,9 +8294,26 @@ impl ClusterManager {
                     if job.state != JobState::Running {
                         return ClientResponse::default();
                     }
-                    // Route through Preempted so the state machine and accounting
-                    // see a finished run, then requeue to Pending — one atomic
-                    // apply; the intermediate Preempted never escapes the lock.
+                    if durable_finalization.is_some_and(|context| {
+                        !Self::finalization_context_matches_job(context, job, false)
+                    }) {
+                        return ClientResponse::default();
+                    }
+                    match Self::defer_preempt_requeue_for_dispatch(
+                        job,
+                        *begin_time,
+                        durable_finalization.cloned(),
+                    ) {
+                        DispatchDeferral::Won => {
+                            response.terminal_cleanup_deferred = true;
+                            return response;
+                        }
+                        DispatchDeferral::Lost => return response,
+                        DispatchDeferral::NotOwned => {}
+                    }
+                    // Keep the ended run visibly Preempted until its durable
+                    // finalization marker is acknowledged.  The Ack performs
+                    // the requeue atomically after bounded sink delivery.
                     if let Err(e) = job.transition(JobState::Preempted) {
                         warn!(job_id = *job_id, error = %e, "invalid preempt transition in WAL apply");
                         return ClientResponse::default();
@@ -4510,14 +8327,25 @@ impl ClusterManager {
                     allocated_resources = job.allocated_resources.clone();
                     per_node_map = job.per_node_alloc.clone();
                     job.node_completions.clear();
-
-                    if let Err(e) = job.transition(JobState::Pending) {
-                        warn!(job_id = *job_id, error = %e, "invalid requeue transition in WAL apply");
-                        return ClientResponse::default();
+                    finalized = Self::record_pending_finalization(
+                        job,
+                        FinalizationIntent::PreemptRequeue {
+                            begin_time: *begin_time,
+                        },
+                        durable_finalization,
+                    );
+                    // Historical JobPreemptRequeue was itself atomic. Preserve
+                    // that exact replay meaning; only the explicit envelope
+                    // defers requeue until finalization Ack.
+                    if durable_finalization.is_none() {
+                        if let Err(error) = job.transition(JobState::Pending) {
+                            warn!(job_id = *job_id, %error, "cannot replay legacy preempt requeue");
+                            return ClientResponse::default();
+                        }
+                        Self::reset_job_for_preempt_requeue(job);
+                        job.spec.begin_time = Some(*begin_time);
+                        job.set_pending_reason(PendingReason::BeginTime);
                     }
-                    Self::reset_job_for_preempt_requeue(job);
-                    job.spec.begin_time = Some(*begin_time);
-                    job.set_pending_reason(PendingReason::BeginTime);
                 }
                 if let Some(ref total) = allocated_resources {
                     let node_count = freed_nodes.len().max(1) as u32;
@@ -4543,16 +8371,12 @@ impl ClusterManager {
                 }
                 drop(jobs);
                 drop(nodes);
-                // Complete steps and fire accounting for the terminated run as
-                // PREEMPTED, even though the job itself is now Pending-with-hold.
-                self.complete_job_steps(job_id, -1, timestamp);
+                if durable_finalization.is_none() {
+                    self.complete_job_steps(job_id, -1, timestamp);
+                }
                 self.next_job_id.store(next_id, Ordering::Relaxed);
                 return ClientResponse {
-                    jobs_finalized: vec![JobFinalized {
-                        job_id: *job_id,
-                        state: JobState::Preempted,
-                        exit_code: -1,
-                    }],
+                    jobs_finalized: vec![finalized],
                     ..Default::default()
                 };
             }
@@ -4584,6 +8408,26 @@ impl ClusterManager {
             }
             WalOperation::JobEvict { job_id, detail } => {
                 if let Some(job) = jobs.get_mut(job_id) {
+                    if durable_finalization.is_some_and(|context| {
+                        !Self::finalization_context_matches_job(context, job, false)
+                    }) {
+                        return ClientResponse::default();
+                    }
+                    let disposition = Self::terminal_disposition(
+                        JobState::NodeFail,
+                        -1,
+                        Some(PendingReason::JobLaunchFailure),
+                        detail.clone(),
+                        durable_finalization.cloned(),
+                    );
+                    match Self::defer_terminal_for_dispatch(job, disposition) {
+                        DispatchDeferral::Won => {
+                            response.terminal_cleanup_deferred = true;
+                            return response;
+                        }
+                        DispatchDeferral::Lost => return response,
+                        DispatchDeferral::NotOwned => {}
+                    }
                     job.launch_failure_detail = detail.clone();
                 }
                 if let Some(fin) = Self::evict_job_locked(
@@ -4592,6 +8436,7 @@ impl ClusterManager {
                     &mut nodes,
                     timestamp,
                     PendingReason::JobLaunchFailure,
+                    durable_finalization,
                 ) {
                     response.jobs_finalized.push(fin);
                 }
@@ -4601,11 +8446,291 @@ impl ClusterManager {
                     job.launch_failure_detail = Some(detail.clone());
                 }
             }
+            WalOperation::JobDispatchCommit {
+                job_id,
+                submission_generation,
+                nodes: node_names,
+                resources,
+                per_node_alloc,
+                run_attempt,
+            } => {
+                let Some(job) = jobs.get_mut(job_id) else {
+                    return ClientResponse::default();
+                };
+                let exact_dispatch = job.pending_dispatch.as_ref().is_some_and(|dispatch| {
+                    dispatch.submission_generation == *submission_generation
+                        && dispatch.run_attempt == *run_attempt
+                        && dispatch.target_nodes == *node_names
+                        && allocations_equivalent(&dispatch.resources, resources)
+                        && dispatch.per_node_alloc == *per_node_alloc
+                });
+                if job.state == JobState::Pending
+                    && job.submission_generation == *submission_generation
+                    && job.run_attempt == *run_attempt
+                    && exact_dispatch
+                    && job
+                        .pending_dispatch
+                        .as_ref()
+                        .is_some_and(|dispatch| dispatch.phase == PendingDispatchPhase::Committed)
+                {
+                    response.dispatch_committed = true;
+                    return response;
+                }
+                // Validate the complete target set before mutating either the
+                // job or any node. A node removed between fanout and commit
+                // leaves the durable intent intact for attempt-scoped recovery
+                // instead of producing a Running job with partial accounting.
+                let mut committed_nodes = node_names.clone();
+                committed_nodes.sort();
+                committed_nodes.dedup();
+                if committed_nodes.len() != node_names.len()
+                    || committed_nodes.iter().any(|name| {
+                        nodes.get(name).is_none_or(|node| {
+                            !matches!(
+                                node.state,
+                                NodeState::Idle
+                                    | NodeState::Allocated
+                                    | NodeState::Mixed
+                                    | NodeState::Draining
+                            )
+                        })
+                    })
+                    || committed_nodes
+                        .iter()
+                        .any(|name| !per_node_alloc.contains_key(name))
+                {
+                    warn!(
+                        job_id = *job_id,
+                        targets = ?node_names,
+                        "atomic dispatch commit has missing, duplicate, down, or unallocated target"
+                    );
+                    return ClientResponse::default();
+                }
+                let intent_matches = job.pending_dispatch.as_ref().is_some_and(|dispatch| {
+                    dispatch.submission_generation == *submission_generation
+                        && dispatch.run_attempt == *run_attempt
+                        && dispatch.phase == PendingDispatchPhase::Launching
+                        && dispatch.target_nodes == *node_names
+                        && allocations_equivalent(&dispatch.resources, resources)
+                        && dispatch.per_node_alloc == *per_node_alloc
+                });
+                if job.state != JobState::Pending
+                    || job.submission_generation != *submission_generation
+                    || job.run_attempt != *run_attempt
+                    || !intent_matches
+                {
+                    return ClientResponse::default();
+                }
+                let target_incarnations = &job
+                    .pending_dispatch
+                    .as_ref()
+                    .expect("matching dispatch was validated")
+                    .target_incarnations;
+                if committed_nodes.iter().any(|name| {
+                    nodes.get(name).is_none_or(|node| {
+                        node.incarnation.is_empty()
+                            || target_incarnations.get(name).is_none_or(String::is_empty)
+                            || target_incarnations.get(name) != Some(&node.incarnation)
+                    })
+                }) {
+                    warn!(
+                        job_id = *job_id,
+                        run_attempt = *run_attempt,
+                        "atomic dispatch commit target incarnation changed"
+                    );
+                    return ClientResponse::default();
+                }
+                if per_node_alloc.iter().any(|(name, slice)| {
+                    nodes
+                        .get(name)
+                        .is_none_or(|node| !allocation_contains(&node.alloc_resources, slice))
+                }) {
+                    warn!(
+                        job_id = *job_id,
+                        run_attempt = *run_attempt,
+                        "atomic dispatch commit is missing its provisional reservation"
+                    );
+                    return ClientResponse::default();
+                }
+                if self
+                    .steps
+                    .read()
+                    .get(&(*job_id, STEP_BATCH))
+                    .is_some_and(|step| {
+                        !step.state.is_terminal() && step.run_attempt != *run_attempt
+                    })
+                {
+                    warn!(
+                        job_id = *job_id,
+                        run_attempt = *run_attempt,
+                        "atomic dispatch commit conflicts with an active batch step"
+                    );
+                    return ClientResponse::default();
+                }
+                job.start_time = Some(timestamp);
+                job.allocated_nodes = node_names.clone();
+                job.allocated_resources = Some(resources.clone());
+                job.per_node_alloc = per_node_alloc.clone();
+                job.allocated_node_incarnations = job
+                    .pending_dispatch
+                    .as_ref()
+                    .map(|dispatch| dispatch.target_incarnations.clone())
+                    .unwrap_or_default();
+                job.set_pending_reason(PendingReason::None);
+                job.srun_step_dispatch = false;
+                job.launch_failure_detail = None;
+                job.transient_capacity_rejections.clear();
+                job.pending_dispatch
+                    .as_mut()
+                    .expect("matching dispatch was validated")
+                    .phase = PendingDispatchPhase::Committed;
+                response.dispatch_committed = true;
+
+                // The reserved batch step is part of the same replicated
+                // publication as Running. A worker completion can arrive as
+                // soon as LaunchJob ACKs; creating this afterward left a gap
+                // where completion finalized the job before a batch step
+                // existed, then the caller inserted a stale Running step.
+                let node_count = node_names.len().max(1) as u32;
+                let per_node = node_names
+                    .first()
+                    .and_then(|name| per_node_alloc.get(name).cloned())
+                    .unwrap_or_else(|| {
+                        ResourceAllocations::with_scalar(
+                            resources.cpus / node_count,
+                            resources.memory_mb / node_count as u64,
+                        )
+                    });
+                self.steps.write().insert(
+                    (*job_id, STEP_BATCH),
+                    JobStep {
+                        job_id: *job_id,
+                        submission_generation: job.submission_generation,
+                        step_id: STEP_BATCH,
+                        run_attempt: *run_attempt,
+                        name: "batch".into(),
+                        state: StepState::Running,
+                        num_tasks: 1,
+                        cpus_per_task: per_node.cpus,
+                        resources: per_node,
+                        nodes: node_names.clone(),
+                        distribution: spur_core::step::TaskDistribution::Block,
+                        start_time: Some(timestamp),
+                        end_time: None,
+                        exit_code: None,
+                    },
+                );
+            }
+            WalOperation::JobDispatchPublish {
+                job_id,
+                submission_generation,
+                run_attempt,
+            } => {
+                let Some(job) = jobs.get_mut(job_id) else {
+                    return ClientResponse::default();
+                };
+                let Some(dispatch) = job.pending_dispatch.as_ref().cloned() else {
+                    return ClientResponse::default();
+                };
+                if job.state != JobState::Pending
+                    || job.submission_generation != *submission_generation
+                    || dispatch.submission_generation != *submission_generation
+                    || job.run_attempt != *run_attempt
+                    || dispatch.run_attempt != *run_attempt
+                    || dispatch.phase != PendingDispatchPhase::Committed
+                {
+                    return ClientResponse::default();
+                }
+                if durable_finalization.is_some_and(|context| {
+                    !Self::finalization_context_matches_job(context, job, false)
+                }) {
+                    return ClientResponse::default();
+                }
+                let publication_target_failed = dispatch.target_nodes.iter().any(|name| {
+                    nodes.get(name).is_none_or(|node| {
+                        !matches!(
+                            node.state,
+                            NodeState::Idle
+                                | NodeState::Allocated
+                                | NodeState::Mixed
+                                | NodeState::Draining
+                        ) || node.incarnation.is_empty()
+                            || dispatch
+                                .target_incarnations
+                                .get(name)
+                                .is_none_or(String::is_empty)
+                            || dispatch.target_incarnations.get(name) != Some(&node.incarnation)
+                    })
+                });
+                let mut disposition = dispatch.terminal_after_cleanup.clone();
+                if publication_target_failed && disposition.is_none() {
+                    disposition = Some(Self::terminal_disposition(
+                        JobState::NodeFail,
+                        -1,
+                        Some(PendingReason::NodeDown),
+                        None,
+                        durable_finalization.cloned(),
+                    ));
+                }
+                let mut early: Vec<_> = dispatch.early_completions.clone().into_iter().collect();
+                early.sort_by(|(left, _), (right, _)| left.cmp(right));
+                if let Err(error) = job.transition(JobState::Running) {
+                    warn!(job_id = *job_id, %error, "invalid dispatch publication transition");
+                    return ClientResponse::default();
+                }
+                response.dispatch_published = true;
+                let aborting = disposition.is_some();
+                let owned = job
+                    .pending_dispatch
+                    .as_mut()
+                    .expect("committed dispatch was validated");
+                owned.phase = if aborting {
+                    PendingDispatchPhase::Aborting
+                } else {
+                    PendingDispatchPhase::Published
+                };
+                if let Some(disposition) = disposition {
+                    owned.terminal_after_cleanup = Some(disposition);
+                }
+
+                let mut finalized = None;
+                for (node_name, completion) in early {
+                    if !Self::release_owned_target_locked(*job_id, job, &mut nodes, &node_name) {
+                        continue;
+                    }
+                    if aborting {
+                        job.node_completions.insert(node_name, completion);
+                    } else {
+                        finalized = Self::record_node_completion_locked(
+                            *job_id,
+                            job,
+                            &node_name,
+                            completion,
+                            timestamp,
+                            durable_finalization,
+                        );
+                    }
+                    if finalized.is_some() {
+                        break;
+                    }
+                }
+                if let Some(finalized) = finalized {
+                    job.pending_dispatch = None;
+                    let exit_code = finalized.exit_code;
+                    response.jobs_finalized.push(finalized);
+                    drop(jobs);
+                    drop(nodes);
+                    self.complete_job_steps(job_id, exit_code, timestamp);
+                    self.next_job_id.store(next_id, Ordering::Relaxed);
+                    return response;
+                }
+            }
             WalOperation::JobStart {
                 job_id,
                 nodes: node_names,
                 resources,
                 per_node_alloc,
+                allocated_node_incarnations,
                 srun_step_dispatch,
                 run_attempt,
             } => {
@@ -4614,10 +8739,13 @@ impl ClusterManager {
                     job.allocated_nodes = node_names.clone();
                     job.allocated_resources = Some(resources.clone());
                     job.per_node_alloc = per_node_alloc.clone();
+                    job.allocated_node_incarnations = allocated_node_incarnations.clone();
                     job.set_pending_reason(PendingReason::None);
                     job.srun_step_dispatch = *srun_step_dispatch;
                     job.run_attempt = *run_attempt;
                     job.launch_failure_detail = None;
+                    job.transient_capacity_rejections.clear();
+                    job.pending_dispatch = None;
                 }
                 let node_count = node_names.len().max(1) as u32;
                 for name in node_names {
@@ -4637,124 +8765,487 @@ impl ClusterManager {
                 // running jobs (see available_licenses()), so the config total is
                 // authoritative and cannot drift.
             }
+            WalOperation::JobStandaloneStart {
+                job_id,
+                submission_generation,
+                nodes: node_names,
+                resources,
+                per_node_alloc,
+                target_incarnations,
+            } => {
+                let Some(job) = jobs.get_mut(job_id) else {
+                    return ClientResponse::default();
+                };
+                let exact_replay = job.submission_generation == *submission_generation
+                    && job.state == JobState::Running
+                    && job.srun_step_dispatch
+                    && job.run_attempt == 0
+                    && job.allocated_nodes == *node_names
+                    && job
+                        .allocated_resources
+                        .as_ref()
+                        .is_some_and(|allocated| allocations_equivalent(allocated, resources))
+                    && job.per_node_alloc == *per_node_alloc
+                    && job.allocated_node_incarnations == *target_incarnations;
+                if exact_replay {
+                    return ClientResponse::default();
+                }
+                let distinct_nodes: HashSet<_> = node_names.iter().collect();
+                let identities_match_nodes = distinct_nodes.len() == node_names.len()
+                    && target_incarnations.len() == distinct_nodes.len()
+                    && node_names.iter().all(|name| {
+                        per_node_alloc.contains_key(name)
+                            && target_incarnations
+                                .get(name)
+                                .is_some_and(|incarnation| !incarnation.is_empty())
+                    });
+                let workers_still_match = identities_match_nodes
+                    && node_names.iter().all(|name| {
+                        nodes.get(name).is_some_and(|node| {
+                            target_incarnations.get(name) == Some(&node.incarnation)
+                        })
+                    });
+                let reservation_matches = job.pending_dispatch.as_ref().is_some_and(|dispatch| {
+                    dispatch.submission_generation == *submission_generation
+                        && dispatch.run_attempt == 0
+                        && dispatch.phase == PendingDispatchPhase::Launching
+                        && dispatch.target_nodes == *node_names
+                        && allocations_equivalent(&dispatch.resources, resources)
+                        && dispatch.per_node_alloc == *per_node_alloc
+                        && dispatch.target_incarnations == *target_incarnations
+                });
+                let reservation_is_charged = per_node_alloc.iter().all(|(name, slice)| {
+                    nodes
+                        .get(name)
+                        .is_some_and(|node| allocation_contains(&node.alloc_resources, slice))
+                });
+                if submission_generation.is_nil()
+                    || job.submission_generation != *submission_generation
+                    || !job.spec.srun_job
+                    || job.state != JobState::Pending
+                    || job.run_attempt != 0
+                    || !reservation_matches
+                    || !reservation_is_charged
+                    || !workers_still_match
+                {
+                    return ClientResponse::default();
+                }
+                if let Err(error) = job.transition(JobState::Running) {
+                    warn!(job_id = *job_id, %error, "invalid standalone start transition");
+                    return ClientResponse::default();
+                }
+                job.start_time = Some(timestamp);
+                job.allocated_nodes = node_names.clone();
+                job.allocated_resources = Some(resources.clone());
+                job.per_node_alloc = per_node_alloc.clone();
+                job.allocated_node_incarnations = target_incarnations.clone();
+                job.set_pending_reason(PendingReason::None);
+                job.srun_step_dispatch = true;
+                job.run_attempt = 0;
+                job.launch_failure_detail = None;
+                job.transient_capacity_rejections.clear();
+                job.pending_dispatch = None;
+            }
             WalOperation::JobNodeComplete {
                 job_id,
+                submission_generation,
+                worker_incarnation,
                 node_name,
                 exit_code,
                 signal,
+                drain_reason,
+                run_attempt,
+                submission_token,
             } => {
+                let requested_receipt = SubmissionCompletionReceipt {
+                    node_name: node_name.clone(),
+                    run_attempt: *run_attempt,
+                    worker_incarnation: worker_incarnation.clone(),
+                    exit_code: *exit_code,
+                    signal: *signal,
+                    drain_reason: drain_reason.clone(),
+                };
+                if let Some(token) = submission_token.as_deref() {
+                    let submission_tokens = self.submission_tokens.read();
+                    let Some(record) = submission_tokens.get(token) else {
+                        response.completion_conflict = true;
+                        return response;
+                    };
+                    match record.classify_completion_receipt(
+                        *job_id,
+                        *submission_generation,
+                        &requested_receipt,
+                    ) {
+                        CompletionReceiptMatch::Exact => {
+                            response.completion_accepted = true;
+                            return response;
+                        }
+                        CompletionReceiptMatch::Conflict => {
+                            response.completion_conflict = true;
+                            return response;
+                        }
+                        CompletionReceiptMatch::New => {}
+                    }
+                }
                 let finalized = {
                     let Some(job) = jobs.get_mut(job_id) else {
-                        return ClientResponse::default();
+                        if submission_token.is_some() {
+                            response.completion_conflict = true;
+                        }
+                        return response;
                     };
+                    if job.submission_generation != *submission_generation {
+                        if submission_token.is_some() {
+                            response.completion_conflict = true;
+                        }
+                        return response;
+                    }
+                    if submission_token
+                        .as_deref()
+                        .is_some_and(|token| job.submission_token.as_deref() != Some(token))
+                    {
+                        response.completion_conflict = true;
+                        return response;
+                    }
+                    if durable_finalization.is_some_and(|context| {
+                        !Self::finalization_context_matches_job(context, job, false)
+                    }) {
+                        return ClientResponse::default();
+                    }
+                    if job.state.is_terminal() {
+                        let exact_terminal_owner = submission_token.is_some()
+                            && *run_attempt != 0
+                            && job.run_attempt == *run_attempt
+                            && job.allocated_nodes.iter().any(|node| node == node_name)
+                            && job
+                                .allocated_node_incarnations
+                                .get(node_name)
+                                .map(String::as_str)
+                                == Some(worker_incarnation.as_str());
+                        if !exact_terminal_owner {
+                            if submission_token.is_some() {
+                                response.completion_conflict = true;
+                            }
+                            return response;
+                        }
+                        match self.persist_completion_receipt(
+                            submission_token.as_deref(),
+                            *job_id,
+                            *submission_generation,
+                            &requested_receipt,
+                        ) {
+                            CompletionReceiptMatch::New | CompletionReceiptMatch::Exact => {
+                                response.completion_accepted = true;
+                            }
+                            CompletionReceiptMatch::Conflict => {
+                                response.completion_conflict = true;
+                            }
+                        }
+                        return response;
+                    }
+                    if job.state == JobState::Pending {
+                        let completion = spur_core::job::NodeCompletion {
+                            code: *exit_code,
+                            signal: *signal,
+                        };
+                        let phase = job
+                            .pending_dispatch
+                            .as_ref()
+                            .map(|dispatch| dispatch.phase)
+                            .unwrap_or_default();
+                        match phase {
+                            PendingDispatchPhase::Launching | PendingDispatchPhase::Committed => {
+                                let natural = {
+                                    let Some(dispatch) = job.pending_dispatch.as_mut() else {
+                                        return ClientResponse::default();
+                                    };
+                                    if *run_attempt == 0
+                                        || dispatch.run_attempt != *run_attempt
+                                        || !dispatch
+                                            .target_nodes
+                                            .iter()
+                                            .any(|node| node == node_name)
+                                        || dispatch.target_incarnations.get(node_name)
+                                            != Some(worker_incarnation)
+                                    {
+                                        return ClientResponse::default();
+                                    }
+                                    dispatch
+                                        .early_completions
+                                        .entry(node_name.clone())
+                                        .or_insert(completion);
+                                    (dispatch.early_completions.len()
+                                        == dispatch.target_nodes.len()
+                                        && dispatch.terminal_after_cleanup.is_none()
+                                        && dispatch.preempt_requeue_after_cleanup.is_none())
+                                    .then(|| {
+                                        (
+                                            dispatch.phase,
+                                            dispatch.early_completions.clone(),
+                                            dispatch
+                                                .target_nodes
+                                                .first()
+                                                .cloned()
+                                                .unwrap_or_default(),
+                                            dispatch.target_nodes.clone(),
+                                            dispatch.target_incarnations.clone(),
+                                            dispatch.resources.clone(),
+                                            dispatch.per_node_alloc.clone(),
+                                        )
+                                    })
+                                };
+                                if let Some((
+                                    natural_phase,
+                                    completions,
+                                    primary,
+                                    target_nodes,
+                                    target_incarnations,
+                                    resources,
+                                    per_node_alloc,
+                                )) = natural
+                                {
+                                    if natural_phase == PendingDispatchPhase::Launching {
+                                        job.start_time = Some(timestamp);
+                                        job.allocated_nodes = target_nodes.clone();
+                                        job.allocated_resources = Some(resources.clone());
+                                        job.per_node_alloc = per_node_alloc.clone();
+                                        job.allocated_node_incarnations = target_incarnations;
+                                        job.set_pending_reason(PendingReason::None);
+                                        job.srun_step_dispatch = false;
+                                        job.launch_failure_detail = None;
+                                        job.transient_capacity_rejections.clear();
+                                        job.pending_dispatch
+                                            .as_mut()
+                                            .expect("dispatch completion was validated")
+                                            .phase = PendingDispatchPhase::Committed;
+                                        response.dispatch_committed = true;
+
+                                        let node_count = target_nodes.len().max(1) as u32;
+                                        let per_node = target_nodes
+                                            .first()
+                                            .and_then(|name| per_node_alloc.get(name).cloned())
+                                            .unwrap_or_else(|| {
+                                                ResourceAllocations::with_scalar(
+                                                    resources.cpus / node_count,
+                                                    resources.memory_mb / node_count as u64,
+                                                )
+                                            });
+                                        self.steps.write().insert(
+                                            (*job_id, STEP_BATCH),
+                                            JobStep {
+                                                job_id: *job_id,
+                                                submission_generation: job.submission_generation,
+                                                step_id: STEP_BATCH,
+                                                run_attempt: *run_attempt,
+                                                name: "batch".into(),
+                                                state: StepState::Running,
+                                                num_tasks: 1,
+                                                cpus_per_task: per_node.cpus,
+                                                resources: per_node,
+                                                nodes: target_nodes,
+                                                distribution:
+                                                    spur_core::step::TaskDistribution::Block,
+                                                start_time: Some(timestamp),
+                                                end_time: None,
+                                                exit_code: None,
+                                            },
+                                        );
+                                    }
+                                    let disposition = Self::natural_completion_disposition(
+                                        job,
+                                        &completions,
+                                        &primary,
+                                        durable_finalization.cloned(),
+                                    );
+                                    job.pending_dispatch
+                                        .as_mut()
+                                        .expect("dispatch completion was validated")
+                                        .terminal_after_cleanup = Some(disposition);
+                                }
+                                Self::apply_completion_drain_locked(
+                                    &mut nodes,
+                                    node_name,
+                                    drain_reason,
+                                );
+                                response.completion_buffered = true;
+                            }
+                            PendingDispatchPhase::Aborting => {
+                                let Some(dispatch) = job.pending_dispatch.as_ref() else {
+                                    return ClientResponse::default();
+                                };
+                                if *run_attempt == 0
+                                    || dispatch.run_attempt != *run_attempt
+                                    || !dispatch.target_nodes.iter().any(|node| node == node_name)
+                                    || dispatch.target_incarnations.get(node_name)
+                                        != Some(worker_incarnation)
+                                {
+                                    return ClientResponse::default();
+                                }
+                                if Self::release_owned_target_locked(
+                                    *job_id, job, &mut nodes, node_name,
+                                ) {
+                                    job.node_completions.insert(node_name.clone(), completion);
+                                    Self::apply_completion_drain_locked(
+                                        &mut nodes,
+                                        node_name,
+                                        drain_reason,
+                                    );
+                                    response.completion_buffered = true;
+                                }
+                            }
+                            PendingDispatchPhase::Published => {
+                                return ClientResponse::default();
+                            }
+                        }
+                        if response.completion_buffered
+                            && self.persist_completion_receipt(
+                                submission_token.as_deref(),
+                                *job_id,
+                                *submission_generation,
+                                &requested_receipt,
+                            ) == CompletionReceiptMatch::Conflict
+                        {
+                            response.completion_conflict = true;
+                        }
+                        return response;
+                    }
                     // A completion for a non-active job is stale/replayed; skip
                     // it rather than forcing an illegal finalize transition.
                     if !job.state.is_active() {
                         return ClientResponse::default();
                     }
-
-                    let already_reported = job.node_completions.contains_key(node_name);
-                    job.node_completions.insert(
-                        node_name.clone(),
-                        spur_core::job::NodeCompletion {
-                            code: *exit_code,
-                            signal: *signal,
-                        },
-                    );
-
-                    if let Some(ref total) = job.allocated_resources {
-                        if !already_reported {
-                            let node_count = job.allocated_nodes.len().max(1) as u32;
-                            if let Some(node) = nodes.get_mut(node_name) {
-                                let slice = job.per_node_alloc.get(node_name).cloned().unwrap_or_else(|| {
-                                    warn!(job_id = *job_id, node = %node_name, "per_node_alloc missing at node deallocation, using scalar fallback");
-                                    ResourceAllocations::with_scalar(
-                                        total.cpus / node_count,
-                                        total.memory_mb / node_count as u64,
-                                    )
-                                });
-                                node.alloc_resources.subtract(&slice);
-                                node.update_state_from_alloc();
-                                if node.state == NodeState::Draining
-                                    && node.alloc_resources.cpus == 0
-                                    && !node.alloc_resources.has_devices()
-                                {
-                                    node.state = NodeState::Drain;
+                    let completion = spur_core::job::NodeCompletion {
+                        code: *exit_code,
+                        signal: *signal,
+                    };
+                    if let Some(dispatch) = job.pending_dispatch.as_ref() {
+                        if *run_attempt == 0
+                            || dispatch.run_attempt != *run_attempt
+                            || !dispatch.target_nodes.iter().any(|node| node == node_name)
+                            || dispatch.target_incarnations.get(node_name)
+                                != Some(worker_incarnation)
+                        {
+                            return ClientResponse::default();
+                        }
+                        match dispatch.phase {
+                            PendingDispatchPhase::Published => {
+                                if !Self::release_owned_target_locked(
+                                    *job_id, job, &mut nodes, node_name,
+                                ) {
+                                    return ClientResponse::default();
                                 }
-                            }
-                        }
-                    }
-
-                    // Suspended jobs route through Completing too, so an
-                    // out-of-band task death finalizes instead of stranding.
-                    if matches!(job.state, JobState::Running | JobState::Suspended) {
-                        if let Err(e) = job.transition(JobState::Completing) {
-                            warn!(job_id = *job_id, error = %e, "invalid transition to Completing");
-                        }
-                        job.end_time = Some(timestamp);
-                    }
-
-                    if job.all_nodes_completed() {
-                        // Primary = batch node (allocated_nodes[0]); empty when
-                        // none allocated, where derived_completion falls back to
-                        // the worst completion.
-                        let primary = job.allocated_nodes.first().cloned().unwrap_or_default();
-                        // spurd flags an OOM kill via a sentinel bit in the signal;
-                        // detect it, then strip the bit so the stored signal is the
-                        // real SIGKILL and the job reports OUT_OF_MEMORY.
-                        let oom = job
-                            .node_completions
-                            .values()
-                            .any(|c| c.signal & spur_core::job::OOM_SIGNAL_FLAG != 0);
-                        let (derived_state, final_exit, raw_signal) =
-                            Job::derived_completion(&job.node_completions, &primary);
-                        let final_signal = raw_signal & !spur_core::job::OOM_SIGNAL_FLAG;
-                        let (final_state, final_reason) =
-                            job.completion_verdict(derived_state, final_exit, final_signal, oom);
-                        match job.transition(final_state) {
-                            Ok(()) => {
-                                job.exit_code = Some(final_exit);
-                                job.exit_signal = final_signal;
-                                // DerivedExitCode is the running max over srun
-                                // steps, accumulated live by JobStepComplete; a
-                                // job with no srun steps keeps 0 (Slurm parity),
-                                // not the batch exit. Left as-is here.
-                                job.set_pending_reason(final_reason);
-                                job.end_time = Some(timestamp);
-                                job.node_completions.clear();
-                                Some((final_state, final_exit))
-                            }
-                            Err(e) => {
-                                warn!(
-                                    job_id = *job_id,
-                                    error = %e,
-                                    "invalid final completion transition"
+                                response.completion_accepted = true;
+                                Self::apply_completion_drain_locked(
+                                    &mut nodes,
+                                    node_name,
+                                    drain_reason,
                                 );
+                                let finalized = Self::record_node_completion_locked(
+                                    *job_id,
+                                    job,
+                                    node_name,
+                                    completion,
+                                    timestamp,
+                                    durable_finalization,
+                                );
+                                if finalized.is_some() {
+                                    job.pending_dispatch = None;
+                                } else if let Some(dispatch) = job.pending_dispatch.as_ref() {
+                                    response.completion_remaining_nodes =
+                                        dispatch.target_nodes.clone();
+                                    response.completion_submission_generation =
+                                        job.submission_generation.to_string();
+                                    response.completion_run_attempt = job.run_attempt;
+                                }
+                                finalized
+                            }
+                            PendingDispatchPhase::Aborting => {
+                                if Self::release_owned_target_locked(
+                                    *job_id, job, &mut nodes, node_name,
+                                ) {
+                                    job.node_completions.insert(node_name.clone(), completion);
+                                    response.completion_buffered = true;
+                                }
+                                None
+                            }
+                            PendingDispatchPhase::Launching | PendingDispatchPhase::Committed => {
                                 None
                             }
                         }
                     } else {
-                        None
+                        if *run_attempt != 0
+                            && job.run_attempt != 0
+                            && *run_attempt != job.run_attempt
+                        {
+                            return ClientResponse::default();
+                        }
+                        if !job.allocated_nodes.iter().any(|node| node == node_name) {
+                            return ClientResponse::default();
+                        }
+                        if job
+                            .allocated_node_incarnations
+                            .get(node_name)
+                            .map(String::as_str)
+                            .unwrap_or_default()
+                            != worker_incarnation
+                        {
+                            return ClientResponse::default();
+                        }
+                        response.completion_accepted = true;
+                        let finalized = Self::apply_node_completion_locked(
+                            *job_id,
+                            job,
+                            &mut nodes,
+                            node_name,
+                            completion,
+                            timestamp,
+                            durable_finalization,
+                        );
+                        Self::apply_completion_drain_locked(&mut nodes, node_name, drain_reason);
+                        if finalized.is_none() {
+                            response.completion_remaining_nodes = job
+                                .allocated_nodes
+                                .iter()
+                                .filter(|node| !job.node_completions.contains_key(*node))
+                                .cloned()
+                                .collect();
+                            response.completion_submission_generation =
+                                job.submission_generation.to_string();
+                            response.completion_run_attempt = job.run_attempt;
+                        }
+                        finalized
                     }
                 };
 
-                if let Some((final_state, final_exit)) = finalized {
+                if (response.completion_accepted
+                    || response.completion_buffered
+                    || finalized.is_some())
+                    && self.persist_completion_receipt(
+                        submission_token.as_deref(),
+                        *job_id,
+                        *submission_generation,
+                        &requested_receipt,
+                    ) == CompletionReceiptMatch::Conflict
+                {
+                    response.completion_conflict = true;
+                }
+
+                if let Some(finalized) = finalized {
                     drop(jobs);
                     drop(nodes);
-                    self.complete_job_steps(job_id, final_exit, timestamp);
+                    self.complete_job_steps(job_id, finalized.exit_code, timestamp);
                     self.next_job_id.store(next_id, Ordering::Relaxed);
-                    return ClientResponse {
-                        jobs_finalized: vec![JobFinalized {
-                            job_id: *job_id,
-                            state: final_state,
-                            exit_code: final_exit,
-                        }],
-                        ..Default::default()
-                    };
+                    response.jobs_finalized.push(finalized);
+                    return response;
                 }
             }
             WalOperation::JobTimeLimitSignaled { job_id, at } => {
                 if let Some(job) = jobs.get_mut(job_id) {
+                    if durable_finalization.is_some_and(|context| {
+                        !Self::finalization_context_matches_job(context, job, false)
+                    }) {
+                        return ClientResponse::default();
+                    }
                     // A run that already ended keeps the verdict it finalized
                     // with: the watchdog raced the job's own exit and lost.
                     if job.state.is_active() && job.time_limit_signaled_at.is_none() {
@@ -4762,22 +9253,201 @@ impl ClusterManager {
                     }
                 }
             }
-            WalOperation::JobComplete {
-                job_id,
-                exit_code,
-                state,
-            } => {
+            WalOperation::JobComplete { .. }
+            | WalOperation::JobStandaloneCancel { .. }
+            | WalOperation::JobCancelExact { .. }
+            | WalOperation::SubmissionTokenCancel { .. } => {
+                let mut token_finalization = None;
+                let (
+                    job_id_value,
+                    exit_code_value,
+                    state_value,
+                    expected_generation,
+                    standalone_only,
+                    finalization_intent,
+                ) = match op {
+                    WalOperation::JobComplete {
+                        job_id,
+                        exit_code,
+                        state,
+                        finalization_intent,
+                    } => (
+                        *job_id,
+                        *exit_code,
+                        *state,
+                        None,
+                        false,
+                        finalization_intent.clone(),
+                    ),
+                    WalOperation::JobStandaloneCancel {
+                        job_id,
+                        submission_generation,
+                    } => (
+                        *job_id,
+                        -1,
+                        JobState::Cancelled,
+                        Some(*submission_generation),
+                        true,
+                        None,
+                    ),
+                    WalOperation::JobCancelExact {
+                        job_id,
+                        expected_submission_generation,
+                    } => (
+                        *job_id,
+                        -1,
+                        JobState::Cancelled,
+                        Some(*expected_submission_generation),
+                        false,
+                        None,
+                    ),
+                    WalOperation::SubmissionTokenCancel { token } => {
+                        let Some(envelope) = durable_finalization else {
+                            warn!(
+                                "refusing submission-token cancellation without durable envelope"
+                            );
+                            return response;
+                        };
+                        let (job_id, submission_generation, cleanup_complete) = {
+                            let mut submission_tokens = self.submission_tokens.write();
+                            let record = submission_tokens
+                                .entry(token.clone())
+                                .or_insert_with(SubmissionTokenRecord::cancelled_tombstone);
+                            record.cancelled = true;
+                            (
+                                record.job_id,
+                                record.submission_generation,
+                                record.cleanup_complete,
+                            )
+                        };
+                        response.submission_cancelled = true;
+                        response.submission_job_id = job_id;
+                        response.submission_generation = submission_generation;
+                        response.submission_cleanup_complete = cleanup_complete;
+                        if job_id == 0 || submission_generation.is_nil() {
+                            return response;
+                        }
+                        let Some(job) = jobs.get(&job_id) else {
+                            if let Some(record) = self.submission_tokens.write().get_mut(token) {
+                                record.cleanup_complete = true;
+                            }
+                            response.submission_cleanup_complete = true;
+                            return response;
+                        };
+                        if job.submission_generation != submission_generation {
+                            // Token records are immutable identity bindings. A
+                            // conflicting in-memory job ID is a replacement and
+                            // must never be touched by this delayed fence.
+                            if let Some(record) = self.submission_tokens.write().get_mut(token) {
+                                record.cleanup_complete = true;
+                            }
+                            response.submission_cleanup_complete = true;
+                            return response;
+                        }
+                        if job.state.is_terminal()
+                            && job.pending_dispatch.is_none()
+                            && job.pending_finalization.is_none()
+                        {
+                            if let Some(record) = self.submission_tokens.write().get_mut(token) {
+                                record.cleanup_complete = true;
+                            }
+                            response.submission_cleanup_complete = true;
+                            return response;
+                        }
+                        if let Some(record) = self.submission_tokens.write().get_mut(token) {
+                            record.cleanup_complete = false;
+                        }
+                        response.submission_cleanup_complete = false;
+                        let (_, expected_node_incarnations) = Self::finalization_ownership(job);
+                        let mut context = (*envelope).clone();
+                        context.expected_submission_generation = Some(submission_generation);
+                        context.expected_run_attempt = Some(job.run_attempt);
+                        context.expected_node_incarnations = expected_node_incarnations;
+                        token_finalization = Some(context);
+                        (
+                            job_id,
+                            -1,
+                            JobState::Cancelled,
+                            Some(submission_generation),
+                            false,
+                            None,
+                        )
+                    }
+                    _ => unreachable!("match arm only accepts completion operations"),
+                };
+                let effective_finalization = token_finalization.as_ref().or(durable_finalization);
+                let job_id = &job_id_value;
+                let exit_code = &exit_code_value;
+                let state = &state_value;
                 let freed_nodes;
                 let allocated_resources;
                 let already_deallocated;
                 if let Some(job) = jobs.get_mut(job_id) {
+                    // Generic cancellation cannot make a standalone allocation
+                    // visible as free until every exact worker owner is reaped.
+                    if !standalone_only
+                        && *state == JobState::Cancelled
+                        && job.srun_step_dispatch
+                        && job.run_attempt == 0
+                    {
+                        return response;
+                    }
+                    if let Some(generation) = expected_generation {
+                        if generation.is_nil() || job.submission_generation != generation {
+                            return response;
+                        }
+                        if standalone_only
+                            && (!job.spec.srun_job
+                                || !job.srun_step_dispatch
+                                || job.run_attempt != 0)
+                        {
+                            return response;
+                        }
+                    }
+                    if effective_finalization.is_some_and(|context| {
+                        !Self::finalization_context_matches_job(context, job, false)
+                    }) {
+                        return response;
+                    }
+                    if state.is_finalized() && !standalone_only {
+                        if *state == JobState::Deadline
+                            && job.pending_dispatch.as_ref().is_some_and(|dispatch| {
+                                matches!(
+                                    dispatch.phase,
+                                    PendingDispatchPhase::Committed
+                                        | PendingDispatchPhase::Published
+                                )
+                            })
+                        {
+                            return response;
+                        }
+                        let mut disposition = Self::terminal_disposition(
+                            *state,
+                            *exit_code,
+                            None,
+                            None,
+                            effective_finalization.cloned(),
+                        );
+                        if let Some(intent) = finalization_intent.clone() {
+                            disposition.finalization_intent = intent;
+                        }
+                        match Self::defer_terminal_for_dispatch(job, disposition) {
+                            DispatchDeferral::Won => {
+                                response.terminal_cleanup_deferred = true;
+                                return response;
+                            }
+                            DispatchDeferral::Lost => return response,
+                            DispatchDeferral::NotOwned => {}
+                        }
+                    }
                     // is_finalized (incl. Preempted): a stale/replayed complete
                     // is a silent no-op, not a rejected-transition warning.
                     // Preempted is finalized for the ended run but may still cancel.
-                    if job.state.is_finalized()
-                        && !(job.state == JobState::Preempted && *state == JobState::Cancelled)
+                    if job.pending_finalization.is_some()
+                        || (job.state.is_finalized()
+                            && !(job.state == JobState::Preempted && *state == JobState::Cancelled))
                     {
-                        return ClientResponse::default();
+                        return response;
                     }
                     if let Err(e) = job.transition(*state) {
                         warn!(
@@ -4785,33 +9455,39 @@ impl ClusterManager {
                             error = %e,
                             "invalid state transition in WAL apply"
                         );
-                        return ClientResponse::default();
-                    }
-                    if state.is_terminal() {
-                        response.jobs_finalized.push(JobFinalized {
-                            job_id: *job_id,
-                            state: *state,
-                            exit_code: *exit_code,
-                        });
+                        return response;
                     }
                     job.exit_code = Some(*exit_code);
                     job.end_time = Some(timestamp);
                     // Derived from the replicated entry, so every replica reports
-                    // the same reason for a job the watchdog had to force-kill.
-                    if *state == JobState::Timeout {
-                        job.set_pending_reason(PendingReason::TimeLimit);
+                    // the same reason for controller-driven terminal outcomes.
+                    match *state {
+                        JobState::Timeout => job.set_pending_reason(PendingReason::TimeLimit),
+                        JobState::Deadline => job.set_pending_reason(PendingReason::DeadLine),
+                        _ => {}
                     }
                     // Suspended -> terminal: fold the final suspended interval in
                     // and clear suspended_at so it never lingers on a terminal job.
                     if let Some(since) = job.suspended_at.take() {
                         job.suspended_secs += (timestamp - since).num_seconds().max(0);
                     }
+                    if state.is_finalized() {
+                        response
+                            .jobs_finalized
+                            .push(Self::record_pending_finalization(
+                                job,
+                                finalization_intent.clone().unwrap_or_else(|| {
+                                    FinalizationIntent::for_terminal_state(*state)
+                                }),
+                                effective_finalization,
+                            ));
+                    }
                     freed_nodes = job.allocated_nodes.clone();
                     allocated_resources = job.allocated_resources.clone();
                     already_deallocated = job.node_completions.keys().cloned().collect::<Vec<_>>();
                     job.node_completions.clear();
                 } else {
-                    return ClientResponse::default();
+                    return response;
                 }
                 // Deallocate node resources not already freed during COMPLETING
                 let per_node_map = jobs
@@ -4847,15 +9523,135 @@ impl ClusterManager {
                 drop(nodes);
                 self.complete_job_steps(job_id, *exit_code, timestamp);
             }
+            WalOperation::JobFinalizationAck {
+                job_id,
+                marker,
+                action,
+            } => {
+                let Some(job) = jobs.get_mut(job_id) else {
+                    return ClientResponse::default();
+                };
+                let action_matches_intent =
+                    Self::finalization_action_matches_intent(marker, action);
+                let cancelled_token_dominates_requeue = action_matches_intent
+                    && matches!(action, FinalizationAction::Requeue { .. })
+                    && job.submission_token.as_deref().is_some_and(|token| {
+                        self.submission_tokens
+                            .read()
+                            .get(token)
+                            .is_some_and(|record| {
+                                record.cancelled
+                                    && record.job_id == *job_id
+                                    && record.submission_generation == marker.submission_generation
+                            })
+                    });
+                if job.pending_finalization.as_ref() != Some(marker)
+                    || job.submission_generation != marker.submission_generation
+                    || job.run_attempt != marker.run_attempt
+                    || job.state != marker.state
+                    || job.exit_code != Some(marker.exit_code)
+                    || job.exit_signal != marker.exit_signal
+                    || job.derived_exit_code != marker.derived_exit_code
+                    || job.end_time != Some(marker.end_time)
+                    || !action_matches_intent
+                {
+                    return ClientResponse::default();
+                }
+                let completed_cancel_token = (cancelled_token_dominates_requeue
+                    || matches!(action, FinalizationAction::KeepTerminal))
+                .then(|| job.submission_token.clone())
+                .flatten();
+
+                match (cancelled_token_dominates_requeue, action) {
+                    (true, _) => {
+                        info!(
+                            job_id = *job_id,
+                            "permanent submission-token cancellation suppressed finalization requeue"
+                        );
+                    }
+                    (false, FinalizationAction::KeepTerminal) => {}
+                    (
+                        false,
+                        FinalizationAction::Requeue {
+                            begin_time,
+                            pending_reason,
+                            pending_reason_desc,
+                            priority,
+                            counter,
+                        },
+                    ) => {
+                        if let Err(error) = job.transition(JobState::Pending) {
+                            warn!(job_id = *job_id, %error, "cannot apply finalization requeue");
+                            return ClientResponse::default();
+                        }
+                        match counter {
+                            FinalizationRequeueCounter::None => {
+                                Self::clear_run_state_for_requeue(job)
+                            }
+                            FinalizationRequeueCounter::Ordinary => {
+                                Self::reset_job_for_requeue(job)
+                            }
+                            FinalizationRequeueCounter::Preempt => {
+                                Self::reset_job_for_preempt_requeue(job)
+                            }
+                        }
+                        if let Some(hold) = begin_time {
+                            job.spec.begin_time = Some(*hold);
+                        }
+                        match pending_reason_desc {
+                            Some(description) => job.set_pending_reason_desc(
+                                pending_reason.clone(),
+                                description.clone(),
+                            ),
+                            None => job.set_pending_reason(pending_reason.clone()),
+                        }
+                        if let Some(new_priority) = priority {
+                            job.priority = *new_priority;
+                        }
+                    }
+                }
+                job.pending_finalization = None;
+                if let Some(token) = completed_cancel_token {
+                    if let Some(record) = self.submission_tokens.write().get_mut(&token) {
+                        if record.cancelled
+                            && record.job_id == *job_id
+                            && record.submission_generation == marker.submission_generation
+                        {
+                            record.cleanup_complete = true;
+                        }
+                    }
+                }
+
+                // Step completion is part of the same deterministic apply as
+                // consuming the marker.  Node eviction no longer relies on a
+                // response-driven caller to clean up retained steps.
+                self.complete_job_steps(job_id, marker.exit_code, marker.end_time);
+                response.finalization_acked = true;
+            }
             WalOperation::JobStepComplete {
                 job_id,
+                submission_generation,
+                run_attempt,
                 step_id,
                 exit_code,
             } => {
+                let Some(job) = jobs.get(job_id) else {
+                    return ClientResponse::default();
+                };
+                if job.submission_generation != *submission_generation
+                    || *run_attempt != job.run_attempt
+                {
+                    return ClientResponse::default();
+                }
                 // Record the step's own exit code/state.
                 {
                     let mut steps = self.steps.write();
                     if let Some(step) = steps.get_mut(&(*job_id, *step_id)) {
+                        if step.submission_generation != *submission_generation
+                            || step.run_attempt != *run_attempt
+                        {
+                            return ClientResponse::default();
+                        }
                         step.state = if *exit_code == 0 {
                             StepState::Completed
                         } else {
@@ -4889,6 +9685,16 @@ impl ClusterManager {
                         step_id = step.step_id,
                         state = ?job.state,
                         "JobStepCreate: skipping step for terminal job"
+                    );
+                }
+                Some(job)
+                    if step.submission_generation != job.submission_generation
+                        || step.run_attempt != job.run_attempt =>
+                {
+                    warn!(
+                        job_id = step.job_id,
+                        step_id = step.step_id,
+                        "JobStepCreate: skipping step for a stale execution"
                     );
                 }
                 Some(_) => {
@@ -4926,6 +9732,7 @@ impl ClusterManager {
             WalOperation::NodeRegister {
                 name,
                 hostname,
+                incarnation,
                 resources,
                 address,
                 port,
@@ -4940,6 +9747,7 @@ impl ClusterManager {
                 } else {
                     hostname.clone()
                 };
+                node.incarnation = incarnation.clone();
                 node.labels = labels.clone();
                 self.apply_node_config_policy(&mut node);
                 if !address.is_empty() {
@@ -4954,6 +9762,7 @@ impl ClusterManager {
                 }
                 node.source = spur_core::node::resolve_wal_node_source(source, version, labels);
                 node.last_heartbeat = Some(Utc::now());
+                node.agent_start_time = Some(timestamp);
                 node.state = node
                     .state
                     .transition(&NodeEvent::Register, false)
@@ -4977,13 +9786,71 @@ impl ClusterManager {
                 drop(partitions);
 
                 let mut nodes = self.nodes.write();
-                nodes.insert(name.clone(), node);
+                match nodes.entry(name.clone()) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        // A pending dispatch normally prevents removal of its
+                        // target. Rehydrate anyway for old/incomplete state so
+                        // a registering agent cannot make a durable provisional
+                        // reservation disappear from node accounting.
+                        for dispatch in jobs
+                            .values()
+                            .filter_map(|job| job.pending_dispatch.as_ref())
+                        {
+                            if let Some(slice) = dispatch.per_node_alloc.get(name) {
+                                if dispatch.target_incarnations.get(name) != Some(incarnation) {
+                                    return ClientResponse::default();
+                                }
+                                node.alloc_resources.add(slice);
+                            }
+                        }
+                        node.update_state_from_alloc();
+                        entry.insert(node);
+                        response.node_registration_accepted = true;
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        // Creation CAS/idempotency: a delayed duplicate register
+                        // may arrive after JobDispatchBegin reserved capacity.
+                        // Merge only agent/config metadata and preserve resource
+                        // inventory, allocation, lifecycle/admin state, external
+                        // occupancy, and other controller-owned fields.
+                        let existing = entry.get_mut();
+                        let owns_execution =
+                            Self::jobs_own_node_incarnation(&jobs, name, &existing.incarnation)
+                                || existing.alloc_resources != ResourceAllocations::default();
+                        if owns_execution {
+                            if existing.incarnation != node.incarnation {
+                                return ClientResponse::default();
+                            }
+                            // Registration is also a liveness proof, but no
+                            // scheduling or communication metadata may move
+                            // while this incarnation owns an execution.
+                            existing.last_heartbeat = node.last_heartbeat;
+                            response.node_registration_accepted = true;
+                            return response;
+                        }
+                        existing.hostname = node.hostname;
+                        existing.incarnation = node.incarnation;
+                        existing.labels = node.labels;
+                        existing.features = node.features;
+                        existing.weight = node.weight;
+                        existing.partitions = node.partitions;
+                        existing.address = node.address;
+                        existing.port = node.port;
+                        existing.wg_pubkey = node.wg_pubkey;
+                        existing.version = node.version;
+                        existing.source = node.source;
+                        existing.last_heartbeat = node.last_heartbeat;
+                        existing.agent_start_time = node.agent_start_time;
+                        response.node_registration_accepted = true;
+                    }
+                }
                 self.next_job_id.store(next_id, Ordering::Relaxed);
-                return ClientResponse::default();
+                return response;
             }
             WalOperation::NodeUpdate {
                 name,
                 hostname,
+                incarnation,
                 resources,
                 address,
                 port,
@@ -4992,6 +9859,20 @@ impl ClusterManager {
                 source,
             } => {
                 if let Some(node) = nodes.get_mut(name) {
+                    let owns_execution =
+                        Self::jobs_own_node_incarnation(&jobs, name, &node.incarnation)
+                            || node.alloc_resources != ResourceAllocations::default();
+                    if owns_execution {
+                        if !incarnation.is_empty() && node.incarnation != *incarnation {
+                            return ClientResponse::default();
+                        }
+                        node.last_heartbeat = Some(Utc::now());
+                        response.node_registration_accepted = true;
+                        return response;
+                    }
+                    if !incarnation.is_empty() {
+                        node.incarnation = incarnation.clone();
+                    }
                     node.total_resources = resources.clone();
                     if !hostname.is_empty() {
                         node.hostname = hostname.clone();
@@ -5009,26 +9890,82 @@ impl ClusterManager {
                     node.source =
                         spur_core::node::resolve_wal_node_source(source, version, &node.labels);
                     node.last_heartbeat = Some(Utc::now());
+                    response.node_registration_accepted = true;
                 }
             }
             WalOperation::NodeStateChange {
                 name,
+                expected_incarnation,
                 new_state,
                 reason,
                 admin_locked,
                 ..
             } => {
-                if let Some(node) = nodes.get_mut(name) {
-                    node.state = *new_state;
-                    node.state_reason = reason.clone();
-                    node.admin_locked = *admin_locked;
+                if *new_state == NodeState::Down
+                    && durable_finalization.is_some_and(|context| !context.is_node_lifecycle())
+                {
+                    return ClientResponse::default();
                 }
+                let Some(node) = nodes.get_mut(name) else {
+                    return ClientResponse::default();
+                };
+                if !expected_incarnation.is_empty() && node.incarnation != *expected_incarnation {
+                    return ClientResponse::default();
+                }
+                node.state = *new_state;
+                node.state_reason = reason.clone();
+                node.admin_locked = *admin_locked;
+                response.node_state_changed = true;
                 if *new_state == NodeState::Down {
-                    Self::evict_jobs_on_node(name, &mut jobs, &mut nodes, timestamp, &mut response);
+                    Self::evict_jobs_on_node(
+                        name,
+                        &mut jobs,
+                        &mut nodes,
+                        timestamp,
+                        &mut response,
+                        durable_finalization,
+                    );
+                }
+            }
+            WalOperation::NodeStateChangeExact {
+                name,
+                expected_incarnation,
+                expected_old_state,
+                new_state,
+                reason,
+                admin_locked,
+            } => {
+                let Some(node) = nodes.get_mut(name) else {
+                    return ClientResponse::default();
+                };
+                if node.incarnation != *expected_incarnation {
+                    return ClientResponse::default();
+                }
+                if expected_old_state.is_some_and(|expected| expected != node.state) {
+                    return ClientResponse::default();
+                }
+                node.state = *new_state;
+                node.state_reason = reason.clone();
+                node.admin_locked = *admin_locked;
+                response.node_state_changed = true;
+                if *new_state == NodeState::Down {
+                    Self::evict_jobs_on_node(
+                        name,
+                        &mut jobs,
+                        &mut nodes,
+                        timestamp,
+                        &mut response,
+                        durable_finalization,
+                    );
                 }
             }
             WalOperation::NodeLabelsUpdate { name, set, remove } => {
                 if let Some(node) = nodes.get_mut(name) {
+                    if Self::jobs_own_node_incarnation(&jobs, name, &node.incarnation)
+                        || node.alloc_resources != ResourceAllocations::default()
+                    {
+                        return ClientResponse::default();
+                    }
                     for (k, v) in set {
                         node.labels.insert(k.clone(), v.clone());
                     }
@@ -5060,8 +9997,41 @@ impl ClusterManager {
                     node.external_gpu_ids = gpu_ids.clone();
                 }
             }
-            WalOperation::NodeRemove { name, reason } => {
-                Self::evict_jobs_on_node(name, &mut jobs, &mut nodes, timestamp, &mut response);
+            WalOperation::NodeRemove {
+                name,
+                expected_incarnation,
+                reason,
+            } => {
+                if durable_finalization.is_some_and(|context| !context.is_node_lifecycle()) {
+                    return ClientResponse::default();
+                }
+                if durable_finalization.is_none()
+                    && jobs.values().any(|job| {
+                        job.pending_dispatch.as_ref().is_some_and(|dispatch| {
+                            dispatch.target_nodes.iter().any(|target| target == name)
+                        })
+                    })
+                {
+                    warn!(
+                        node = %name,
+                        "refusing node removal while a pending dispatch targets it"
+                    );
+                    return ClientResponse::default();
+                }
+                let Some(node) = nodes.get(name) else {
+                    return ClientResponse::default();
+                };
+                if !expected_incarnation.is_empty() && node.incarnation != *expected_incarnation {
+                    return ClientResponse::default();
+                }
+                Self::evict_jobs_on_node(
+                    name,
+                    &mut jobs,
+                    &mut nodes,
+                    timestamp,
+                    &mut response,
+                    durable_finalization,
+                );
                 if let Some(node) = nodes.get(name) {
                     if node.alloc_resources.cpus > 0 || node.alloc_resources.has_devices() {
                         warn!(
@@ -5076,11 +10046,36 @@ impl ClusterManager {
                     }
                 }
                 nodes.remove(name);
+                response.node_removed = true;
                 info!(
                     node = %name,
                     reason = reason.as_deref().unwrap_or(""),
                     "node removed from cluster"
                 );
+            }
+            WalOperation::NodeRemoveExact {
+                name,
+                expected_incarnation,
+                reason,
+            } => {
+                let Some(node) = nodes.get(name) else {
+                    return ClientResponse::default();
+                };
+                if node.incarnation != *expected_incarnation {
+                    return ClientResponse::default();
+                }
+                if jobs.values().any(|job| execution_owns_node(job, name))
+                    || node.alloc_resources != ResourceAllocations::default()
+                {
+                    warn!(node = %name, "refusing exact agent removal while it owns work");
+                    return ClientResponse::default();
+                }
+                if let Some(role) = node.k0s_role {
+                    self.k0s_role_counts.dec(role);
+                }
+                nodes.remove(name);
+                response.node_removed = true;
+                info!(node = %name, reason = reason.as_deref().unwrap_or(""), "worker incarnation removed from cluster");
             }
             WalOperation::TokenCreate { token } => {
                 self.tokens.write().insert(token.id.clone(), token.clone());
@@ -5375,15 +10370,49 @@ impl ClusterManager {
                 // apply. Deterministic — every replica applies in the same order.
                 let evicted: HashSet<JobId> = job_ids
                     .iter()
-                    .filter(|id| jobs.get(id).is_some_and(|j| j.state.is_finalized()))
+                    .filter(|id| {
+                        jobs.get(id).is_some_and(|j| {
+                            j.state.is_finalized()
+                                && j.pending_dispatch.is_none()
+                                && j.pending_finalization.is_none()
+                        })
+                    })
                     .copied()
                     .collect();
                 if !evicted.is_empty() {
+                    let mut submission_tokens = self.submission_tokens.write();
+                    for job_id in &evicted {
+                        let Some(job) = jobs.get(job_id) else {
+                            continue;
+                        };
+                        let Some(token) = job.submission_token.as_deref() else {
+                            continue;
+                        };
+                        if let Some(record) = submission_tokens.get_mut(token) {
+                            if record.job_id == *job_id
+                                && record.submission_generation == job.submission_generation
+                            {
+                                record.terminal_receipt = Some(SubmissionTerminalReceipt {
+                                    state: job.state,
+                                    exit_code: job.exit_code.unwrap_or(-1),
+                                    run_attempt: job.run_attempt,
+                                });
+                                if record.cancelled {
+                                    record.cleanup_complete = true;
+                                }
+                            }
+                        }
+                    }
                     jobs.retain(|id, _| !evicted.contains(id));
                     self.steps
                         .write()
                         .retain(|_, s| !evicted.contains(&s.job_id));
                 }
+            }
+            WalOperation::DurableFinalization { .. } => {
+                // The outer envelope is stripped before locks are acquired;
+                // nested envelopes are rejected above.
+                unreachable!("durable-finalization envelope was not unwrapped")
             }
         }
         self.next_job_id.store(next_id, Ordering::Relaxed);
@@ -5396,6 +10425,8 @@ impl ClusterManager {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ClusterSnapshot {
     jobs: Vec<Job>,
+    #[serde(default)]
+    submission_tokens: Vec<(String, SubmissionTokenRecord)>,
     nodes: Vec<Node>,
     reservations: Vec<Reservation>,
     /// The leader's authoritative partition table. `None` = pre-partition-support
@@ -5482,6 +10513,12 @@ impl StateMachineApply for ClusterManager {
     fn snapshot_state(&self) -> Result<Vec<u8>, anyhow::Error> {
         let snap = ClusterSnapshot {
             jobs: self.jobs.read().values().cloned().collect(),
+            submission_tokens: self
+                .submission_tokens
+                .read()
+                .iter()
+                .map(|(token, record)| (token.clone(), record.clone()))
+                .collect(),
             nodes: self.nodes.read().values().cloned().collect(),
             reservations: self.reservations.read().clone(),
             partitions: Some(self.partitions.read().clone()),
@@ -5508,6 +10545,7 @@ impl StateMachineApply for ClusterManager {
             next_id = next_id.max(job.job_id + 1);
             jobs.insert(job.job_id, job);
         }
+        *self.submission_tokens.write() = snap.submission_tokens.into_iter().collect();
 
         let mut nodes = self.nodes.write();
         nodes.clear();
@@ -5740,7 +10778,7 @@ fn qos_block_with(
     let mut running_count = jobs
         .values()
         .filter(|j| {
-            j.state == JobState::Running
+            holds_admission_capacity(j)
                 && j.spec.user == *user
                 && j.spec.qos.as_deref() == Some(qos_name.as_str())
         })
@@ -5811,7 +10849,7 @@ fn account_block_with(
     let mut running_count = jobs
         .values()
         .filter(|j| {
-            j.state == JobState::Running
+            holds_admission_capacity(j)
                 && j.spec.user == *user
                 && j.spec.account.as_deref() == Some(account)
         })
@@ -5979,7 +11017,7 @@ fn partition_limit_block(job: &Job, part: &Partition) -> Option<spur_core::job::
 fn sum_running_tres(jobs: &HashMap<JobId, Job>, pred: impl Fn(&Job) -> bool) -> TresRecord {
     let mut tres = TresRecord::new();
     for j in jobs.values() {
-        if j.state != JobState::Running || !pred(j) {
+        if !holds_admission_capacity(j) || !pred(j) {
             continue;
         }
         tres.add(&job_tres(j));
@@ -6158,12 +11196,15 @@ pub(crate) fn node_config_matches(
 pub(crate) enum HealthAction {
     MarkDown {
         name: String,
+        incarnation: String,
         old_state: NodeState,
         admin_locked: bool,
     },
     Recover {
         name: String,
+        incarnation: String,
         old_state: NodeState,
+        recovered_state: NodeState,
     },
 }
 
@@ -6199,6 +11240,7 @@ pub(crate) fn evaluate_node_health(
             {
                 actions.push(HealthAction::MarkDown {
                     name: node.name.clone(),
+                    incarnation: node.incarnation.clone(),
                     old_state: node.state,
                     admin_locked: node.admin_locked,
                 });
@@ -6210,7 +11252,9 @@ pub(crate) fn evaluate_node_health(
         {
             actions.push(HealthAction::Recover {
                 name: node.name.clone(),
+                incarnation: node.incarnation.clone(),
                 old_state: node.state,
+                recovered_state: recovered_node_state(Some(node)),
             });
         }
     }
@@ -6471,6 +11515,70 @@ mod tests {
     use spur_metrics::job::JobMetricsSnapshot;
     use tempfile::TempDir;
 
+    struct InMemoryAccountingSink {
+        fail_after_commit_once: std::sync::atomic::AtomicBool,
+        contributions: std::sync::atomic::AtomicUsize,
+        receipts: std::sync::Mutex<HashMap<(JobId, Uuid, u32), JobEndRecord>>,
+    }
+
+    impl InMemoryAccountingSink {
+        fn commit_then_lose_response_once() -> Self {
+            Self {
+                fail_after_commit_once: std::sync::atomic::AtomicBool::new(true),
+                contributions: std::sync::atomic::AtomicUsize::new(0),
+                receipts: std::sync::Mutex::new(HashMap::new()),
+            }
+        }
+    }
+
+    impl AccountingSink for InMemoryAccountingSink {
+        fn record_start(&self, _record: JobStartRecord) -> crate::accounting::AccountingFuture<'_> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn record_finalization(
+            &self,
+            record: JobEndRecord,
+        ) -> crate::accounting::AccountingFuture<'_> {
+            Box::pin(async move {
+                let key = (
+                    record.job_id,
+                    record.submission_generation,
+                    record.run_attempt,
+                );
+                {
+                    let mut receipts = self.receipts.lock().unwrap();
+                    if !record.finalization_id.is_nil() {
+                        anyhow::ensure!(
+                            receipts.iter().all(|(owner, stored)| {
+                                owner == &key || stored.finalization_id != record.finalization_id
+                            }),
+                            "finalization UUID belongs to another execution"
+                        );
+                    }
+                    match receipts.get(&key) {
+                        Some(stored) => anyhow::ensure!(
+                            stored == &record,
+                            "conflicting immutable finalization replay"
+                        ),
+                        None => {
+                            receipts.insert(key, record);
+                            self.contributions
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                }
+                if self
+                    .fail_after_commit_once
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    anyhow::bail!("simulated lost response after accounting commit");
+                }
+                Ok(())
+            })
+        }
+    }
+
     #[test]
     fn submission_size_accepts_normal_script() {
         let spec = JobSpec {
@@ -6576,6 +11684,9 @@ mod tests {
             .await
             .expect("single-node raft did not self-elect within 5s");
         cm.set_raft(handle.raft);
+        // Production starts the reconciler alongside the scheduler loop. Tests
+        // drive cleanup and finalization ACKs explicitly so assertions can
+        // inspect each durable phase without racing an immediate interval tick.
         cm
     }
 
@@ -6663,6 +11774,21 @@ mod tests {
         spec
     }
 
+    fn ack_terminal_finalization(cm: &ClusterManager, job_id: JobId) {
+        let marker = cm
+            .get_job(job_id)
+            .and_then(|job| job.pending_finalization)
+            .expect("terminal test job must have pending finalization");
+        assert!(
+            cm.apply_operation(&WalOperation::JobFinalizationAck {
+                job_id,
+                marker,
+                action: FinalizationAction::KeepTerminal,
+            })
+            .finalization_acked
+        );
+    }
+
     /// Build a cluster backed by a real spur.conf on disk so `reconfigure()`
     /// has a path to re-read. Returns the cluster and the conf path so tests
     /// can rewrite the file and reconcile.
@@ -6690,10 +11816,9 @@ mod tests {
         (cm, conf_path)
     }
 
-    /// Consumer-driven: `maybe_requeue` must honor the new `max_batch_requeue`
-    /// after reconfigure, not just the swapped config value. A job whose
-    /// `requeue_count` sits between the old and new caps is a no-op under the
-    /// old cap but requeues to Pending under the new one.
+    /// The finalization consumer must honor the live `max_batch_requeue` after
+    /// reconfigure. A job whose count sits between the old and new caps is held
+    /// under the old cap but becomes an ordinary requeue under the new one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reconfigure_max_batch_requeue_changes_consumer_behavior() {
         let conf = |cap: u32| {
@@ -6704,41 +11829,66 @@ mod tests {
             )
         };
         let dir = TempDir::new().unwrap();
-        let (cm, conf_path) = test_cluster_with_conf_file(&dir, &conf(3)).await;
-        register_node(&cm, "worker1", 8, 16000);
-
-        let job_id = run_job_on(&cm, "requeue-cap", "worker1");
-        // Put the job in a terminal, requeue-eligible state (Failed → Pending is
-        // a valid requeue transition and is NOT in the max-requeue hold set, so
-        // over-cap is a clean no-op) with 5 attempts already recorded.
-        {
+        let initial_conf = conf(3);
+        let (cm, conf_path) = test_cluster_with_conf_file(&dir, &initial_conf).await;
+        let job_id = 1;
+        cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
+            job_id,
+            spec: Box::new(basic_spec("requeue-cap")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            job_id,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let marker = {
             let mut jobs = cm.jobs.write();
             let job = jobs.get_mut(&job_id).unwrap();
-            job.state = JobState::Failed;
+            job.state = JobState::Timeout;
+            job.exit_code = Some(-1);
+            job.end_time = Some(Utc::now());
             job.spec.requeue = true;
             job.requeue_count = 5;
-        }
+            let marker = PendingFinalization {
+                finalization_id: Default::default(),
+                submission_generation: job.submission_generation,
+                run_attempt: job.run_attempt,
+                state: JobState::Timeout,
+                exit_code: -1,
+                exit_signal: 0,
+                derived_exit_code: 0,
+                end_time: job.end_time.unwrap(),
+                intent: FinalizationIntent::AutoRequeue,
+            };
+            job.pending_finalization = Some(marker.clone());
+            marker
+        };
 
-        // Cap = 3, count = 5 → over cap → maybe_requeue is a no-op (stays Failed).
-        cm.maybe_requeue(job_id).unwrap();
-        assert_eq!(
-            cm.get_job(job_id).unwrap().state,
-            JobState::Failed,
-            "over-cap job must not requeue before reconfigure"
-        );
+        let before = cm.get_job(job_id).unwrap();
+        assert!(matches!(
+            cm.finalization_action(&before, &marker),
+            FinalizationAction::Requeue {
+                pending_reason: PendingReason::JobHoldMaxRequeue,
+                priority: Some(0),
+                counter: FinalizationRequeueCounter::None,
+                ..
+            }
+        ));
 
         // Raise the cap past the attempt count and reconfigure.
         std::fs::write(&conf_path, conf(9)).unwrap();
         cm.reconfigure().unwrap();
 
-        // Cap = 9, count = 5 → under cap → maybe_requeue returns it to Pending.
-        cm.maybe_requeue(job_id).unwrap();
-        settle(&cm, job_id, JobState::Pending);
-        assert_eq!(
-            cm.get_job(job_id).unwrap().state,
-            JobState::Pending,
-            "after reconfigure raised the cap, the consumer must requeue the job"
-        );
+        let after = cm.get_job(job_id).unwrap();
+        assert!(matches!(
+            cm.finalization_action(&after, &marker),
+            FinalizationAction::Requeue {
+                pending_reason: PendingReason::None,
+                counter: FinalizationRequeueCounter::Ordinary,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -6824,6 +11974,141 @@ mod tests {
             .collect()
     }
 
+    /// Build the exact envelope a leader would persist, but with a caller-
+    /// supplied time so state-machine tests never depend on replica clocks.
+    fn durable_job_operation_at(
+        cm: &ClusterManager,
+        job_id: JobId,
+        operation: WalOperation,
+        end_time: DateTime<Utc>,
+    ) -> WalOperation {
+        let job = cm.get_job(job_id).expect("durable test job exists");
+        let incarnations = job
+            .pending_dispatch
+            .as_ref()
+            .map(|dispatch| dispatch.target_incarnations.clone())
+            .unwrap_or_else(|| job.allocated_node_incarnations.clone());
+        WalOperation::DurableFinalization {
+            context: DurableFinalizationContext::exact(
+                job.submission_generation,
+                job.run_attempt,
+                end_time,
+            )
+            .with_node_incarnations(incarnations),
+            operation: Box::new(operation),
+        }
+    }
+
+    fn durable_job_operation(
+        cm: &ClusterManager,
+        job_id: JobId,
+        operation: WalOperation,
+    ) -> WalOperation {
+        durable_job_operation_at(cm, job_id, operation, Utc::now())
+    }
+
+    fn durable_node_operation(operation: WalOperation) -> WalOperation {
+        WalOperation::DurableFinalization {
+            context: DurableFinalizationContext::node_lifecycle(Utc::now()),
+            operation: Box::new(operation),
+        }
+    }
+
+    /// Apply a current-format terminal entry and model exact worker cleanup,
+    /// stopping before the finalization ACK so a test may inspect the marker.
+    fn apply_durable_terminal(
+        cm: &ClusterManager,
+        job_id: JobId,
+        operation: WalOperation,
+    ) -> ClientResponse {
+        let response = cm.apply_operation(&durable_job_operation(cm, job_id, operation));
+        if response.terminal_cleanup_deferred {
+            acknowledge_test_cleanup(cm, job_id)
+        } else {
+            response
+        }
+    }
+
+    /// Model exact TERMINATE_AND_REAP acknowledgements in state-machine tests.
+    /// Production reaches these entries only after its worker RPC succeeds.
+    fn acknowledge_test_cleanup(cm: &ClusterManager, job_id: JobId) -> ClientResponse {
+        let job = cm.get_job(job_id).expect("cleanup test job exists");
+        let dispatch = job
+            .pending_dispatch
+            .expect("terminal request retained cleanup ownership");
+        assert_eq!(dispatch.phase, PendingDispatchPhase::Aborting);
+        for node_name in dispatch.target_nodes.clone() {
+            let response = cm.apply_operation(&WalOperation::JobDispatchTargetClear {
+                job_id,
+                submission_generation: dispatch.submission_generation,
+                run_attempt: dispatch.run_attempt,
+                node_name,
+            });
+            assert!(response.dispatch_target_cleared);
+        }
+        cm.apply_operation(&WalOperation::JobDispatchClear {
+            job_id,
+            submission_generation: dispatch.submission_generation,
+            run_attempt: dispatch.run_attempt,
+        })
+    }
+
+    fn apply_dispatch_begin(
+        cm: &ClusterManager,
+        job_id: JobId,
+        nodes: &[&str],
+        per_node: ResourceAllocations,
+    ) -> (String, u32) {
+        let job = cm.get_job(job_id).unwrap();
+        let generation = job.submission_generation;
+        let run_attempt = job.run_attempt + 1;
+        let mut resources = ResourceAllocations::default();
+        for _ in nodes {
+            resources.add(&per_node);
+        }
+        let target_nodes: Vec<String> = nodes.iter().map(|node| (*node).to_string()).collect();
+        let target_incarnations = target_nodes
+            .iter()
+            .map(|node| (node.clone(), cm.get_node(node).unwrap().incarnation))
+            .collect();
+        let response = cm.apply_operation(&WalOperation::JobDispatchBegin {
+            job_id,
+            submission_generation: generation,
+            expected_run_attempt: job.run_attempt,
+            run_attempt,
+            target_nodes,
+            target_incarnations,
+            resources,
+            per_node_alloc: per_node_for(nodes, per_node),
+        });
+        assert!(response.dispatch_begun);
+        (generation.to_string(), run_attempt)
+    }
+
+    fn apply_dispatch_commit(cm: &ClusterManager, job_id: JobId) {
+        let job = cm.get_job(job_id).unwrap();
+        let dispatch = job.pending_dispatch.unwrap();
+        let response = cm.apply_operation(&WalOperation::JobDispatchCommit {
+            job_id,
+            submission_generation: job.submission_generation,
+            nodes: dispatch.target_nodes,
+            resources: dispatch.resources,
+            per_node_alloc: dispatch.per_node_alloc,
+            run_attempt: job.run_attempt,
+        });
+        assert!(response.dispatch_committed);
+    }
+
+    fn apply_dispatch_publish(cm: &ClusterManager, job_id: JobId) {
+        let job = cm.get_job(job_id).unwrap();
+        let response = cm.apply_operation(&WalOperation::JobDispatchPublish {
+            job_id,
+            submission_generation: job.submission_generation,
+            run_attempt: job.run_attempt,
+        });
+        assert!(response.dispatch_published);
+    }
+
     /// Spin until a Raft-proposed mutation is visible in memory.
     /// In tests, `propose()` can be called before the single-node Raft
     /// has finished its initial self-election, causing `client_write` to
@@ -6860,6 +12145,47 @@ mod tests {
         wait_for(&format!("node '{n}' registered"), || {
             cm.get_node(&n).is_some()
         });
+        // The legacy test registration helper predates worker-incarnation
+        // input on the public API. Give allocations a stable, nonempty test
+        // owner so durable cleanup exercises fail-closed identity checks.
+        cm.nodes
+            .write()
+            .get_mut(&n)
+            .expect("registered test node exists")
+            .incarnation = format!("{n}-worker-1");
+    }
+
+    fn register_node_with_incarnation(
+        cm: &ClusterManager,
+        name: &str,
+        incarnation: &str,
+        cpus: u32,
+        mem: u64,
+    ) {
+        cm.register_node_exact(
+            name.into(),
+            name.into(),
+            ResourceSet {
+                cpus,
+                memory_mb: mem,
+                ..Default::default()
+            },
+            "127.0.0.1".into(),
+            6818,
+            String::new(),
+            String::new(),
+            spur_core::node::NodeSource::NativeHost,
+            HashMap::new(),
+            incarnation.into(),
+        )
+        .unwrap();
+        wait_for(
+            &format!("node '{name}' registered as {incarnation}"),
+            || {
+                cm.get_node(name)
+                    .is_some_and(|node| node.incarnation == incarnation)
+            },
+        );
     }
 
     fn submit_and_wait(cm: &ClusterManager, spec: JobSpec) -> JobId {
@@ -6870,10 +12196,40 @@ mod tests {
 
     /// Wait for a job to reach the expected state.
     /// Handles the test-only race where propose() is called before the
-    /// single-node Raft has self-elected.
+    /// single-node Raft has self-elected. Test clusters do not run real worker
+    /// agents, so acknowledge an already-authorized Aborting intent exactly as
+    /// a successful TERMINATE_AND_REAP response would before checking again.
     fn settle(cm: &ClusterManager, job_id: JobId, expected: JobState) {
         wait_for(&format!("job {job_id} -> {expected:?}"), || {
-            cm.get_job(job_id).is_some_and(|j| j.state == expected)
+            let Some(mut job) = cm.get_job(job_id) else {
+                return false;
+            };
+            let cleanup_ready = job.pending_dispatch.as_ref().is_some_and(|dispatch| {
+                dispatch.phase == PendingDispatchPhase::Aborting
+                    && (dispatch.terminal_after_cleanup.is_some()
+                        || dispatch.preempt_requeue_after_cleanup.is_some()
+                        || dispatch.backoff_after_cleanup.is_some())
+            });
+            if cleanup_ready {
+                let _ = acknowledge_test_cleanup(cm, job_id);
+                let Some(updated) = cm.get_job(job_id) else {
+                    return false;
+                };
+                job = updated;
+            }
+            if let Some(marker) = job.pending_finalization.clone() {
+                let action = cm.finalization_action(&job, &marker);
+                let response = cm.apply_operation(&WalOperation::JobFinalizationAck {
+                    job_id,
+                    marker,
+                    action,
+                });
+                if !response.finalization_acked {
+                    return false;
+                }
+            }
+            cm.get_job(job_id)
+                .is_some_and(|current| current.state == expected)
         });
     }
 
@@ -6884,6 +12240,7 @@ mod tests {
 
         let spec = basic_spec("test-job");
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(spec.clone()),
         });
@@ -7326,6 +12683,7 @@ mod tests {
         let cm = test_cluster(&dir).await;
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("j")),
         });
@@ -7346,6 +12704,7 @@ mod tests {
 
         register_node(&cm, "node1", 8, 16000);
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("j")),
         });
@@ -7356,6 +12715,7 @@ mod tests {
             nodes: vec!["node1".into()],
             resources: resources.clone(),
             per_node_alloc: per_node_for(&["node1"], resources),
+            allocated_node_incarnations: HashMap::new(),
             srun_step_dispatch: false,
             run_attempt: 0,
         });
@@ -7376,6 +12736,7 @@ mod tests {
 
         register_node(&cm, "node1", 8, 16000);
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("j")),
         });
@@ -7390,6 +12751,7 @@ mod tests {
             nodes: vec!["node1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["node1"], alloc),
+            allocated_node_incarnations: HashMap::new(),
             srun_step_dispatch: false,
             run_attempt: 0,
         });
@@ -7398,6 +12760,7 @@ mod tests {
             job_id: 1,
             exit_code: 0,
             state: JobState::Completed,
+            finalization_intent: None,
         });
 
         let job = cm.get_job(1).unwrap();
@@ -7416,19 +12779,40 @@ mod tests {
         let cm = test_cluster(&dir).await;
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("done")),
         });
-        cm.apply_operation(&WalOperation::JobComplete {
-            job_id: 1,
-            exit_code: 0,
-            state: JobState::Cancelled,
-        });
+        cm.apply_operation(&durable_job_operation(
+            &cm,
+            1,
+            WalOperation::JobComplete {
+                job_id: 1,
+                exit_code: 0,
+                state: JobState::Cancelled,
+                finalization_intent: None,
+            },
+        ));
         assert!(
             cm.get_job(1).unwrap().state.is_terminal(),
             "job 1 is terminal"
         );
+        let marker = cm.get_job(1).unwrap().pending_finalization.unwrap();
+        cm.apply_operation(&WalOperation::EvictTerminalJobs { job_ids: vec![1] });
+        assert!(
+            cm.get_job(1).is_some(),
+            "retention must not erase an unacknowledged finalization"
+        );
+        assert!(
+            cm.apply_operation(&WalOperation::JobFinalizationAck {
+                job_id: 1,
+                marker,
+                action: FinalizationAction::KeepTerminal,
+            })
+            .finalization_acked
+        );
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 2,
             spec: Box::new(basic_spec("running")),
         });
@@ -7438,12 +12822,14 @@ mod tests {
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 3,
             spec: Box::new(basic_spec("pending")),
         });
         // A job stranded in Preempted (a rare requeue-strand): finalized with an
         // end_time, so it must be reapable even though it isn't is_terminal().
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 4,
             spec: Box::new(basic_spec("preempted")),
         });
@@ -7460,7 +12846,9 @@ mod tests {
         // drop the evicted job's step and keep the live one's.
         let step = |job_id: JobId| JobStep {
             job_id,
+            submission_generation: Default::default(),
             step_id: 0,
+            run_attempt: 0,
             name: "s".into(),
             state: StepState::Running,
             num_tasks: 1,
@@ -7511,14 +12899,21 @@ mod tests {
 
         for cm in [&cm_a, &cm_b] {
             cm.apply_operation(&WalOperation::JobSubmit {
+                metadata: None,
                 job_id: 1,
                 spec: Box::new(basic_spec("done")),
             });
-            cm.apply_operation(&WalOperation::JobComplete {
-                job_id: 1,
-                exit_code: 0,
-                state: JobState::Cancelled,
-            });
+            cm.apply_operation(&durable_job_operation(
+                cm,
+                1,
+                WalOperation::JobComplete {
+                    job_id: 1,
+                    exit_code: 0,
+                    state: JobState::Cancelled,
+                    finalization_intent: None,
+                },
+            ));
+            ack_terminal_finalization(cm, 1);
         }
         // Divergent local end_times: skew must not change the outcome, since the
         // apply guard reads state, not end_time.
@@ -7541,6 +12936,7 @@ mod tests {
         let dir_c = TempDir::new().unwrap();
         let cm_c = test_cluster(&dir_c).await;
         cm_c.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("requeued")),
         });
@@ -7565,14 +12961,21 @@ mod tests {
         cfg2.controller.terminal_job_retention_secs = 86_400;
         let cm2 = test_cluster_with_config(&dir2, cfg2).await;
         cm2.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("fresh")),
         });
-        cm2.apply_operation(&WalOperation::JobComplete {
-            job_id: 1,
-            exit_code: 0,
-            state: JobState::Cancelled,
-        });
+        cm2.apply_operation(&durable_job_operation(
+            &cm2,
+            1,
+            WalOperation::JobComplete {
+                job_id: 1,
+                exit_code: 0,
+                state: JobState::Cancelled,
+                finalization_intent: None,
+            },
+        ));
+        ack_terminal_finalization(&cm2, 1);
         cm2.evict_expired_terminal_jobs();
         assert!(
             cm2.get_job(1).is_some(),
@@ -7599,14 +13002,21 @@ mod tests {
         let cm = test_cluster_with_config(&dir, cfg).await;
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("done")),
         });
-        cm.apply_operation(&WalOperation::JobComplete {
-            job_id: 1,
-            exit_code: 0,
-            state: JobState::Cancelled,
-        });
+        cm.apply_operation(&durable_job_operation(
+            &cm,
+            1,
+            WalOperation::JobComplete {
+                job_id: 1,
+                exit_code: 0,
+                state: JobState::Cancelled,
+                finalization_intent: None,
+            },
+        ));
+        ack_terminal_finalization(&cm, 1);
 
         // Just completed: within the floored window, so retention 0 does not
         // evict on the next tick.
@@ -7639,6 +13049,7 @@ mod tests {
 
         // Target runs, completes, and ages out of the window.
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 100,
             spec: Box::new(basic_spec("target")),
         });
@@ -7647,11 +13058,17 @@ mod tests {
             JobState::Pending,
             JobState::Running,
         ));
-        cm.apply_operation(&WalOperation::JobComplete {
-            job_id: 100,
-            exit_code: 0,
-            state: JobState::Completed,
-        });
+        cm.apply_operation(&durable_job_operation(
+            &cm,
+            100,
+            WalOperation::JobComplete {
+                job_id: 100,
+                exit_code: 0,
+                state: JobState::Completed,
+                finalization_intent: None,
+            },
+        ));
+        ack_terminal_finalization(&cm, 100);
         cm.jobs.write().get_mut(&100).unwrap().end_time =
             Some(chrono::Utc::now() - chrono::Duration::days(1));
 
@@ -7659,6 +13076,7 @@ mod tests {
         let mut child = basic_spec("child");
         child.dependency = vec!["afterok:100".into()];
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 101,
             spec: Box::new(child),
         });
@@ -7670,11 +13088,17 @@ mod tests {
         );
 
         // Once the child is gone, the target is evictable.
-        cm.apply_operation(&WalOperation::JobComplete {
-            job_id: 101,
-            exit_code: 0,
-            state: JobState::Cancelled,
-        });
+        cm.apply_operation(&durable_job_operation(
+            &cm,
+            101,
+            WalOperation::JobComplete {
+                job_id: 101,
+                exit_code: 0,
+                state: JobState::Cancelled,
+                finalization_intent: None,
+            },
+        ));
+        ack_terminal_finalization(&cm, 101);
         cm.jobs.write().get_mut(&101).unwrap().end_time =
             Some(chrono::Utc::now() - chrono::Duration::days(1));
         cm.evict_expired_terminal_jobs();
@@ -7696,18 +13120,26 @@ mod tests {
         let id1 = cm.next_job_id.fetch_add(1, Ordering::SeqCst);
         let id2 = cm.next_job_id.fetch_add(1, Ordering::SeqCst);
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: id1,
             spec: Box::new(basic_spec("survivor")),
         });
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: id2,
             spec: Box::new(basic_spec("high")),
         });
-        cm.apply_operation(&WalOperation::JobComplete {
-            job_id: id2,
-            exit_code: 0,
-            state: JobState::Cancelled,
-        });
+        cm.apply_operation(&durable_job_operation(
+            &cm,
+            id2,
+            WalOperation::JobComplete {
+                job_id: id2,
+                exit_code: 0,
+                state: JobState::Cancelled,
+                finalization_intent: None,
+            },
+        ));
+        ack_terminal_finalization(&cm, id2);
         let next_before = cm.next_job_id.load(Ordering::Relaxed);
         cm.apply_operation(&WalOperation::EvictTerminalJobs { job_ids: vec![id2] });
         assert!(cm.get_job(id2).is_none(), "high-id job evicted");
@@ -7734,6 +13166,7 @@ mod tests {
         let cm = test_cluster(&dir).await;
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("s")),
         });
@@ -7898,6 +13331,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("acc")),
         });
@@ -7935,6 +13369,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("cancel-susp")),
         });
@@ -7953,6 +13388,7 @@ mod tests {
             job_id: 1,
             exit_code: 0,
             state: JobState::Cancelled,
+            finalization_intent: None,
         });
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Cancelled);
@@ -8010,6 +13446,7 @@ mod tests {
         cm.apply_operation(&WalOperation::NodeRegister {
             name: "gpu-node".into(),
             hostname: String::new(),
+            incarnation: String::new(),
             resources: ResourceSet {
                 cpus: 64,
                 memory_mb: 256000,
@@ -8044,6 +13481,7 @@ mod tests {
         register_node(&cm, "n1", 4, 8000);
         cm.apply_operation(&WalOperation::NodeStateChange {
             name: "n1".into(),
+            expected_incarnation: String::new(),
             old_state: NodeState::Idle,
             new_state: NodeState::Drain,
             reason: Some("maintenance".into()),
@@ -8061,6 +13499,7 @@ mod tests {
         let cm = test_cluster(&dir).await;
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("j")),
         });
@@ -8090,6 +13529,766 @@ mod tests {
         assert_eq!(job.spec.name, "my-job");
         assert_eq!(job.state, JobState::Pending);
         assert_eq!(job.spec.partition, Some("default".into()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn idempotent_submit_is_atomic_exact_and_survives_eviction_and_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let token = "k8s-token-a".to_string();
+        let spec = basic_spec("idempotent");
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+        let first = tokio::spawn({
+            let cm = cm.clone();
+            let barrier = barrier.clone();
+            let token = token.clone();
+            let spec = spec.clone();
+            async move {
+                barrier.wait().await;
+                cm.submit_job_with_token(spec, Some(token))
+            }
+        });
+        let second = tokio::spawn({
+            let cm = cm.clone();
+            let barrier = barrier.clone();
+            let token = token.clone();
+            let spec = spec.clone();
+            async move {
+                barrier.wait().await;
+                cm.submit_job_with_token(spec, Some(token))
+            }
+        });
+        barrier.wait().await;
+        let first = first.await.unwrap().unwrap();
+        let second = second.await.unwrap().unwrap();
+        assert_eq!(first.job_id, second.job_id);
+        assert_eq!(first.submission_generation, second.submission_generation);
+        assert!(!first.submission_generation.is_nil());
+        assert_eq!(cm.jobs.read().len(), 1);
+
+        let mut changed = spec.clone();
+        changed.name = "different".to_string();
+        assert!(matches!(
+            cm.submit_job_with_token(changed, Some(token.clone())),
+            Err(SubmitError::InvalidArgument(_))
+        ));
+
+        {
+            let mut jobs = cm.jobs.write();
+            jobs.get_mut(&first.job_id).unwrap().state = JobState::Completed;
+        }
+        cm.apply_operation(&WalOperation::EvictTerminalJobs {
+            job_ids: vec![first.job_id],
+        });
+        assert!(cm.get_job(first.job_id).is_none());
+        let after_eviction = cm
+            .submit_job_with_token(spec.clone(), Some(token.clone()))
+            .unwrap();
+        assert_eq!(after_eviction.job_id, first.job_id);
+        assert_eq!(
+            after_eviction.submission_generation,
+            first.submission_generation
+        );
+
+        let snapshot = cm.snapshot_state().unwrap();
+        let restored = ClusterManager::new(test_config(), dir.path()).unwrap();
+        restored.restore_from_snapshot(&snapshot).unwrap();
+        let recovered = restored
+            .submit_job_with_token(spec, Some(token))
+            .expect("durable token lookup must not require a new proposal");
+        assert_eq!(recovered.job_id, first.job_id);
+        assert_eq!(recovered.submission_generation, first.submission_generation);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_different_specs_with_one_token_fail_closed() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let submit = |name: &'static str| {
+            let cm = cm.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                cm.submit_job_with_token(basic_spec(name), Some("one-token-two-specs".to_string()))
+            })
+        };
+        let first = submit("first-spec");
+        let second = submit("second-spec");
+        barrier.wait().await;
+        let results = [first.await.unwrap(), second.await.unwrap()];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        assert_eq!(cm.jobs.read().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tokened_array_is_rejected_before_any_proposal() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let mut spec = basic_spec("array");
+        spec.array_spec = Some("0-3".to_string());
+        assert!(matches!(
+            cm.submit_job_with_token(spec, Some("array-token".to_string())),
+            Err(SubmitError::InvalidArgument(_))
+        ));
+        assert!(cm.jobs.read().is_empty());
+        assert!(cm.submission_tokens.read().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn token_cancel_before_submit_is_a_snapshot_durable_no_create_fence() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let token = "cancel-before-submit";
+
+        let cancelled = cm.cancel_job_by_submission_token(token).unwrap();
+        assert_eq!(cancelled.job_id, 0);
+        assert!(cancelled.submission_generation.is_nil());
+        assert!(cancelled.cleanup_complete);
+        assert!(matches!(
+            cm.submit_job_with_token(basic_spec("too-late"), Some(token.into())),
+            Err(SubmitError::InvalidArgument(_))
+        ));
+        assert!(cm.jobs.read().is_empty());
+
+        let snapshot = cm.snapshot_state().unwrap();
+        let restored = ClusterManager::new(test_config(), dir.path()).unwrap();
+        restored.restore_from_snapshot(&snapshot).unwrap();
+        assert!(matches!(
+            restored.submit_job_with_token(basic_spec("still-too-late"), Some(token.into())),
+            Err(SubmitError::InvalidArgument(_))
+        ));
+        let record = restored
+            .submission_tokens
+            .read()
+            .get(token)
+            .cloned()
+            .unwrap();
+        assert!(record.cancelled);
+        assert!(record.cleanup_complete);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn token_cancel_after_submit_tracks_cleanup_through_ack_and_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let token = "submit-before-cancel";
+        let submitted = cm
+            .submit_job_with_token(basic_spec("cancel-me"), Some(token.into()))
+            .unwrap();
+
+        let cancelled = cm.cancel_job_by_submission_token(token).unwrap();
+        assert_eq!(cancelled.job_id, submitted.job_id);
+        assert_eq!(
+            cancelled.submission_generation,
+            submitted.submission_generation
+        );
+        assert!(!cancelled.cleanup_complete);
+        let terminal = cm.get_job(submitted.job_id).unwrap();
+        assert_eq!(terminal.state, JobState::Cancelled);
+        let marker = terminal
+            .pending_finalization
+            .expect("cancel intent must survive until finalization ACK");
+
+        let ack = cm.apply_operation(&WalOperation::JobFinalizationAck {
+            job_id: submitted.job_id,
+            marker,
+            action: FinalizationAction::KeepTerminal,
+        });
+        assert!(ack.finalization_acked);
+        assert!(
+            cm.cancel_job_by_submission_token(token)
+                .unwrap()
+                .cleanup_complete
+        );
+
+        let snapshot = cm.snapshot_state().unwrap();
+        let restored = ClusterManager::new(test_config(), dir.path()).unwrap();
+        restored.restore_from_snapshot(&snapshot).unwrap();
+        let record = restored
+            .submission_tokens
+            .read()
+            .get(token)
+            .cloned()
+            .unwrap();
+        assert!(record.cancelled);
+        assert!(record.cleanup_complete);
+        assert_eq!(record.job_id, submitted.job_id);
+        assert_eq!(
+            record.submission_generation,
+            submitted.submission_generation
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_token_submit_and_cancel_have_one_linearized_outcome() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let token = "concurrent-submit-cancel".to_string();
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let submit = tokio::spawn({
+            let cm = cm.clone();
+            let token = token.clone();
+            let barrier = barrier.clone();
+            async move {
+                barrier.wait().await;
+                cm.submit_job_with_token(basic_spec("racing-submit"), Some(token))
+            }
+        });
+        let cancel = tokio::spawn({
+            let cm = cm.clone();
+            let token = token.clone();
+            let barrier = barrier.clone();
+            async move {
+                barrier.wait().await;
+                cm.cancel_job_by_submission_token(&token)
+            }
+        });
+        barrier.wait().await;
+        let submit = submit.await.unwrap();
+        let cancel = cancel.await.unwrap().unwrap();
+        let record = cm.submission_tokens.read().get(&token).cloned().unwrap();
+        assert!(record.cancelled);
+        assert!(matches!(
+            cm.submit_job_with_token(basic_spec("racing-submit"), Some(token.clone())),
+            Err(SubmitError::InvalidArgument(_))
+        ));
+
+        match submit {
+            Ok(submitted) => {
+                assert_eq!(record.job_id, submitted.job_id);
+                assert_eq!(
+                    record.submission_generation,
+                    submitted.submission_generation
+                );
+                assert_eq!(cancel.job_id, submitted.job_id);
+                assert_eq!(
+                    cm.get_job(submitted.job_id).unwrap().state,
+                    JobState::Cancelled
+                );
+            }
+            Err(SubmitError::InvalidArgument(_)) => {
+                assert_eq!(record.job_id, 0);
+                assert!(record.cleanup_complete);
+                assert_eq!(cancel.job_id, 0);
+                assert!(cm.jobs.read().is_empty());
+            }
+            Err(error) => panic!("unexpected submit race failure: {error}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn token_cancel_dominates_requeue_ack_in_both_raft_orders() {
+        fn requeue_action() -> FinalizationAction {
+            FinalizationAction::Requeue {
+                begin_time: None,
+                pending_reason: PendingReason::None,
+                pending_reason_desc: None,
+                priority: None,
+                counter: FinalizationRequeueCounter::Ordinary,
+            }
+        }
+
+        // Cancel commits first: a stale, otherwise-valid requeue ACK consumes
+        // the marker but leaves the permanently fenced job terminal.
+        let first_dir = TempDir::new().unwrap();
+        let first = test_cluster(&first_dir).await;
+        let first_token = "cancel-before-requeue-ack";
+        let mut first_spec = basic_spec("first-order");
+        first_spec.requeue = true;
+        let first_submit = first
+            .submit_job_with_token(first_spec, Some(first_token.into()))
+            .unwrap();
+        first.apply_operation(&WalOperation::job_state_change(
+            first_submit.job_id,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        first.apply_operation(&durable_job_operation(
+            &first,
+            first_submit.job_id,
+            WalOperation::JobComplete {
+                job_id: first_submit.job_id,
+                exit_code: -1,
+                state: JobState::Timeout,
+                finalization_intent: Some(FinalizationIntent::AutoRequeue),
+            },
+        ));
+        let first_marker = first
+            .get_job(first_submit.job_id)
+            .unwrap()
+            .pending_finalization
+            .unwrap();
+        assert!(
+            !first
+                .cancel_job_by_submission_token(first_token)
+                .unwrap()
+                .cleanup_complete
+        );
+        let malformed = first.apply_operation(&WalOperation::JobFinalizationAck {
+            job_id: first_submit.job_id,
+            marker: first_marker.clone(),
+            action: FinalizationAction::Requeue {
+                begin_time: None,
+                pending_reason: PendingReason::None,
+                pending_reason_desc: None,
+                priority: None,
+                counter: FinalizationRequeueCounter::Preempt,
+            },
+        });
+        assert!(!malformed.finalization_acked);
+        assert_eq!(
+            first
+                .get_job(first_submit.job_id)
+                .unwrap()
+                .pending_finalization,
+            Some(first_marker.clone())
+        );
+        let suppressed = first.apply_operation(&WalOperation::JobFinalizationAck {
+            job_id: first_submit.job_id,
+            marker: first_marker.clone(),
+            action: requeue_action(),
+        });
+        assert!(suppressed.finalization_acked);
+        let first_job = first.get_job(first_submit.job_id).unwrap();
+        assert_eq!(first_job.state, JobState::Timeout);
+        assert!(first_job.pending_finalization.is_none());
+        assert_eq!(first_job.requeue_count, 0);
+        assert!(first
+            .submission_tokens
+            .read()
+            .get(first_token)
+            .is_some_and(|record| record.cleanup_complete));
+
+        let first_snapshot = first.snapshot_state().unwrap();
+        let first_restored = ClusterManager::new(test_config(), first_dir.path()).unwrap();
+        first_restored
+            .restore_from_snapshot(&first_snapshot)
+            .unwrap();
+        assert!(
+            !first_restored
+                .apply_operation(&WalOperation::JobFinalizationAck {
+                    job_id: first_submit.job_id,
+                    marker: first_marker,
+                    action: requeue_action(),
+                })
+                .finalization_acked
+        );
+        assert_eq!(
+            first_restored.get_job(first_submit.job_id).unwrap().state,
+            JobState::Timeout
+        );
+
+        // Requeue ACK commits first: the later token fence exact-cancels the
+        // now-Pending job and its own KeepTerminal ACK completes cleanup.
+        let second_dir = TempDir::new().unwrap();
+        let second = test_cluster(&second_dir).await;
+        let second_token = "requeue-ack-before-cancel";
+        let mut second_spec = basic_spec("second-order");
+        second_spec.requeue = true;
+        let second_submit = second
+            .submit_job_with_token(second_spec, Some(second_token.into()))
+            .unwrap();
+        second.apply_operation(&WalOperation::job_state_change(
+            second_submit.job_id,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        second.apply_operation(&durable_job_operation(
+            &second,
+            second_submit.job_id,
+            WalOperation::JobComplete {
+                job_id: second_submit.job_id,
+                exit_code: -1,
+                state: JobState::Timeout,
+                finalization_intent: Some(FinalizationIntent::AutoRequeue),
+            },
+        ));
+        let second_marker = second
+            .get_job(second_submit.job_id)
+            .unwrap()
+            .pending_finalization
+            .unwrap();
+        assert!(
+            second
+                .apply_operation(&WalOperation::JobFinalizationAck {
+                    job_id: second_submit.job_id,
+                    marker: second_marker.clone(),
+                    action: requeue_action(),
+                })
+                .finalization_acked
+        );
+        assert_eq!(
+            second.get_job(second_submit.job_id).unwrap().state,
+            JobState::Pending
+        );
+        assert_eq!(
+            second.get_job(second_submit.job_id).unwrap().requeue_count,
+            1
+        );
+
+        assert!(
+            !second
+                .cancel_job_by_submission_token(second_token)
+                .unwrap()
+                .cleanup_complete
+        );
+        let cancel_marker = second
+            .get_job(second_submit.job_id)
+            .unwrap()
+            .pending_finalization
+            .unwrap();
+        assert!(
+            second
+                .apply_operation(&WalOperation::JobFinalizationAck {
+                    job_id: second_submit.job_id,
+                    marker: cancel_marker,
+                    action: FinalizationAction::KeepTerminal,
+                })
+                .finalization_acked
+        );
+        assert_eq!(
+            second.get_job(second_submit.job_id).unwrap().state,
+            JobState::Cancelled
+        );
+        assert_eq!(
+            second.get_job(second_submit.job_id).unwrap().requeue_count,
+            1
+        );
+        assert!(second
+            .submission_tokens
+            .read()
+            .get(second_token)
+            .is_some_and(|record| record.cleanup_complete));
+
+        let second_snapshot = second.snapshot_state().unwrap();
+        let second_restored = ClusterManager::new(test_config(), second_dir.path()).unwrap();
+        second_restored
+            .restore_from_snapshot(&second_snapshot)
+            .unwrap();
+        assert!(
+            !second_restored
+                .apply_operation(&WalOperation::JobFinalizationAck {
+                    job_id: second_submit.job_id,
+                    marker: second_marker,
+                    action: requeue_action(),
+                })
+                .finalization_acked
+        );
+        assert_eq!(
+            second_restored.get_job(second_submit.job_id).unwrap().state,
+            JobState::Cancelled
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tokened_standalone_srun_is_rejected_before_raft_binding() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        assert!(matches!(
+            cm.submit_job_with_token(
+                srun_spec("unsupported-tokened-srun"),
+                Some("srun-token".into()),
+            ),
+            Err(SubmitError::InvalidArgument(_))
+        ));
+        assert!(cm.jobs.read().is_empty());
+        assert!(cm.submission_tokens.read().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exact_completion_receipt_survives_eviction_snapshot_and_rejects_conflicts() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16_000);
+        let token = "completion-receipt-token";
+        let submitted = cm
+            .submit_job_with_token(basic_spec("receipt-job"), Some(token.into()))
+            .unwrap();
+        let (generation, attempt) =
+            apply_dispatch_begin(&cm, submitted.job_id, &["worker1"], scalar_alloc(2, 4_000));
+        apply_dispatch_commit(&cm, submitted.job_id);
+        apply_dispatch_publish(&cm, submitted.job_id);
+        let incarnation = cm.get_node("worker1").unwrap().incarnation;
+
+        let accepted = cm
+            .node_complete_exact_with_drain(
+                submitted.job_id,
+                &generation,
+                token,
+                "worker1",
+                &incarnation,
+                0,
+                0,
+                attempt,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(accepted, NodeCompleteResult::AllDone { .. }));
+        assert!(matches!(
+            cm.node_complete_exact_with_drain(
+                submitted.job_id,
+                &generation,
+                token,
+                "worker1",
+                &incarnation,
+                0,
+                0,
+                attempt,
+                None,
+            )
+            .unwrap(),
+            NodeCompleteResult::AlreadyTerminal
+        ));
+
+        let marker = cm
+            .get_job(submitted.job_id)
+            .unwrap()
+            .pending_finalization
+            .unwrap();
+        assert!(
+            cm.apply_operation(&WalOperation::JobFinalizationAck {
+                job_id: submitted.job_id,
+                marker,
+                action: FinalizationAction::KeepTerminal,
+            })
+            .finalization_acked
+        );
+        cm.apply_operation(&WalOperation::EvictTerminalJobs {
+            job_ids: vec![submitted.job_id],
+        });
+        let terminal = cm
+            .terminal_submission_by_token(token, submitted.job_id)
+            .unwrap()
+            .expect("eviction retains a terminal token summary");
+        assert_eq!(
+            terminal.submission_generation,
+            submitted.submission_generation
+        );
+        assert_eq!(terminal.run_attempt, attempt);
+
+        let snapshot = cm.snapshot_state().unwrap();
+        let restored = ClusterManager::new(test_config(), dir.path()).unwrap();
+        restored.restore_from_snapshot(&snapshot).unwrap();
+        assert!(matches!(
+            restored
+                .node_complete_exact_with_drain(
+                    submitted.job_id,
+                    &generation,
+                    token,
+                    "worker1",
+                    &incarnation,
+                    0,
+                    0,
+                    attempt,
+                    None,
+                )
+                .unwrap(),
+            NodeCompleteResult::AlreadyTerminal
+        ));
+
+        for conflict in [
+            restored.node_complete_exact_with_drain(
+                submitted.job_id,
+                &generation,
+                token,
+                "worker1",
+                &incarnation,
+                1,
+                0,
+                attempt,
+                None,
+            ),
+            restored.node_complete_exact_with_drain(
+                submitted.job_id,
+                &generation,
+                token,
+                "worker1",
+                "replacement-incarnation",
+                0,
+                0,
+                attempt,
+                None,
+            ),
+        ] {
+            assert!(matches!(
+                conflict,
+                Err(NodeCompleteError::ReceiptConflict { .. })
+            ));
+        }
+        assert!(matches!(
+            restored.node_complete_exact_with_drain(
+                submitted.job_id,
+                &generation,
+                token,
+                "arbitrary-node",
+                "arbitrary-incarnation",
+                0,
+                0,
+                attempt,
+                None,
+            ),
+            Err(NodeCompleteError::JobNotFound { .. })
+        ));
+        assert!(matches!(
+            restored.node_complete_exact_with_drain(
+                submitted.job_id,
+                &generation,
+                token,
+                "worker1",
+                &incarnation,
+                0,
+                0,
+                attempt + 1,
+                None,
+            ),
+            Err(NodeCompleteError::JobNotFound { .. })
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn early_completion_is_receipted_before_dispatch_commit() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16_000);
+        let token = "early-completion-token";
+        let submitted = cm
+            .submit_job_with_token(basic_spec("early-receipt"), Some(token.into()))
+            .unwrap();
+        let (generation, attempt) =
+            apply_dispatch_begin(&cm, submitted.job_id, &["worker1"], scalar_alloc(2, 4_000));
+        let incarnation = cm.get_node("worker1").unwrap().incarnation;
+
+        assert!(matches!(
+            cm.node_complete_exact_with_drain(
+                submitted.job_id,
+                &generation,
+                token,
+                "worker1",
+                &incarnation,
+                0,
+                0,
+                attempt,
+                None,
+            )
+            .unwrap(),
+            NodeCompleteResult::Buffered
+        ));
+        let record = cm.submission_tokens.read().get(token).cloned().unwrap();
+        assert_eq!(record.completion_receipts.len(), 1);
+        assert_eq!(record.completion_receipts[0].run_attempt, attempt);
+        assert!(matches!(
+            cm.node_complete_exact_with_drain(
+                submitted.job_id,
+                &generation,
+                token,
+                "worker1",
+                &incarnation,
+                0,
+                0,
+                attempt,
+                None,
+            )
+            .unwrap(),
+            NodeCompleteResult::AlreadyTerminal
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delayed_completion_after_launching_cancel_uses_terminal_get_job_fallback() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16_000);
+        let token = "launching-cancel-token";
+        let submitted = cm
+            .submit_job_with_token(basic_spec("cancel-during-launch"), Some(token.into()))
+            .unwrap();
+        let (generation, attempt) =
+            apply_dispatch_begin(&cm, submitted.job_id, &["worker1"], scalar_alloc(2, 4_000));
+        let incarnation = cm.get_node("worker1").unwrap().incarnation;
+
+        let cancelled = cm.cancel_job_by_submission_token(token).unwrap();
+        assert!(!cancelled.cleanup_complete);
+        assert_eq!(
+            cm.get_job(submitted.job_id)
+                .unwrap()
+                .pending_dispatch
+                .unwrap()
+                .phase,
+            PendingDispatchPhase::Aborting
+        );
+        let cleared = acknowledge_test_cleanup(&cm, submitted.job_id);
+        assert!(cleared.dispatch_cleared);
+        let terminal = cm.get_job(submitted.job_id).unwrap();
+        assert_eq!(terminal.state, JobState::Cancelled);
+        assert!(terminal.allocated_nodes.is_empty());
+        assert!(terminal.pending_dispatch.is_none());
+
+        assert!(matches!(
+            cm.node_complete_exact_with_drain(
+                submitted.job_id,
+                &generation,
+                token,
+                "worker1",
+                &incarnation,
+                0,
+                0,
+                attempt,
+                None,
+            ),
+            Err(NodeCompleteError::JobNotFound { .. })
+        ));
+        let current = cm.get_job(submitted.job_id).unwrap();
+        assert_eq!(
+            current.submission_generation,
+            submitted.submission_generation
+        );
+        assert_eq!(current.submission_token.as_deref(), Some(token));
+        assert_eq!(current.run_attempt, attempt);
+        assert!(current.state.is_terminal());
+    }
+
+    #[test]
+    fn completion_receipts_key_same_node_by_attempt_and_legacy_fields_default() {
+        let generation = Uuid::new_v4();
+        let mut record: SubmissionTokenRecord = serde_json::from_value(serde_json::json!({
+            "job_id": 7,
+            "submission_generation": generation,
+            "user": "k8s",
+            "spec_sha256": "digest"
+        }))
+        .expect("legacy token record");
+        assert!(!record.cancelled);
+        assert!(!record.cleanup_complete);
+        assert!(record.completion_receipts.is_empty());
+        assert!(record.terminal_receipt.is_none());
+
+        let first = SubmissionCompletionReceipt {
+            node_name: "worker1".into(),
+            run_attempt: 1,
+            worker_incarnation: "incarnation-a".into(),
+            exit_code: 0,
+            signal: 0,
+            drain_reason: None,
+        };
+        let second = SubmissionCompletionReceipt {
+            run_attempt: 2,
+            worker_incarnation: "incarnation-b".into(),
+            ..first.clone()
+        };
+        assert_eq!(
+            record.classify_completion_receipt(7, generation, &first),
+            CompletionReceiptMatch::New
+        );
+        record.completion_receipts.push(first);
+        assert_eq!(
+            record.classify_completion_receipt(7, generation, &second),
+            CompletionReceiptMatch::New
+        );
+        record.completion_receipts.push(second);
+        assert_eq!(record.completion_receipts.len(), 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8344,7 +14543,12 @@ mod tests {
         assert_eq!(stats.snapshot().jobs_started, 1);
 
         cm.complete_job(job_id, 0, JobState::Completed).unwrap();
-        settle(&cm, job_id, JobState::Completed);
+        if cm.get_job(job_id).unwrap().pending_dispatch.is_some() {
+            let response = acknowledge_test_cleanup(&cm, job_id);
+            assert_eq!(response.jobs_finalized.len(), 1);
+        }
+        cm.reconcile_pending_finalizations_once().await;
+        assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Completed);
         assert_eq!(stats.snapshot().jobs_finalized, 1);
     }
 
@@ -8355,6 +14559,7 @@ mod tests {
 
         register_node(&cm, "worker1", 8, 16000);
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("single-completing")),
         });
@@ -8369,15 +14574,21 @@ mod tests {
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
+            allocated_node_incarnations: HashMap::new(),
             srun_step_dispatch: false,
             run_attempt: 0,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
             job_id: 1,
+            submission_generation: cm.get_job(1).unwrap().submission_generation,
+            worker_incarnation: String::new(),
+            drain_reason: None,
             node_name: "worker1".into(),
             exit_code: 0,
             signal: 0,
+            run_attempt: 0,
+            submission_token: None,
         });
 
         let job = cm.get_job(1).unwrap();
@@ -8385,6 +14596,220 @@ mod tests {
         assert_eq!(job.exit_code, Some(0));
         assert!(job.node_completions.is_empty());
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completion_drain_is_atomic_idempotent_and_exact_attempt_fenced() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "worker1", 8, 16_000);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
+            job_id: 1,
+            spec: Box::new(basic_spec("completion-drain")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let alloc = scalar_alloc(2, 4_000);
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["worker1".into()],
+            resources: alloc.clone(),
+            per_node_alloc: per_node_for(&["worker1"], alloc),
+            allocated_node_incarnations: HashMap::new(),
+            srun_step_dispatch: false,
+            run_attempt: 2,
+        });
+        let generation = cm.get_job(1).unwrap().submission_generation;
+        let state_before_stale = cm.get_node("worker1").unwrap().state;
+
+        let stale = cm.apply_operation(&WalOperation::JobNodeComplete {
+            job_id: 1,
+            submission_generation: generation,
+            worker_incarnation: String::new(),
+            node_name: "worker1".into(),
+            exit_code: 0,
+            signal: 0,
+            drain_reason: Some("stale worker requested drain".into()),
+            run_attempt: 1,
+            submission_token: None,
+        });
+        assert!(!stale.completion_accepted);
+        assert_eq!(cm.get_node("worker1").unwrap().state, state_before_stale);
+        assert!(cm.get_node("worker1").unwrap().state_reason.is_none());
+
+        let accepted = WalOperation::JobNodeComplete {
+            job_id: 1,
+            submission_generation: generation,
+            worker_incarnation: String::new(),
+            node_name: "worker1".into(),
+            exit_code: 0,
+            signal: 0,
+            drain_reason: Some("epilog health check failed".into()),
+            run_attempt: 2,
+            submission_token: None,
+        };
+        let response = cm.apply_operation(&accepted);
+        assert_eq!(response.jobs_finalized.len(), 1);
+        let node = cm.get_node("worker1").unwrap();
+        assert_eq!(node.state, NodeState::Drain);
+        assert_eq!(
+            node.state_reason.as_deref(),
+            Some("epilog health check failed")
+        );
+
+        // Models a response lost after apply: retrying the same report must not
+        // re-finalize, but the drain committed with the first completion stays.
+        let replay = cm.apply_operation(&accepted);
+        assert!(replay.jobs_finalized.is_empty());
+        let node = cm.get_node("worker1").unwrap();
+        assert_eq!(node.state, NodeState::Drain);
+        assert_eq!(
+            node.state_reason.as_deref(),
+            Some("epilog health check failed")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_submission_generation_cannot_drain_current_run() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node(&cm, "worker1", 8, 16_000);
+        let job_id = run_job_on(&cm, "generation-drain-fence", "worker1");
+        let current = cm.get_job(job_id).unwrap();
+        let state_before_stale = cm.get_node("worker1").unwrap().state;
+        let stale_generation = Default::default();
+        assert_ne!(stale_generation, current.submission_generation);
+
+        let response = cm.apply_operation(&WalOperation::JobNodeComplete {
+            job_id,
+            submission_generation: stale_generation,
+            worker_incarnation: String::new(),
+            node_name: "worker1".into(),
+            exit_code: 0,
+            signal: 0,
+            drain_reason: Some("stale generation requested drain".into()),
+            run_attempt: current.run_attempt,
+            submission_token: None,
+        });
+        assert!(!response.completion_accepted);
+        let node = cm.get_node("worker1").unwrap();
+        assert_eq!(node.state, state_before_stale);
+        assert!(node.state_reason.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn all_early_completions_promote_dispatch_once_and_late_commit_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        register_node_with_incarnation(&cm, "n1", "incarnation-n1", 8, 16_000);
+        register_node_with_incarnation(&cm, "n2", "incarnation-n2", 8, 16_000);
+        let job_id = submit_and_wait(&cm, basic_spec("early-completion-promotion"));
+        let per_node = scalar_alloc(2, 4_000);
+        let nodes = vec!["n2".to_string(), "n1".to_string()];
+        let per_node_alloc = per_node_for(&["n2", "n1"], per_node.clone());
+        let mut resources = ResourceAllocations::default();
+        resources.add(&per_node);
+        resources.add(&per_node);
+        let (run_attempt, _guard) = cm
+            .begin_pending_dispatch(
+                job_id,
+                nodes.clone(),
+                resources.clone(),
+                per_node_alloc.clone(),
+            )
+            .unwrap();
+        let generation = cm.get_job(job_id).unwrap().submission_generation;
+
+        let first = cm.apply_operation(&WalOperation::JobNodeComplete {
+            job_id,
+            submission_generation: generation,
+            worker_incarnation: "incarnation-n1".into(),
+            node_name: "n1".into(),
+            exit_code: 0,
+            signal: 0,
+            drain_reason: None,
+            run_attempt,
+            submission_token: None,
+        });
+        assert!(first.completion_buffered);
+        assert!(!first.dispatch_committed);
+        let launching = cm.get_job(job_id).unwrap();
+        assert_eq!(launching.state, JobState::Pending);
+        assert_eq!(
+            launching.pending_dispatch.as_ref().unwrap().phase,
+            PendingDispatchPhase::Launching
+        );
+
+        let second_completion = WalOperation::JobNodeComplete {
+            job_id,
+            submission_generation: generation,
+            worker_incarnation: "incarnation-n2".into(),
+            node_name: "n2".into(),
+            exit_code: 0,
+            signal: 0,
+            drain_reason: None,
+            run_attempt,
+            submission_token: None,
+        };
+        let second = cm.apply_operation(&second_completion);
+        assert!(second.completion_buffered);
+        assert!(second.dispatch_committed);
+
+        let committed = cm.get_job(job_id).unwrap();
+        assert_eq!(committed.state, JobState::Pending);
+        assert_eq!(committed.allocated_nodes, nodes);
+        assert_eq!(committed.allocated_resources.as_ref(), Some(&resources));
+        let dispatch = committed.pending_dispatch.as_ref().unwrap();
+        assert_eq!(dispatch.phase, PendingDispatchPhase::Committed);
+        assert!(dispatch.terminal_after_cleanup.is_some());
+        assert_eq!(dispatch.early_completions.len(), 2);
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 2);
+        assert_eq!(cm.get_node("n2").unwrap().alloc_resources.cpus, 2);
+
+        let batch = cm
+            .get_steps(job_id)
+            .into_iter()
+            .find(|step| step.step_id == STEP_BATCH)
+            .unwrap();
+        assert_eq!(batch.nodes, vec!["n2", "n1"]);
+        assert_eq!(batch.run_attempt, run_attempt);
+
+        // The original launch RPC can return after exact completions promoted
+        // the dispatch. Its late commit must succeed without charging nodes or
+        // creating a second batch step.
+        assert_eq!(
+            cm.start_job_after_dispatch(
+                job_id,
+                vec!["n2".into(), "n1".into()],
+                resources,
+                per_node_alloc,
+                run_attempt,
+            )
+            .unwrap(),
+            run_attempt
+        );
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 2);
+        assert_eq!(cm.get_node("n2").unwrap().alloc_resources.cpus, 2);
+        assert_eq!(
+            cm.get_steps(job_id)
+                .into_iter()
+                .filter(|step| step.step_id == STEP_BATCH)
+                .count(),
+            1
+        );
+
+        // A replayed final completion is also harmless.
+        let replay = cm.apply_operation(&second_completion);
+        assert!(!replay.dispatch_committed);
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 2);
+        assert_eq!(cm.get_node("n2").unwrap().alloc_resources.cpus, 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8396,6 +14821,7 @@ mod tests {
         let cm = test_cluster(&dir).await;
         register_node(&cm, "worker1", 8, 16000);
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("oom")),
         });
@@ -8410,15 +14836,21 @@ mod tests {
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
+            allocated_node_incarnations: HashMap::new(),
             srun_step_dispatch: false,
             run_attempt: 0,
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
             job_id: 1,
+            submission_generation: cm.get_job(1).unwrap().submission_generation,
+            worker_incarnation: String::new(),
+            drain_reason: None,
             node_name: "worker1".into(),
             exit_code: 0,
             signal: spur_core::job::OOM_SIGNAL_FLAG | 9,
+            run_attempt: 0,
+            submission_token: None,
         });
 
         let job = cm.get_job(1).unwrap();
@@ -8438,50 +14870,40 @@ mod tests {
         }
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("multi-completing")),
         });
-        cm.apply_operation(&WalOperation::job_state_change(
-            1,
-            JobState::Pending,
-            JobState::Running,
-        ));
         let alloc = scalar_alloc(2, 4000);
-        cm.apply_operation(&WalOperation::JobStart {
-            job_id: 1,
-            nodes: vec!["n1".into(), "n2".into(), "n3".into()],
-            resources: scalar_alloc(6, 12000),
-            per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
-            srun_step_dispatch: false,
-            run_attempt: 0,
-        });
+        apply_dispatch_begin(&cm, 1, &["n1", "n2", "n3"], alloc);
+        apply_dispatch_commit(&cm, 1);
+        apply_dispatch_publish(&cm, 1);
+        let attempt = cm.get_job(1).unwrap().run_attempt;
 
-        cm.apply_operation(&WalOperation::JobNodeComplete {
-            job_id: 1,
-            node_name: "n1".into(),
-            exit_code: 0,
-            signal: 0,
-        });
+        assert!(matches!(
+            cm.node_complete(1, "n1", 0, 0, attempt).unwrap(),
+            NodeCompleteResult::Completing { .. }
+        ));
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Completing);
         assert_eq!(job.node_completions.len(), 1);
         assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 0);
         assert!(cm.get_node("n2").unwrap().alloc_resources.cpus > 0);
 
-        cm.apply_operation(&WalOperation::JobNodeComplete {
-            job_id: 1,
-            node_name: "n2".into(),
-            exit_code: 0,
-            signal: 0,
-        });
+        assert!(matches!(
+            cm.node_complete(1, "n2", 0, 0, attempt).unwrap(),
+            NodeCompleteResult::Completing { remaining_nodes, .. }
+                if remaining_nodes == vec!["n3"]
+        ));
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Completing);
 
-        cm.apply_operation(&WalOperation::JobNodeComplete {
-            job_id: 1,
-            node_name: "n3".into(),
-            exit_code: 42,
-            signal: 0,
-        });
+        assert!(matches!(
+            cm.node_complete(1, "n3", 42, 0, attempt).unwrap(),
+            NodeCompleteResult::AllDone {
+                state: JobState::Completed,
+                exit_code: 0,
+            }
+        ));
 
         let job = cm.get_job(1).unwrap();
         // ExitCode follows the primary (batch) node n1 = allocated_nodes[0],
@@ -8504,6 +14926,7 @@ mod tests {
         register_node(&cm, "n1", 8, 16000);
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("steps")),
         });
@@ -8517,6 +14940,7 @@ mod tests {
             nodes: vec!["n1".into()],
             resources: scalar_alloc(4, 8000),
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(4, 8000)),
+            allocated_node_incarnations: HashMap::new(),
             srun_step_dispatch: false,
             run_attempt: 0,
         });
@@ -8525,12 +14949,16 @@ mod tests {
         // the running max live; ExitCode is unaffected (it is the batch exit).
         cm.apply_operation(&WalOperation::JobStepComplete {
             job_id: 1,
+            submission_generation: Default::default(),
+            run_attempt: 0,
             step_id: 0,
             exit_code: 7,
         });
         assert_eq!(cm.get_job(1).unwrap().derived_exit_code, 7);
         cm.apply_operation(&WalOperation::JobStepComplete {
             job_id: 1,
+            submission_generation: Default::default(),
+            run_attempt: 0,
             step_id: 1,
             exit_code: 3,
         });
@@ -8538,6 +14966,8 @@ mod tests {
         assert_eq!(cm.get_job(1).unwrap().derived_exit_code, 7);
         cm.apply_operation(&WalOperation::JobStepComplete {
             job_id: 1,
+            submission_generation: Default::default(),
+            run_attempt: 0,
             step_id: 2,
             exit_code: 2,
         });
@@ -8546,9 +14976,14 @@ mod tests {
         // Batch script exits 2 -> ExitCode=2:0, DerivedExitCode preserved at 7.
         cm.apply_operation(&WalOperation::JobNodeComplete {
             job_id: 1,
+            submission_generation: cm.get_job(1).unwrap().submission_generation,
+            worker_incarnation: String::new(),
+            drain_reason: None,
             node_name: "n1".into(),
             exit_code: 2,
             signal: 0,
+            run_attempt: 0,
+            submission_token: None,
         });
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Failed);
@@ -8565,6 +15000,7 @@ mod tests {
         register_node(&cm, "n1", 8, 16000);
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("batch-only")),
         });
@@ -8576,6 +15012,8 @@ mod tests {
 
         cm.apply_operation(&WalOperation::JobStepComplete {
             job_id: 1,
+            submission_generation: Default::default(),
+            run_attempt: 0,
             step_id: STEP_BATCH,
             exit_code: 9,
         });
@@ -8593,6 +15031,7 @@ mod tests {
         }
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("finalize-response")),
         });
@@ -8607,24 +15046,35 @@ mod tests {
             nodes: vec!["n1".into(), "n2".into()],
             resources: scalar_alloc(4, 8000),
             per_node_alloc: per_node_for(&["n1", "n2"], alloc),
+            allocated_node_incarnations: HashMap::new(),
             srun_step_dispatch: false,
             run_attempt: 0,
         });
 
         let r1 = cm.apply_operation(&WalOperation::JobNodeComplete {
             job_id: 1,
+            submission_generation: cm.get_job(1).unwrap().submission_generation,
+            worker_incarnation: String::new(),
+            drain_reason: None,
             node_name: "n1".into(),
             exit_code: 0,
             signal: 0,
+            run_attempt: 0,
+            submission_token: None,
         });
         assert!(r1.jobs_finalized.is_empty());
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Completing);
 
         let r2 = cm.apply_operation(&WalOperation::JobNodeComplete {
             job_id: 1,
+            submission_generation: cm.get_job(1).unwrap().submission_generation,
+            worker_incarnation: String::new(),
+            drain_reason: None,
             node_name: "n2".into(),
             exit_code: 0,
             signal: 0,
+            run_attempt: 0,
+            submission_token: None,
         });
         let f = r2
             .jobs_finalized
@@ -8643,6 +15093,7 @@ mod tests {
 
         register_node(&cm, "worker1", 8, 16000);
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("job-complete-response")),
         });
@@ -8657,6 +15108,7 @@ mod tests {
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
+            allocated_node_incarnations: HashMap::new(),
             srun_step_dispatch: false,
             run_attempt: 0,
         });
@@ -8665,6 +15117,7 @@ mod tests {
             job_id: 1,
             exit_code: 0,
             state: JobState::Completed,
+            finalization_intent: None,
         });
         let f = resp
             .jobs_finalized
@@ -8675,6 +15128,810 @@ mod tests {
         assert_eq!(f.exit_code, 0);
     }
 
+    #[test]
+    fn terminal_marker_is_first_writer_and_ack_is_exact() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
+            job_id: 1,
+            spec: Box::new(basic_spec("durable-finalization")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+
+        let first_terminal = durable_job_operation(
+            &cm,
+            1,
+            WalOperation::JobComplete {
+                job_id: 1,
+                exit_code: 7,
+                state: JobState::Failed,
+                finalization_intent: None,
+            },
+        );
+        let response = cm.apply_operation(&first_terminal);
+        let marker = cm
+            .get_job(1)
+            .unwrap()
+            .pending_finalization
+            .expect("terminal transition must install a marker");
+        assert_eq!(
+            response.jobs_finalized[0].submission_generation,
+            marker.submission_generation
+        );
+        assert_eq!(response.jobs_finalized[0].run_attempt, marker.run_attempt);
+
+        // A later terminal operation cannot replace a marker whose sinks may
+        // already have run.
+        let later_terminal = durable_job_operation(
+            &cm,
+            1,
+            WalOperation::JobComplete {
+                job_id: 1,
+                exit_code: -1,
+                state: JobState::Cancelled,
+                finalization_intent: None,
+            },
+        );
+        let later = cm.apply_operation(&later_terminal);
+        assert!(later.jobs_finalized.is_empty());
+        assert_eq!(
+            cm.get_job(1).unwrap().pending_finalization,
+            Some(marker.clone())
+        );
+
+        // Every immutable outcome field participates in the Ack CAS.
+        let mut stale = marker.clone();
+        stale.derived_exit_code += 1;
+        let stale_response = cm.apply_operation(&WalOperation::JobFinalizationAck {
+            job_id: 1,
+            marker: stale,
+            action: FinalizationAction::KeepTerminal,
+        });
+        assert!(!stale_response.finalization_acked);
+        assert_eq!(
+            cm.get_job(1).unwrap().pending_finalization,
+            Some(marker.clone())
+        );
+
+        let ack = cm.apply_operation(&WalOperation::JobFinalizationAck {
+            job_id: 1,
+            marker,
+            action: FinalizationAction::KeepTerminal,
+        });
+        assert!(ack.finalization_acked);
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Failed);
+        assert!(job.pending_finalization.is_none());
+    }
+
+    #[test]
+    fn finalization_ack_requeues_timeout_atomically() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        let mut spec = basic_spec("timeout-requeue");
+        spec.requeue = true;
+        cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
+            job_id: 1,
+            spec: Box::new(spec),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cm.apply_operation(&durable_job_operation(
+            &cm,
+            1,
+            WalOperation::JobComplete {
+                job_id: 1,
+                exit_code: -1,
+                state: JobState::Timeout,
+                finalization_intent: None,
+            },
+        ));
+        let terminal = cm.get_job(1).unwrap();
+        let marker = terminal.pending_finalization.clone().unwrap();
+        let action = cm.finalization_action(&terminal, &marker);
+        let ack = cm.apply_operation(&WalOperation::JobFinalizationAck {
+            job_id: 1,
+            marker,
+            action,
+        });
+
+        assert!(ack.finalization_acked);
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.requeue_count, 1);
+        assert!(job.pending_finalization.is_none());
+        assert!(job.exit_code.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn periodic_reconciler_recovers_a_lost_terminal_response() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let mut spec = basic_spec("lost-finalization-response");
+        spec.requeue = true;
+        cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
+            job_id: 1,
+            spec: Box::new(spec),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+
+        // Bypass the public response consumer to model a leader that commits
+        // the terminal entry and crashes before seeing its ClientResponse.
+        cm.apply_operation(&durable_job_operation(
+            &cm,
+            1,
+            WalOperation::JobComplete {
+                job_id: 1,
+                exit_code: -1,
+                state: JobState::Timeout,
+                finalization_intent: None,
+            },
+        ));
+        assert!(cm.get_job(1).unwrap().pending_finalization.is_some());
+
+        cm.reconcile_pending_finalizations_once().await;
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert!(job.pending_finalization.is_none());
+        assert_eq!(job.requeue_count, 1);
+        wait_for("finalization lock cleaned", || {
+            cm.finalization_locks.lock().is_empty()
+        });
+    }
+
+    /// Models the hardest delivery ambiguity: PostgreSQL committed the exact
+    /// receipt and usage contribution, but the controller observed an error
+    /// before proposing the Raft ACK. The durable marker must survive both the
+    /// error and snapshot replay; redelivery must not double-count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn accounting_commit_response_loss_retries_once_without_double_counting() {
+        let sink = Arc::new(InMemoryAccountingSink::commit_then_lose_response_once());
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.set_accounting_sink(sink.clone());
+        cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
+            job_id: 1,
+            spec: Box::new(basic_spec("accounting-ambiguous-commit")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cm.apply_operation(&durable_job_operation(
+            &cm,
+            1,
+            WalOperation::JobComplete {
+                job_id: 1,
+                exit_code: 0,
+                state: JobState::Completed,
+                finalization_intent: None,
+            },
+        ));
+        let marker = cm.get_job(1).unwrap().pending_finalization.clone().unwrap();
+
+        cm.reconcile_pending_finalizations_once().await;
+        assert_eq!(
+            cm.get_job(1).unwrap().pending_finalization,
+            Some(marker.clone()),
+            "an accounting error must not be acknowledged"
+        );
+        assert_eq!(
+            sink.contributions.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let stored = sink
+            .receipts
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        assert_eq!(stored.finalization_id, marker.finalization_id);
+        assert_eq!(stored.submission_generation, marker.submission_generation);
+        assert_eq!(stored.run_attempt, marker.run_attempt);
+
+        let snapshot = cm.snapshot_state().unwrap();
+        let replay_dir = TempDir::new().unwrap();
+        let replayed = test_cluster(&replay_dir).await;
+        replayed.restore_from_snapshot(&snapshot).unwrap();
+        replayed.set_accounting_sink(sink.clone());
+        assert_eq!(
+            replayed.get_job(1).unwrap().pending_finalization,
+            Some(marker)
+        );
+
+        replayed.reconcile_pending_finalizations_once().await;
+        assert!(replayed.get_job(1).unwrap().pending_finalization.is_none());
+        assert_eq!(
+            sink.contributions.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "redelivery after commit ambiguity must be a no-op"
+        );
+    }
+
+    #[test]
+    fn finalization_ack_rejects_action_shape_from_another_intent() {
+        let marker = PendingFinalization {
+            finalization_id: Default::default(),
+            submission_generation: Default::default(),
+            run_attempt: 3,
+            state: JobState::Timeout,
+            exit_code: -1,
+            exit_signal: 0,
+            derived_exit_code: 0,
+            end_time: Utc::now(),
+            intent: FinalizationIntent::AutoRequeue,
+        };
+        let preempt_action = FinalizationAction::Requeue {
+            begin_time: Some(Utc::now()),
+            pending_reason: PendingReason::BeginTime,
+            pending_reason_desc: None,
+            priority: None,
+            counter: FinalizationRequeueCounter::Preempt,
+        };
+        assert!(!ClusterManager::finalization_action_matches_intent(
+            &marker,
+            &preempt_action,
+        ));
+    }
+
+    #[test]
+    fn durable_finalization_terminal_entry_converges_with_one_leader_identity_and_timestamp() {
+        let left_dir = TempDir::new().unwrap();
+        let right_dir = TempDir::new().unwrap();
+        let left = ClusterManager::new(test_config(), left_dir.path()).unwrap();
+        let right = ClusterManager::new(test_config(), right_dir.path()).unwrap();
+        let submit = WalOperation::JobSubmit {
+            metadata: None,
+            job_id: 1,
+            spec: Box::new(basic_spec("replica-determinism")),
+        };
+        for cluster in [&left, &right] {
+            cluster.apply_operation(&submit);
+            cluster.apply_operation(&WalOperation::job_state_change(
+                1,
+                JobState::Pending,
+                JobState::Running,
+            ));
+        }
+
+        let end_time = DateTime::<Utc>::from_timestamp(1_750_000_000, 123_000_000).unwrap();
+        let operation = durable_job_operation_at(
+            &left,
+            1,
+            WalOperation::JobComplete {
+                job_id: 1,
+                exit_code: 17,
+                state: JobState::Failed,
+                finalization_intent: None,
+            },
+            end_time,
+        );
+        let left_response = left.apply_operation(&operation);
+        let right_response = right.apply_operation(&operation);
+        assert_eq!(left_response.jobs_finalized.len(), 1);
+        assert_eq!(right_response.jobs_finalized.len(), 1);
+        assert_eq!(
+            left_response.jobs_finalized[0].job_id,
+            right_response.jobs_finalized[0].job_id
+        );
+        assert_eq!(
+            left_response.jobs_finalized[0].state,
+            right_response.jobs_finalized[0].state
+        );
+        assert_eq!(
+            left_response.jobs_finalized[0].exit_code,
+            right_response.jobs_finalized[0].exit_code
+        );
+
+        let left_job = left.get_job(1).unwrap();
+        let right_job = right.get_job(1).unwrap();
+        assert_eq!(left_job.end_time, Some(end_time));
+        assert_eq!(left_job.end_time, right_job.end_time);
+        assert_eq!(
+            left_job.pending_finalization,
+            right_job.pending_finalization
+        );
+        let marker = left_job.pending_finalization.unwrap();
+        assert_ne!(marker.finalization_id, Uuid::nil());
+
+        let ack = WalOperation::JobFinalizationAck {
+            job_id: 1,
+            marker,
+            action: FinalizationAction::KeepTerminal,
+        };
+        assert!(left.apply_operation(&ack).finalization_acked);
+        assert!(right.apply_operation(&ack).finalization_acked);
+        assert_eq!(
+            left.get_job(1).unwrap().state,
+            right.get_job(1).unwrap().state
+        );
+        assert_eq!(
+            left.get_job(1).unwrap().pending_finalization,
+            right.get_job(1).unwrap().pending_finalization
+        );
+    }
+
+    #[test]
+    fn durable_finalization_legacy_unwrapped_replay_never_synthesizes_outbox_work() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
+            job_id: 1,
+            spec: Box::new(basic_spec("legacy-timeout")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+
+        let historical_terminal = WalOperation::JobComplete {
+            job_id: 1,
+            exit_code: -1,
+            state: JobState::Timeout,
+            finalization_intent: None,
+        };
+        assert_eq!(
+            cm.apply_operation(&historical_terminal)
+                .jobs_finalized
+                .len(),
+            1
+        );
+        assert!(cm.get_job(1).unwrap().pending_finalization.is_none());
+
+        // This was the old response-driven auto-requeue sequence. It must
+        // remain replayable rather than being rejected as a marker bypass.
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Timeout,
+            JobState::Pending,
+        ));
+        let replayed = cm.get_job(1).unwrap();
+        assert_eq!(replayed.state, JobState::Pending);
+        assert!(replayed.pending_finalization.is_none());
+
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let historical_success = WalOperation::JobComplete {
+            job_id: 1,
+            exit_code: 0,
+            state: JobState::Completed,
+            finalization_intent: None,
+        };
+        assert_eq!(
+            cm.apply_operation(&historical_success).jobs_finalized.len(),
+            1
+        );
+        assert!(cm.get_job(1).unwrap().pending_finalization.is_none());
+        assert!(
+            cm.apply_operation(&historical_success)
+                .jobs_finalized
+                .is_empty(),
+            "replaying old terminal data must not redeliver a durable sink"
+        );
+    }
+
+    #[test]
+    fn durable_finalization_stale_exact_terminal_signal_and_preempt_entries_are_fenced() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
+            job_id: 1,
+            spec: Box::new(basic_spec("exact-fence")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let job = cm.get_job(1).unwrap();
+        let at = DateTime::<Utc>::from_timestamp(1_750_000_100, 0).unwrap();
+
+        let stale_generation = WalOperation::DurableFinalization {
+            context: DurableFinalizationContext::exact(Uuid::new_v4(), job.run_attempt, at),
+            operation: Box::new(WalOperation::JobComplete {
+                job_id: 1,
+                exit_code: -1,
+                state: JobState::Failed,
+                finalization_intent: None,
+            }),
+        };
+        assert!(cm
+            .apply_operation(&stale_generation)
+            .jobs_finalized
+            .is_empty());
+
+        let stale_attempt = WalOperation::DurableFinalization {
+            context: DurableFinalizationContext::exact(
+                job.submission_generation,
+                job.run_attempt + 1,
+                at,
+            ),
+            operation: Box::new(WalOperation::JobTimeLimitSignaled { job_id: 1, at }),
+        };
+        cm.apply_operation(&stale_attempt);
+        assert!(cm.get_job(1).unwrap().time_limit_signaled_at.is_none());
+
+        let stale_preempt = WalOperation::DurableFinalization {
+            context: DurableFinalizationContext::exact(
+                job.submission_generation,
+                job.run_attempt + 1,
+                at,
+            ),
+            operation: Box::new(WalOperation::JobPreemptRequeue {
+                job_id: 1,
+                begin_time: at + chrono::Duration::seconds(5),
+            }),
+        };
+        assert!(cm.apply_operation(&stale_preempt).jobs_finalized.is_empty());
+        let unchanged = cm.get_job(1).unwrap();
+        assert_eq!(unchanged.state, JobState::Running);
+        assert!(unchanged.pending_finalization.is_none());
+        assert!(unchanged.pending_dispatch.is_none());
+    }
+
+    #[test]
+    fn durable_finalization_replicated_ack_converges_despite_different_replica_configs() {
+        let leader_dir = TempDir::new().unwrap();
+        let follower_dir = TempDir::new().unwrap();
+        let mut leader_config = test_config();
+        leader_config.controller.max_batch_requeue = 3;
+        let mut follower_config = test_config();
+        follower_config.controller.max_batch_requeue = 1;
+        let leader = ClusterManager::new(leader_config, leader_dir.path()).unwrap();
+        let follower = ClusterManager::new(follower_config, follower_dir.path()).unwrap();
+        let mut spec = basic_spec("config-independent-apply");
+        spec.requeue = true;
+        let submit = WalOperation::JobSubmit {
+            metadata: None,
+            job_id: 1,
+            spec: Box::new(spec),
+        };
+        for cluster in [&leader, &follower] {
+            cluster.apply_operation(&submit);
+            cluster.apply_operation(&WalOperation::job_state_change(
+                1,
+                JobState::Pending,
+                JobState::Running,
+            ));
+            cluster.jobs.write().get_mut(&1).unwrap().requeue_count = 1;
+        }
+
+        let terminal = durable_job_operation_at(
+            &leader,
+            1,
+            WalOperation::JobComplete {
+                job_id: 1,
+                exit_code: -1,
+                state: JobState::Timeout,
+                finalization_intent: None,
+            },
+            DateTime::<Utc>::from_timestamp(1_750_000_200, 0).unwrap(),
+        );
+        leader.apply_operation(&terminal);
+        follower.apply_operation(&terminal);
+        let marker = leader.get_job(1).unwrap().pending_finalization.unwrap();
+        assert_eq!(
+            Some(marker.clone()),
+            follower.get_job(1).unwrap().pending_finalization
+        );
+
+        let leader_action = leader.finalization_action(&leader.get_job(1).unwrap(), &marker);
+        let follower_local_action =
+            follower.finalization_action(&follower.get_job(1).unwrap(), &marker);
+        assert_ne!(leader_action, follower_local_action);
+        let ack = WalOperation::JobFinalizationAck {
+            job_id: 1,
+            marker,
+            action: leader_action,
+        };
+        assert!(leader.apply_operation(&ack).finalization_acked);
+        assert!(follower.apply_operation(&ack).finalization_acked);
+        let leader_job = leader.get_job(1).unwrap();
+        let follower_job = follower.get_job(1).unwrap();
+        assert_eq!(leader_job.state, JobState::Pending);
+        assert_eq!(leader_job.state, follower_job.state);
+        assert_eq!(leader_job.pending_reason, follower_job.pending_reason);
+        assert_eq!(leader_job.requeue_count, follower_job.requeue_count);
+    }
+
+    #[test]
+    fn durable_finalization_multinode_failure_retains_healthy_capacity_until_cleanup_ack() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        for name in ["failed", "healthy"] {
+            let mut node = make_test_node(name, 4, 0);
+            node.incarnation = format!("{name}-worker-1");
+            cm.nodes.write().insert(name.into(), node);
+        }
+        cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
+            job_id: 1,
+            spec: Box::new(basic_spec("multinode-cleanup")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let per_node = scalar_alloc(2, 1024);
+        let mut total = ResourceAllocations::default();
+        total.add(&per_node);
+        total.add(&per_node);
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["failed".into(), "healthy".into()],
+            resources: total,
+            per_node_alloc: per_node_for(&["failed", "healthy"], per_node),
+            allocated_node_incarnations: HashMap::from([
+                ("failed".into(), "failed-worker-1".into()),
+                ("healthy".into(), "healthy-worker-1".into()),
+            ]),
+            srun_step_dispatch: false,
+            run_attempt: 7,
+        });
+
+        let failure = WalOperation::DurableFinalization {
+            context: DurableFinalizationContext::node_lifecycle(
+                DateTime::<Utc>::from_timestamp(1_750_000_300, 0).unwrap(),
+            ),
+            operation: Box::new(WalOperation::NodeStateChange {
+                name: "failed".into(),
+                expected_incarnation: "failed-worker-1".into(),
+                old_state: NodeState::Allocated,
+                new_state: NodeState::Down,
+                reason: Some("lost heartbeat".into()),
+                admin_locked: false,
+            }),
+        };
+        let response = cm.apply_operation(&failure);
+        assert!(response.terminal_cleanup_deferred);
+        assert_eq!(cm.get_node("failed").unwrap().alloc_resources.cpus, 0);
+        assert_eq!(cm.get_node("healthy").unwrap().alloc_resources.cpus, 2);
+        let pending = cm.get_job(1).unwrap();
+        assert_eq!(pending.state, JobState::Running);
+        assert!(pending.pending_finalization.is_none());
+        let dispatch = pending.pending_dispatch.unwrap();
+        assert_eq!(dispatch.phase, PendingDispatchPhase::Aborting);
+        assert_eq!(dispatch.target_nodes, vec!["healthy".to_string()]);
+        assert_eq!(
+            dispatch
+                .target_incarnations
+                .get("healthy")
+                .map(String::as_str),
+            Some("healthy-worker-1")
+        );
+
+        let premature = cm.apply_operation(&WalOperation::JobDispatchClear {
+            job_id: 1,
+            submission_generation: dispatch.submission_generation,
+            run_attempt: dispatch.run_attempt,
+        });
+        assert!(premature.jobs_finalized.is_empty());
+        assert_eq!(cm.get_node("healthy").unwrap().alloc_resources.cpus, 2);
+        assert!(cm.get_job(1).unwrap().pending_finalization.is_none());
+
+        let target_ack = cm.apply_operation(&WalOperation::JobDispatchTargetClear {
+            job_id: 1,
+            submission_generation: dispatch.submission_generation,
+            run_attempt: dispatch.run_attempt,
+            node_name: "healthy".into(),
+        });
+        assert!(target_ack.dispatch_target_cleared);
+        assert_eq!(cm.get_node("healthy").unwrap().alloc_resources.cpus, 0);
+        assert!(cm.get_job(1).unwrap().pending_finalization.is_none());
+
+        let complete = cm.apply_operation(&WalOperation::JobDispatchClear {
+            job_id: 1,
+            submission_generation: dispatch.submission_generation,
+            run_attempt: dispatch.run_attempt,
+        });
+        assert_eq!(complete.jobs_finalized.len(), 1);
+        let finalized = cm.get_job(1).unwrap();
+        assert_eq!(finalized.state, JobState::NodeFail);
+        assert!(finalized.pending_dispatch.is_none());
+        assert!(finalized.pending_finalization.is_some());
+    }
+
+    #[test]
+    fn durable_finalization_missing_worker_ownership_fails_closed() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        let mut node = make_test_node("n1", 4, 0);
+        node.incarnation = "n1-worker-1".into();
+        cm.nodes.write().insert("n1".into(), node);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
+            job_id: 1,
+            spec: Box::new(basic_spec("missing-owner")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let allocation = scalar_alloc(2, 1024);
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: allocation.clone(),
+            per_node_alloc: per_node_for(&["n1"], allocation),
+            allocated_node_incarnations: HashMap::from([("n1".into(), "n1-worker-1".into())]),
+            srun_step_dispatch: false,
+            run_attempt: 4,
+        });
+        cm.jobs
+            .write()
+            .get_mut(&1)
+            .unwrap()
+            .allocated_node_incarnations
+            .clear();
+
+        let operation = durable_job_operation(
+            &cm,
+            1,
+            WalOperation::JobComplete {
+                job_id: 1,
+                exit_code: -1,
+                state: JobState::Cancelled,
+                finalization_intent: None,
+            },
+        );
+        let response = cm.apply_operation(&operation);
+        assert!(!response.terminal_cleanup_deferred);
+        assert!(response.jobs_finalized.is_empty());
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert!(job.pending_dispatch.is_none());
+        assert!(job.pending_finalization.is_none());
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 2);
+    }
+
+    #[test]
+    fn durable_finalization_worker_restart_does_not_replace_persisted_cleanup_owner() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        let mut node = make_test_node("n1", 4, 0);
+        node.incarnation = "old-worker".into();
+        cm.nodes.write().insert("n1".into(), node);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
+            job_id: 1,
+            spec: Box::new(basic_spec("restart-owner")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let allocation = scalar_alloc(2, 1024);
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: allocation.clone(),
+            per_node_alloc: per_node_for(&["n1"], allocation),
+            allocated_node_incarnations: HashMap::from([("n1".into(), "old-worker".into())]),
+            srun_step_dispatch: false,
+            run_attempt: 8,
+        });
+        cm.nodes.write().get_mut("n1").unwrap().incarnation = "new-worker".into();
+
+        let terminal = durable_job_operation(
+            &cm,
+            1,
+            WalOperation::JobComplete {
+                job_id: 1,
+                exit_code: -1,
+                state: JobState::Cancelled,
+                finalization_intent: None,
+            },
+        );
+        let WalOperation::DurableFinalization { context, .. } = &terminal else {
+            panic!("test helper must envelope terminal operation");
+        };
+        assert_eq!(
+            context
+                .expected_node_incarnations
+                .get("n1")
+                .map(String::as_str),
+            Some("old-worker"),
+            "a new registration must never become inferred ownership"
+        );
+        let response = cm.apply_operation(&terminal);
+        assert!(response.terminal_cleanup_deferred);
+        let dispatch = cm.get_job(1).unwrap().pending_dispatch.unwrap();
+        assert_eq!(
+            dispatch.target_incarnations.get("n1").map(String::as_str),
+            Some("old-worker")
+        );
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 2);
+        assert!(cm.get_job(1).unwrap().pending_finalization.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durable_finalization_reconciler_fanout_is_bounded() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let limit = 4;
+        run_finalization_tasks_bounded(0..37, limit, {
+            let active = active.clone();
+            let peak = peak.clone();
+            move |_| {
+                let active = active.clone();
+                let peak = peak.clone();
+                async move {
+                    let now = active.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                    peak.fetch_max(now, AtomicOrdering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    active.fetch_sub(1, AtomicOrdering::SeqCst);
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(active.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(
+            peak.load(AtomicOrdering::SeqCst),
+            limit,
+            "the harness should saturate, but never exceed, its configured bound"
+        );
+    }
+
+    #[test]
+    fn prelaunch_rejections_and_backoff_do_not_install_terminal_marker() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
+            job_id: 1,
+            spec: Box::new(basic_spec("prelaunch")),
+        });
+        let generation = cm.get_job(1).unwrap().submission_generation;
+        let retry_after = Utc::now() + chrono::Duration::seconds(30);
+        cm.apply_operation(&WalOperation::JobTransientCapacityReject {
+            job_id: 1,
+            submission_generation: generation,
+            whole_nodes: vec!["busy".into()],
+            gpu_ids: HashMap::new(),
+            retry_after,
+        });
+        cm.apply_operation(&WalOperation::JobDispatchBackoff {
+            job_id: 1,
+            submission_generation: generation,
+            begin_time: retry_after,
+        });
+
+        let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.requeue_count, 1);
+        assert!(job.pending_finalization.is_none());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn apply_job_complete_noop_when_already_terminal() {
         let dir = TempDir::new().unwrap();
@@ -8682,6 +15939,7 @@ mod tests {
 
         register_node(&cm, "worker1", 8, 16000);
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("double-complete")),
         });
@@ -8696,6 +15954,7 @@ mod tests {
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
+            allocated_node_incarnations: HashMap::new(),
             srun_step_dispatch: false,
             run_attempt: 0,
         });
@@ -8704,6 +15963,7 @@ mod tests {
             job_id: 1,
             exit_code: 0,
             state: JobState::Completed,
+            finalization_intent: None,
         });
         assert!(
             !first.jobs_finalized.is_empty(),
@@ -8717,6 +15977,7 @@ mod tests {
             job_id: 1,
             exit_code: -1,
             state: JobState::Cancelled,
+            finalization_intent: None,
         });
         assert!(second.jobs_finalized.is_empty());
 
@@ -8739,32 +16000,22 @@ mod tests {
         }
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("penultimate")),
         });
-        cm.apply_operation(&WalOperation::job_state_change(
-            1,
-            JobState::Pending,
-            JobState::Running,
-        ));
         let alloc = scalar_alloc(2, 4000);
-        cm.apply_operation(&WalOperation::JobStart {
-            job_id: 1,
-            nodes: vec!["n1".into(), "n2".into(), "n3".into()],
-            resources: scalar_alloc(6, 12000),
-            per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
-            srun_step_dispatch: false,
-            run_attempt: 0,
-        });
-        cm.apply_operation(&WalOperation::JobNodeComplete {
-            job_id: 1,
-            node_name: "n1".into(),
-            exit_code: 0,
-            signal: 0,
-        });
+        apply_dispatch_begin(&cm, 1, &["n1", "n2", "n3"], alloc);
+        apply_dispatch_commit(&cm, 1);
+        apply_dispatch_publish(&cm, 1);
+        let attempt = cm.get_job(1).unwrap().run_attempt;
+        assert!(matches!(
+            cm.node_complete(1, "n1", 0, 0, attempt).unwrap(),
+            NodeCompleteResult::Completing { .. }
+        ));
 
-        let result = cm.node_complete(1, "n2", 0, 0, 0).unwrap();
-        assert_eq!(result, NodeCompleteResult::Completing);
+        let result = cm.node_complete(1, "n2", 0, 0, attempt).unwrap();
+        assert!(matches!(result, NodeCompleteResult::Completing { .. }));
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Completing);
     }
 
@@ -8776,6 +16027,7 @@ mod tests {
         register_node(&cm, "n1", 8, 16000);
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("signal-job")),
         });
@@ -8789,6 +16041,7 @@ mod tests {
             nodes: vec!["n1".into()],
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
+            allocated_node_incarnations: HashMap::new(),
             srun_step_dispatch: false,
             run_attempt: 0,
         });
@@ -8802,6 +16055,83 @@ mod tests {
         assert_eq!(job.pending_reason, PendingReason::RaisedSignal);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_zero_attempt_completion_normalizes_only_for_current_execution() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "worker1", 8, 16000);
+
+        let job_id = submit_and_wait(&cm, basic_spec("legacy-zero-attempt"));
+        cm.apply_operation(&WalOperation::job_state_change(
+            job_id,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let incarnation = cm.get_node("worker1").unwrap().incarnation;
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id,
+            nodes: vec!["worker1".into()],
+            resources: scalar_alloc(2, 4000),
+            per_node_alloc: per_node_for(&["worker1"], scalar_alloc(2, 4000)),
+            allocated_node_incarnations: HashMap::from([("worker1".into(), incarnation.clone())]),
+            srun_step_dispatch: false,
+            run_attempt: 5,
+        });
+        let running = cm.get_job(job_id).unwrap();
+        let generation = running.submission_generation;
+        let attempt = running.run_attempt;
+        assert_ne!(attempt, 0);
+
+        let wrong_generation = cm
+            .node_complete_exact_with_drain(
+                job_id,
+                &Uuid::new_v4().to_string(),
+                "",
+                "worker1",
+                &incarnation,
+                0,
+                0,
+                0,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(wrong_generation, NodeCompleteResult::StaleReport));
+
+        let wrong_attempt = cm
+            .node_complete_exact_with_drain(
+                job_id,
+                &generation.to_string(),
+                "",
+                "worker1",
+                &incarnation,
+                0,
+                0,
+                attempt + 1,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(wrong_attempt, NodeCompleteResult::StaleReport));
+        assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Running);
+
+        let accepted = cm
+            .node_complete_exact_with_drain(
+                job_id,
+                &generation.to_string(),
+                "",
+                "worker1",
+                &incarnation,
+                0,
+                0,
+                0,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(accepted, NodeCompleteResult::AllDone { .. }));
+        let finalized = cm.get_job(job_id).unwrap();
+        assert_eq!(finalized.state, JobState::Completed);
+        assert_eq!(finalized.pending_finalization.unwrap().run_attempt, attempt);
+    }
+
     // A job that exits promptly on the watchdog's SIGTERM used to report FAILED:
     // its completion reached the controller well before the grace period was up,
     // and nothing durable recorded why it had been signalled.
@@ -8812,6 +16142,7 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         let job_id = run_job_on(&cm, "time-limit-job", "worker1");
+        let attempt = cm.get_job(job_id).unwrap().run_attempt;
         cm.signal_time_limit(job_id, Utc::now()).unwrap();
         wait_for("time limit expiry recorded", || {
             cm.get_job(job_id)
@@ -8819,7 +16150,11 @@ mod tests {
         });
 
         // What spurd reports for a script that dies on SIGTERM.
-        cm.node_complete(job_id, "worker1", 0, 15, 0).unwrap();
+        let completion = cm.node_complete(job_id, "worker1", 0, 15, attempt).unwrap();
+        assert!(
+            matches!(completion, NodeCompleteResult::AllDone { .. }),
+            "unexpected completion result: {completion:?}"
+        );
 
         let job = cm.get_job(job_id).unwrap();
         assert_eq!(job.state, JobState::Timeout);
@@ -8838,7 +16173,8 @@ mod tests {
         // The watchdog can lose the race: the job finished on its own just as
         // the deadline passed, so its verdict is already final.
         let job_id = run_job_on(&cm, "raced-job", "worker1");
-        cm.node_complete(job_id, "worker1", 0, 0, 0).unwrap();
+        let attempt = cm.get_job(job_id).unwrap().run_attempt;
+        cm.node_complete(job_id, "worker1", 0, 0, attempt).unwrap();
         settle(&cm, job_id, JobState::Completed);
 
         cm.signal_time_limit(job_id, Utc::now()).unwrap();
@@ -8962,6 +16298,7 @@ mod tests {
         register_node(&cm, "n1", 8, 16000);
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("rpc-signal-job")),
         });
@@ -8975,6 +16312,7 @@ mod tests {
             nodes: vec!["n1".into()],
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
+            allocated_node_incarnations: HashMap::new(),
             srun_step_dispatch: false,
             run_attempt: 0,
         });
@@ -8997,6 +16335,7 @@ mod tests {
         register_node(&cm, "n1", 8, 16000);
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("exit-job")),
         });
@@ -9010,6 +16349,7 @@ mod tests {
             nodes: vec!["n1".into()],
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
+            allocated_node_incarnations: HashMap::new(),
             srun_step_dispatch: false,
             run_attempt: 0,
         });
@@ -9034,6 +16374,7 @@ mod tests {
         register_node(&cm, "n1", 8, 16000);
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("stale-job")),
         });
@@ -9048,6 +16389,7 @@ mod tests {
             nodes: vec!["n1".into()],
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
+            allocated_node_incarnations: HashMap::new(),
             srun_step_dispatch: false,
             run_attempt: 2,
         });
@@ -9073,30 +16415,20 @@ mod tests {
         }
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("cancel-while-cg")),
         });
-        cm.apply_operation(&WalOperation::job_state_change(
-            1,
-            JobState::Pending,
-            JobState::Running,
-        ));
         let alloc = scalar_alloc(2, 4000);
-        cm.apply_operation(&WalOperation::JobStart {
-            job_id: 1,
-            nodes: vec!["n1".into(), "n2".into(), "n3".into()],
-            resources: scalar_alloc(6, 12000),
-            per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
-            srun_step_dispatch: false,
-            run_attempt: 0,
-        });
+        apply_dispatch_begin(&cm, 1, &["n1", "n2", "n3"], alloc);
+        apply_dispatch_commit(&cm, 1);
+        apply_dispatch_publish(&cm, 1);
+        let attempt = cm.get_job(1).unwrap().run_attempt;
 
-        cm.apply_operation(&WalOperation::JobNodeComplete {
-            job_id: 1,
-            node_name: "n1".into(),
-            exit_code: 0,
-            signal: 0,
-        });
+        assert!(matches!(
+            cm.node_complete(1, "n1", 0, 0, attempt).unwrap(),
+            NodeCompleteResult::Completing { .. }
+        ));
 
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Completing);
@@ -9119,12 +16451,10 @@ mod tests {
             );
         }
 
-        cm.apply_operation(&WalOperation::JobNodeComplete {
-            job_id: 1,
-            node_name: "n2".into(),
-            exit_code: 0,
-            signal: 0,
-        });
+        assert_eq!(
+            cm.node_complete(1, "n2", 0, 0, attempt).unwrap(),
+            NodeCompleteResult::AlreadyTerminal
+        );
 
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Cancelled);
@@ -9140,34 +16470,24 @@ mod tests {
         }
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("nc-after-cancel")),
         });
-        cm.apply_operation(&WalOperation::job_state_change(
-            1,
-            JobState::Pending,
-            JobState::Running,
-        ));
         let alloc = scalar_alloc(2, 4000);
-        cm.apply_operation(&WalOperation::JobStart {
-            job_id: 1,
-            nodes: vec!["n1".into(), "n2".into(), "n3".into()],
-            resources: scalar_alloc(6, 12000),
-            per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
-            srun_step_dispatch: false,
-            run_attempt: 0,
-        });
-        cm.apply_operation(&WalOperation::JobNodeComplete {
-            job_id: 1,
-            node_name: "n1".into(),
-            exit_code: 0,
-            signal: 0,
-        });
+        apply_dispatch_begin(&cm, 1, &["n1", "n2", "n3"], alloc);
+        apply_dispatch_commit(&cm, 1);
+        apply_dispatch_publish(&cm, 1);
+        let attempt = cm.get_job(1).unwrap().run_attempt;
+        assert!(matches!(
+            cm.node_complete(1, "n1", 0, 0, attempt).unwrap(),
+            NodeCompleteResult::Completing { .. }
+        ));
 
         cm.cancel_job(1, "testuser").unwrap();
         settle(&cm, 1, JobState::Cancelled);
 
-        let result = cm.node_complete(1, "n2", 0, 0, 0).unwrap();
+        let result = cm.node_complete(1, "n2", 0, 0, attempt).unwrap();
         assert_eq!(result, NodeCompleteResult::AlreadyTerminal);
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Cancelled);
     }
@@ -9272,6 +16592,32 @@ mod tests {
         assert_eq!(job.state, JobState::Cancelled);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_pending_dispatch_carries_exact_targets_into_cleanup() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let job_id = submit_and_wait(&cm, basic_spec("cancel-during-prolog"));
+        apply_dispatch_begin(&cm, job_id, &["n1"], scalar_alloc(2, 4000));
+
+        assert!(cm.cancel_job(job_id, "testuser").unwrap());
+        let job = cm.get_job(job_id).unwrap();
+        let dispatch = job
+            .pending_dispatch
+            .expect("pending cancellation must retain cleanup ownership");
+        assert_eq!(dispatch.phase, PendingDispatchPhase::Aborting);
+        assert_eq!(dispatch.target_nodes, vec!["n1"]);
+        assert_eq!(
+            dispatch.target_incarnations.get("n1"),
+            Some(&cm.get_node("n1").unwrap().incarnation)
+        );
+
+        let response = acknowledge_test_cleanup(&cm, job_id);
+        assert_eq!(response.jobs_finalized.len(), 1);
+        assert_eq!(response.jobs_finalized[0].state, JobState::Cancelled);
+        assert!(cm.get_job(job_id).unwrap().pending_finalization.is_some());
+    }
+
     // A cancelled job keeps its reported path (unlike requeue): the file was
     // created there, so scontrol should still point at it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9304,14 +16650,10 @@ mod tests {
     fn run_job_on(cm: &ClusterManager, name: &str, node: &str) -> JobId {
         let job_id = submit_and_wait(cm, basic_spec(name));
         let resources = scalar_alloc(2, 4000);
-        cm.start_job(
-            job_id,
-            vec![node.into()],
-            resources.clone(),
-            per_node_for(&[node], resources),
-        )
-        .unwrap();
-        settle(cm, job_id, JobState::Running);
+        apply_dispatch_begin(cm, job_id, &[node], resources.clone());
+        apply_dispatch_commit(cm, job_id);
+        apply_dispatch_publish(cm, job_id);
+        assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Running);
         job_id
     }
 
@@ -9327,7 +16669,7 @@ mod tests {
         assert_eq!(cm.node_metrics().alloc_cpus, 2);
 
         let outcome = cm.preempt_job(job_id, PreemptMode::Requeue).unwrap();
-        assert_eq!(outcome, PreemptOutcome::Killed);
+        assert_eq!(outcome, PreemptOutcome::CleanupDeferred);
         settle(&cm, job_id, JobState::Pending);
 
         let job = cm.get_job(job_id).unwrap();
@@ -9578,7 +16920,8 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         let job_id = run_job_on(&cm, "stranded", "worker1");
-        cm.node_complete(job_id, "worker1", -1, 0, 0).unwrap();
+        let attempt = cm.get_job(job_id).unwrap().run_attempt;
+        cm.node_complete(job_id, "worker1", -1, 0, attempt).unwrap();
         wait_for("job reaches a terminal state", || {
             cm.get_job(job_id).is_some_and(|j| j.state.is_terminal())
         });
@@ -9828,6 +17171,7 @@ mod tests {
         let cm = test_cluster(&dir).await;
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("backoff-replay")),
         });
@@ -9836,20 +17180,30 @@ mod tests {
             JobState::Pending,
             JobState::Running,
         ));
-        cm.apply_operation(&WalOperation::JobComplete {
-            job_id: 1,
-            exit_code: -1,
-            state: JobState::Failed,
-        });
-
         let hold = Utc::now() + chrono::Duration::seconds(40);
-        let requeue = WalOperation::job_state_change_backoff_pending(
+        apply_durable_terminal(
+            &cm,
             1,
-            JobState::Failed,
-            PendingReason::JobLaunchFailure,
-            hold,
+            WalOperation::JobComplete {
+                job_id: 1,
+                exit_code: -1,
+                state: JobState::Failed,
+                finalization_intent: Some(FinalizationIntent::LaunchFailure {
+                    hold: false,
+                    begin_time: hold,
+                }),
+            },
         );
-        cm.apply_operation(&requeue);
+
+        let terminal = cm.get_job(1).unwrap();
+        let marker = terminal.pending_finalization.clone().unwrap();
+        let action = cm.finalization_action(&terminal, &marker);
+        let ack = WalOperation::JobFinalizationAck {
+            job_id: 1,
+            marker,
+            action,
+        };
+        assert!(cm.apply_operation(&ack).finalization_acked);
 
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Pending);
@@ -9857,9 +17211,9 @@ mod tests {
         assert_eq!(job.pending_reason, PendingReason::JobLaunchFailure);
         assert_eq!(job.spec.begin_time, Some(hold));
 
-        // Replay the identical entry: the job is already Pending, so this is a
-        // NoOp. Followers and WAL recovery must not compound the hold.
-        cm.apply_operation(&requeue);
+        // Replay the identical Ack: the marker is already consumed, so this is
+        // a NoOp. Followers and WAL recovery must not compound the hold.
+        assert!(!cm.apply_operation(&ack).finalization_acked);
         let job = cm.get_job(1).unwrap();
         assert_eq!(
             job.requeue_count, 1,
@@ -9880,7 +17234,7 @@ mod tests {
 
         let job_id = run_job_on(&cm, "preempt-cancel", "worker1");
         let outcome = cm.preempt_job(job_id, PreemptMode::Cancel).unwrap();
-        assert_eq!(outcome, PreemptOutcome::Killed);
+        assert_eq!(outcome, PreemptOutcome::CleanupDeferred);
         settle(&cm, job_id, JobState::Cancelled);
 
         let job = cm.get_job(job_id).unwrap();
@@ -9934,6 +17288,7 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("replay")),
         });
@@ -9957,6 +17312,7 @@ mod tests {
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
             per_node_alloc: per_node_for(&["worker1"], alloc),
+            allocated_node_incarnations: HashMap::new(),
             srun_step_dispatch: false,
             run_attempt: 0,
         });
@@ -9964,6 +17320,7 @@ mod tests {
             job_id: 1,
             exit_code: 0,
             state: JobState::Completed,
+            finalization_intent: None,
         });
 
         // Replaying the terminal complete: still Completed, resources still freed.
@@ -9971,6 +17328,7 @@ mod tests {
             job_id: 1,
             exit_code: 0,
             state: JobState::Completed,
+            finalization_intent: None,
         });
         assert!(replayed.jobs_finalized.is_empty());
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Completed);
@@ -9978,14 +17336,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn apply_requeue_state_change_not_double_counted_on_replay() {
-        // A replayed Preempted->Pending entry must not double-increment
-        // requeue_count or re-wipe allocation fields.
+    async fn apply_finalization_ack_not_double_counted_on_replay() {
+        // A replayed exact Ack must not double-increment the preemption counter
+        // or re-wipe allocation fields.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "worker1", 8, 16000);
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("requeue-replay")),
         });
@@ -9994,89 +17353,97 @@ mod tests {
             JobState::Pending,
             JobState::Running,
         ));
-        cm.apply_operation(&WalOperation::JobComplete {
+        let begin_time = Utc::now() + chrono::Duration::seconds(5);
+        apply_durable_terminal(
+            &cm,
+            1,
+            WalOperation::JobPreemptRequeue {
+                job_id: 1,
+                begin_time,
+            },
+        );
+        let terminal = cm.get_job(1).unwrap();
+        let marker = terminal.pending_finalization.clone().unwrap();
+        let action = cm.finalization_action(&terminal, &marker);
+        let ack = WalOperation::JobFinalizationAck {
             job_id: 1,
-            exit_code: -1,
-            state: JobState::Preempted,
-        });
-        cm.apply_operation(&WalOperation::job_state_change(
-            1,
-            JobState::Preempted,
-            JobState::Pending,
-        ));
-        assert_eq!(cm.get_job(1).unwrap().requeue_count, 1);
+            marker,
+            action,
+        };
+        assert!(cm.apply_operation(&ack).finalization_acked);
+        assert_eq!(cm.get_job(1).unwrap().preempt_requeue_count, 1);
 
-        // Replay the same requeue transition (job already Pending): NoOp.
-        cm.apply_operation(&WalOperation::job_state_change(
-            1,
-            JobState::Preempted,
-            JobState::Pending,
-        ));
+        // Replay the same Ack (marker already consumed): NoOp.
+        assert!(!cm.apply_operation(&ack).finalization_acked);
         assert_eq!(
-            cm.get_job(1).unwrap().requeue_count,
+            cm.get_job(1).unwrap().preempt_requeue_count,
             1,
-            "replayed requeue must not double-count"
+            "replayed finalization Ack must not double-count"
         );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn apply_preempt_requeue_is_atomic_and_replay_deterministic() {
-        // A single JobPreemptRequeue op takes a RUNNING job to Pending-with-hold
-        // AND frees its nodes AND finalizes the prior run as PREEMPTED for
-        // accounting — no intermediate state. Replay applies the exact begin_time
-        // and is a NoOp (no double-count, no drift, no re-dealloc).
+        // JobPreemptRequeue frees capacity and durably ends the run; the exact
+        // Ack later installs Pending-with-hold in one atomic apply.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "worker1", 8, 16000);
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("preempt-replay")),
         });
-        cm.apply_operation(&WalOperation::job_state_change(
-            1,
-            JobState::Pending,
-            JobState::Running,
-        ));
         let alloc = scalar_alloc(2, 4000);
-        cm.apply_operation(&WalOperation::JobStart {
-            job_id: 1,
-            nodes: vec!["worker1".into()],
-            resources: alloc.clone(),
-            per_node_alloc: per_node_for(&["worker1"], alloc),
-            srun_step_dispatch: false,
-            run_attempt: 0,
-        });
+        apply_dispatch_begin(&cm, 1, &["worker1"], alloc);
+        apply_dispatch_commit(&cm, 1);
+        apply_dispatch_publish(&cm, 1);
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
 
         let begin_time = Utc::now() + chrono::Duration::seconds(5);
-        let resp = cm.apply_operation(&WalOperation::JobPreemptRequeue {
-            job_id: 1,
-            begin_time,
-        });
+        let terminal_op = durable_job_operation(
+            &cm,
+            1,
+            WalOperation::JobPreemptRequeue {
+                job_id: 1,
+                begin_time,
+            },
+        );
+        let deferred = cm.apply_operation(&terminal_op);
+        assert!(deferred.terminal_cleanup_deferred);
+        let resp = acknowledge_test_cleanup(&cm, 1);
         // One op finalizes the prior run as PREEMPTED (drives accounting) ...
         assert_eq!(resp.jobs_finalized.len(), 1);
         assert_eq!(resp.jobs_finalized[0].state, JobState::Preempted);
-        // ... and the job is Pending-with-hold with nodes freed.
+        // ... while the durable marker keeps it terminal and ineligible until
+        // its bounded finalization delivery attempt completes.
         let job = cm.get_job(1).unwrap();
-        assert_eq!(job.state, JobState::Pending);
-        assert_eq!(job.spec.begin_time, Some(begin_time));
-        assert_eq!(job.pending_reason, PendingReason::BeginTime);
-        assert_eq!(job.preempt_requeue_count, 1);
+        assert_eq!(job.state, JobState::Preempted);
+        let marker = job.pending_finalization.clone().unwrap();
+        assert_eq!(job.preempt_requeue_count, 0);
         assert_eq!(job.requeue_count, 0);
-        assert!(job.allocated_nodes.is_empty());
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 0);
 
-        // Replay the identical entry: job is already Pending -> NoOp.
-        let replay = cm.apply_operation(&WalOperation::JobPreemptRequeue {
-            job_id: 1,
-            begin_time,
-        });
+        // Replay the identical terminal entry: marker first-writer semantics
+        // make it a NoOp with no re-deallocation.
+        let replay = cm.apply_operation(&terminal_op);
         assert!(
             replay.jobs_finalized.is_empty(),
             "replayed preempt-requeue must not re-finalize"
         );
+        assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 0);
+
+        let terminal = cm.get_job(1).unwrap();
+        let action = cm.finalization_action(&terminal, &marker);
+        let ack = cm.apply_operation(&WalOperation::JobFinalizationAck {
+            job_id: 1,
+            marker,
+            action,
+        });
+        assert!(ack.finalization_acked);
         let job = cm.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Pending);
         assert_eq!(
             job.spec.begin_time,
             Some(begin_time),
@@ -10086,7 +17453,6 @@ mod tests {
             job.preempt_requeue_count, 1,
             "replayed preempt-requeue must not double-count"
         );
-        assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 0);
     }
 
     /// Drive a job to RUNNING on `node` then finalize it as PREEMPTED via the
@@ -10094,11 +17460,16 @@ mod tests {
     /// jobs in PREEMPTED.
     fn preempted_job_on(cm: &ClusterManager, name: &str, node: &str) -> JobId {
         let job_id = run_job_on(cm, name, node);
-        cm.apply_operation(&WalOperation::JobComplete {
+        apply_durable_terminal(
+            cm,
             job_id,
-            exit_code: -1,
-            state: JobState::Preempted,
-        });
+            WalOperation::JobComplete {
+                job_id,
+                exit_code: -1,
+                state: JobState::Preempted,
+                finalization_intent: None,
+            },
+        );
         assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Preempted);
         job_id
     }
@@ -10116,9 +17487,14 @@ mod tests {
 
         let resp = cm.apply_operation(&WalOperation::JobNodeComplete {
             job_id,
+            submission_generation: cm.get_job(job_id).unwrap().submission_generation,
+            worker_incarnation: String::new(),
+            drain_reason: None,
             node_name: "worker1".into(),
             exit_code: 0,
             signal: 0,
+            run_attempt: 1,
+            submission_token: None,
         });
         assert!(
             resp.jobs_finalized.is_empty(),
@@ -10141,6 +17517,7 @@ mod tests {
             job_id,
             exit_code: 0,
             state: JobState::Completed,
+            finalization_intent: None,
         });
         assert!(
             resp.jobs_finalized.is_empty(),
@@ -10589,6 +17966,7 @@ mod tests {
         spec.num_tasks = 2;
         let job_id = 1;
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id,
             spec: Box::new(spec),
         });
@@ -10633,6 +18011,7 @@ mod tests {
         under_nodes.num_nodes = 1; // below min_nodes=2
         let n_id = 999;
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: n_id,
             spec: Box::new(under_nodes),
         });
@@ -11937,27 +19316,11 @@ mod tests {
             JobState::Pending,
             JobState::Running,
         ));
-        cm.apply_operation(&WalOperation::JobComplete {
-            job_id,
-            exit_code: -1,
-            state: JobState::Preempted,
-        });
-        for _ in 0..5 {
-            cm.apply_operation(&WalOperation::job_state_change(
-                job_id,
-                JobState::Preempted,
-                JobState::Pending,
-            ));
-            cm.apply_operation(&WalOperation::job_state_change(
-                job_id,
-                JobState::Pending,
-                JobState::Running,
-            ));
-            cm.apply_operation(&WalOperation::JobComplete {
-                job_id,
-                exit_code: -1,
-                state: JobState::Preempted,
-            });
+        {
+            let mut jobs = cm.jobs.write();
+            let job = jobs.get_mut(&job_id).unwrap();
+            job.state = JobState::Preempted;
+            job.requeue_count = 5;
         }
         assert_eq!(cm.get_job(job_id).unwrap().requeue_count, 5);
 
@@ -11987,27 +19350,11 @@ mod tests {
             JobState::Pending,
             JobState::Running,
         ));
-        cm.apply_operation(&WalOperation::JobComplete {
-            job_id,
-            exit_code: -1,
-            state: JobState::Preempted,
-        });
-        for _ in 0..5 {
-            cm.apply_operation(&WalOperation::job_state_change(
-                job_id,
-                JobState::Preempted,
-                JobState::Pending,
-            ));
-            cm.apply_operation(&WalOperation::job_state_change(
-                job_id,
-                JobState::Pending,
-                JobState::Running,
-            ));
-            cm.apply_operation(&WalOperation::JobComplete {
-                job_id,
-                exit_code: -1,
-                state: JobState::Preempted,
-            });
+        {
+            let mut jobs = cm.jobs.write();
+            let job = jobs.get_mut(&job_id).unwrap();
+            job.state = JobState::Preempted;
+            job.requeue_count = 5;
         }
         assert_eq!(cm.get_job(job_id).unwrap().requeue_count, 5);
 
@@ -12373,11 +19720,11 @@ mod tests {
         cm.start_job(job_id, nodes, alloc, per_node).unwrap();
         settle(&cm, job_id, JobState::Running);
         cm.complete_job(job_id, -1, JobState::Timeout).unwrap();
-        wait_for("job held at max requeue after timeout", || {
-            cm.get_job(job_id).is_some_and(|j| {
-                j.state == JobState::Pending && j.pending_reason == PendingReason::JobHoldMaxRequeue
-            })
-        });
+        settle(&cm, job_id, JobState::Pending);
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::JobHoldMaxRequeue
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -12391,27 +19738,11 @@ mod tests {
             JobState::Pending,
             JobState::Running,
         ));
-        cm.apply_operation(&WalOperation::JobComplete {
-            job_id,
-            exit_code: -1,
-            state: JobState::Preempted,
-        });
-        for _ in 0..5 {
-            cm.apply_operation(&WalOperation::job_state_change(
-                job_id,
-                JobState::Preempted,
-                JobState::Pending,
-            ));
-            cm.apply_operation(&WalOperation::job_state_change(
-                job_id,
-                JobState::Pending,
-                JobState::Running,
-            ));
-            cm.apply_operation(&WalOperation::JobComplete {
-                job_id,
-                exit_code: -1,
-                state: JobState::Preempted,
-            });
+        {
+            let mut jobs = cm.jobs.write();
+            let job = jobs.get_mut(&job_id).unwrap();
+            job.state = JobState::Preempted;
+            job.requeue_count = 5;
         }
         cm.hold_job_at_max_requeue(job_id).unwrap();
         wait_for("job held at max requeue", || {
@@ -12441,12 +19772,27 @@ mod tests {
             JobState::Pending,
             JobState::Running,
         ));
-        cm.apply_operation(&WalOperation::JobComplete {
+        apply_durable_terminal(
+            &cm,
             job_id,
-            exit_code: -1,
-            state: JobState::Preempted,
-        });
+            WalOperation::JobComplete {
+                job_id,
+                exit_code: -1,
+                state: JobState::Preempted,
+                finalization_intent: None,
+            },
+        );
         assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Preempted);
+
+        let marker = cm.get_job(job_id).unwrap().pending_finalization.unwrap();
+        assert!(
+            cm.apply_operation(&WalOperation::JobFinalizationAck {
+                job_id,
+                marker,
+                action: FinalizationAction::KeepTerminal,
+            })
+            .finalization_acked
+        );
 
         cm.cancel_job(job_id, "testuser").unwrap();
         wait_for("preempted job cancelled", || {
@@ -13540,6 +20886,7 @@ mod tests {
 
         // Parent running -> child's afterok dependency is Waiting (not satisfied).
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("parent")),
         });
@@ -13553,6 +20900,7 @@ mod tests {
         child.dependency = vec!["afterok:1".into()];
         child.reservation = Some("does-not-exist".into());
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 2,
             spec: Box::new(child),
         });
@@ -14699,6 +22047,229 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transient_capacity_wal_apply_is_idempotent_durable_and_budget_neutral() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, basic_spec("capacity-lease"));
+        let later = Utc::now() + chrono::Duration::seconds(60);
+        let earlier = Utc::now() + chrono::Duration::seconds(10);
+        let generation = cm.get_job(id).unwrap().submission_generation;
+
+        let op = WalOperation::JobTransientCapacityReject {
+            job_id: id,
+            submission_generation: generation,
+            whole_nodes: vec!["n1".into()],
+            gpu_ids: HashMap::from([("n2".into(), vec![1, 3])]),
+            retry_after: later,
+        };
+        cm.apply_operation(&op);
+        cm.apply_operation(&op);
+        // An out-of-order older replay must never shorten an existing lease.
+        cm.apply_operation(&WalOperation::JobTransientCapacityReject {
+            job_id: id,
+            submission_generation: generation,
+            whole_nodes: vec!["n1".into()],
+            gpu_ids: HashMap::from([("n2".into(), vec![1])]),
+            retry_after: earlier,
+        });
+
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.requeue_count, 0);
+        assert_eq!(
+            job.transient_capacity_rejections["n1"].whole_node_until,
+            Some(later)
+        );
+        assert_eq!(
+            job.transient_capacity_rejections["n2"].gpu_until,
+            HashMap::from([(1, later), (3, later)])
+        );
+
+        let snapshot = cm.snapshot_state().unwrap();
+        let restore_dir = TempDir::new().unwrap();
+        let restored = test_cluster(&restore_dir).await;
+        restored.restore_from_snapshot(&snapshot).unwrap();
+        let restored_job = restored.get_job(id).unwrap();
+        assert_eq!(
+            restored_job.transient_capacity_rejections,
+            job.transient_capacity_rejections
+        );
+        assert_eq!(restored_job.requeue_count, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_begin_consumes_a_durable_epoch_before_job_start() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node_with_incarnation(&cm, "n1", "dispatch-worker", 8, 16_000);
+        let id = submit_and_wait(&cm, basic_spec("dispatch-epoch"));
+        let generation = cm.get_job(id).unwrap().submission_generation;
+        let resources = scalar_alloc(1, 1000);
+        let per_node_alloc = per_node_for(&["n1"], resources.clone());
+
+        let (first_attempt, first_guard) = cm
+            .begin_pending_dispatch(
+                id,
+                vec!["n1".into()],
+                resources.clone(),
+                per_node_alloc.clone(),
+            )
+            .unwrap();
+        assert_eq!(first_attempt, 1);
+        assert_eq!(cm.get_job(id).unwrap().run_attempt, 1);
+        assert!(cm
+            .authorize_pending_dispatch_abort(id, &generation.to_string(), first_attempt)
+            .unwrap());
+        cm.clear_dispatch_target(id, &generation.to_string(), first_attempt, "n1")
+            .unwrap();
+        cm.clear_pending_dispatch(id, &generation.to_string(), first_attempt)
+            .unwrap();
+        drop(first_guard);
+
+        let (second_attempt, _second_guard) = cm
+            .begin_pending_dispatch(
+                id,
+                vec!["n1".into()],
+                resources.clone(),
+                per_node_alloc.clone(),
+            )
+            .unwrap();
+        assert_eq!(second_attempt, 2);
+        assert_eq!(cm.get_job(id).unwrap().run_attempt, 2);
+
+        // Replaying an older begin cannot move the durable fence backwards.
+        cm.apply_operation(&WalOperation::JobDispatchBegin {
+            job_id: id,
+            submission_generation: Default::default(),
+            expected_run_attempt: 0,
+            run_attempt: 1,
+            target_nodes: vec!["n1".into()],
+            target_incarnations: HashMap::new(),
+            resources,
+            per_node_alloc,
+        });
+        assert_eq!(cm.get_job(id).unwrap().run_attempt, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_dispatch_begin_callers_leave_one_unresolved_intent() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node_with_incarnation(&cm, "n1", "dispatch-worker", 8, 16_000);
+        let id = submit_and_wait(&cm, basic_spec("concurrent-dispatch-epoch"));
+        let resources = scalar_alloc(1, 1000);
+        let per_node_alloc = per_node_for(&["n1"], resources.clone());
+
+        let mut joins = Vec::new();
+        for _ in 0..4 {
+            let cm = cm.clone();
+            let resources = resources.clone();
+            let per_node_alloc = per_node_alloc.clone();
+            joins.push(tokio::task::spawn_blocking(move || {
+                cm.begin_pending_dispatch(id, vec!["n1".into()], resources, per_node_alloc)
+                    .map(|(attempt, _guard)| attempt)
+            }));
+        }
+        let mut epochs = Vec::new();
+        let mut rejected = 0;
+        for join in joins {
+            match join.await.unwrap() {
+                Ok(epoch) => epochs.push(epoch),
+                Err(_) => rejected += 1,
+            }
+        }
+        epochs.sort_unstable();
+        assert_eq!(epochs, vec![1]);
+        assert_eq!(rejected, 3);
+        assert_eq!(cm.get_job(id).unwrap().run_attempt, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publish_defers_node_fail_until_exact_cleanup() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node_with_incarnation(&cm, "n1", "dispatch-worker", 8, 16_000);
+        let id = submit_and_wait(&cm, basic_spec("publish-target-down"));
+        let generation = cm.get_job(id).unwrap().submission_generation;
+        let incarnation = cm.get_node("n1").unwrap().incarnation;
+        let resources = scalar_alloc(2, 1000);
+        let per_node_alloc = per_node_for(&["n1"], resources.clone());
+
+        let begin = cm.apply_operation(&WalOperation::JobDispatchBegin {
+            job_id: id,
+            submission_generation: generation,
+            expected_run_attempt: 0,
+            run_attempt: 1,
+            target_nodes: vec!["n1".into()],
+            target_incarnations: HashMap::from([("n1".into(), incarnation)]),
+            resources: resources.clone(),
+            per_node_alloc: per_node_alloc.clone(),
+        });
+        assert!(begin.dispatch_begun);
+        let commit = cm.apply_operation(&WalOperation::JobDispatchCommit {
+            job_id: id,
+            submission_generation: generation,
+            nodes: vec!["n1".into()],
+            resources,
+            per_node_alloc,
+            run_attempt: 1,
+        });
+        assert!(commit.dispatch_committed);
+
+        let old_state = cm.get_node("n1").unwrap().state;
+        cm.apply_operation(&WalOperation::NodeStateChange {
+            name: "n1".into(),
+            expected_incarnation: String::new(),
+            old_state,
+            new_state: NodeState::Down,
+            reason: Some("lost after BEGIN".into()),
+            admin_locked: false,
+        });
+
+        let published = cm.apply_operation(&WalOperation::JobDispatchPublish {
+            job_id: id,
+            submission_generation: generation,
+            run_attempt: 1,
+        });
+        assert!(published.dispatch_published);
+        assert!(published.jobs_finalized.is_empty());
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        let dispatch = job.pending_dispatch.unwrap();
+        assert_eq!(dispatch.phase, PendingDispatchPhase::Aborting);
+        assert_eq!(
+            dispatch.terminal_after_cleanup.unwrap().state,
+            JobState::NodeFail
+        );
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 2);
+        assert_eq!(
+            cm.get_steps(id)
+                .into_iter()
+                .find(|step| step.step_id == STEP_BATCH)
+                .unwrap()
+                .state,
+            StepState::Running
+        );
+
+        let generation = cm.get_job(id).unwrap().submission_generation;
+        cm.clear_dispatch_target(id, &generation.to_string(), 1, "n1")
+            .unwrap();
+        cm.clear_pending_dispatch(id, &generation.to_string(), 1)
+            .unwrap();
+        let job = cm.get_job(id).unwrap();
+        assert_eq!(job.state, JobState::NodeFail);
+        assert!(job.pending_dispatch.is_none());
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 0);
+        assert_eq!(
+            cm.get_steps(id)
+                .into_iter()
+                .find(|step| step.step_id == STEP_BATCH)
+                .unwrap()
+                .state,
+            StepState::Failed
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn job_dispatch_backoff_preserves_launch_failure_detail() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -14769,6 +22340,7 @@ mod tests {
 
         cm.apply_operation(&WalOperation::JobDispatchBackoff {
             job_id: 999,
+            submission_generation: Default::default(),
             begin_time: Utc::now(),
         });
         assert!(cm.get_job(999).is_none());
@@ -14785,6 +22357,7 @@ mod tests {
 
         cm.apply_operation(&WalOperation::JobDispatchBackoff {
             job_id: id,
+            submission_generation: cm.get_job(id).unwrap().submission_generation,
             begin_time: Utc::now(),
         });
 
@@ -15054,6 +22627,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "locked", 4, 8000);
+        let worker_incarnation = cm.get_node("locked").unwrap().incarnation;
 
         // Give the node an allocation so Drain becomes Draining
         let id = submit_and_wait(&cm, basic_spec("hold-job"));
@@ -15093,7 +22667,7 @@ mod tests {
         );
 
         // Agent reconnects — re-registration must NOT recover to Idle
-        cm.register_node(
+        cm.register_node_exact(
             "locked".into(),
             "locked".into(),
             ResourceSet {
@@ -15107,6 +22681,7 @@ mod tests {
             "1.0".into(),
             NodeSource::NativeHost,
             HashMap::new(),
+            worker_incarnation,
         )
         .unwrap();
         let node = cm.get_node("locked").unwrap();
@@ -15123,7 +22698,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 4, 8000);
-        let id = submit_and_wait(&cm, basic_spec("requeue-me"));
+        let mut spec = basic_spec("requeue-me");
+        spec.requeue = true;
+        let id = submit_and_wait(&cm, spec);
 
         let alloc = scalar_alloc(2, 4000);
         cm.start_job(
@@ -15139,19 +22716,30 @@ mod tests {
         cm.set_job_output_paths(id, "/tmp/spur.out".into(), "/tmp/spur.out".into());
         assert!(cm.get_job(id).unwrap().actual_stdout_path.is_some());
 
-        cm.apply_operation(&WalOperation::JobComplete {
-            job_id: id,
-            exit_code: -1,
-            state: JobState::Timeout,
-        });
+        apply_durable_terminal(
+            &cm,
+            id,
+            WalOperation::JobComplete {
+                job_id: id,
+                exit_code: -1,
+                state: JobState::Timeout,
+                finalization_intent: None,
+            },
+        );
         assert_eq!(cm.get_job(id).unwrap().state, JobState::Timeout);
 
-        // Requeue: Timeout → Pending should reset allocation fields
-        cm.apply_operation(&WalOperation::job_state_change(
-            id,
-            JobState::Timeout,
-            JobState::Pending,
-        ));
+        // Exact finalization Ack: Timeout → Pending resets allocation fields.
+        let terminal = cm.get_job(id).unwrap();
+        let marker = terminal.pending_finalization.clone().unwrap();
+        let action = cm.finalization_action(&terminal, &marker);
+        assert!(
+            cm.apply_operation(&WalOperation::JobFinalizationAck {
+                job_id: id,
+                marker,
+                action,
+            })
+            .finalization_acked
+        );
 
         let job = cm.get_job(id).unwrap();
         assert_eq!(job.state, JobState::Pending);
@@ -15333,12 +22921,11 @@ mod tests {
             "n1 should hold both A's (2) and B's (3) allocations"
         );
 
-        cm.apply_operation(&WalOperation::JobNodeComplete {
-            job_id: job_a,
-            node_name: "n1".into(),
-            exit_code: 0,
-            signal: 0,
-        });
+        let attempt = cm.get_job(job_a).unwrap().run_attempt;
+        assert!(matches!(
+            cm.node_complete(job_a, "n1", 0, 0, attempt).unwrap(),
+            NodeCompleteResult::Completing { .. }
+        ));
         settle(&cm, job_a, JobState::Completing);
         assert_eq!(
             cm.get_node("n1").unwrap().alloc_resources.cpus,
@@ -15374,6 +22961,160 @@ mod tests {
         assert_eq!(node.partitions[0], "default");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_mark_down_does_not_evict_replacement_incarnation() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let node_name = "health-race-node";
+
+        register_node_with_incarnation(&cm, node_name, "incarnation-old", 8, 16_000);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
+            job_id: 40_001,
+            spec: Box::new(basic_spec("old-incarnation-job")),
+        });
+        apply_dispatch_begin(&cm, 40_001, &[node_name], scalar_alloc(1, 1_000));
+        apply_dispatch_commit(&cm, 40_001);
+        apply_dispatch_publish(&cm, 40_001);
+
+        // The monitor snapshots an Allocated old worker immediately before its
+        // execution ends and the process is replaced under the same node name.
+        let mut stale_snapshot = cm.get_node(node_name).unwrap();
+        let expected_allocated_state = stale_snapshot.state;
+        stale_snapshot.last_heartbeat = Some(Utc::now() - chrono::Duration::seconds(200));
+        let stale_action = super::evaluate_node_health(&[&stale_snapshot], Utc::now(), 90);
+        assert!(matches!(
+            stale_action.as_slice(),
+            [super::HealthAction::MarkDown {
+                incarnation,
+                old_state,
+                ..
+            }] if incarnation == "incarnation-old" && *old_state == expected_allocated_state
+        ));
+
+        let old_execution = cm.get_job(40_001).unwrap();
+        let completion = cm.apply_operation(&WalOperation::JobNodeComplete {
+            job_id: 40_001,
+            submission_generation: old_execution.submission_generation,
+            worker_incarnation: "incarnation-old".into(),
+            node_name: node_name.into(),
+            exit_code: 0,
+            signal: 0,
+            drain_reason: None,
+            run_attempt: old_execution.run_attempt,
+            submission_token: None,
+        });
+        assert_eq!(completion.jobs_finalized.len(), 1);
+        register_node_with_incarnation(&cm, node_name, "incarnation-new", 8, 16_000);
+
+        // Give the replacement an execution and the same Allocated state that
+        // the stale action observed. Only the incarnation CAS now distinguishes
+        // it from the failed process.
+        cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
+            job_id: 40_002,
+            spec: Box::new(basic_spec("replacement-incarnation-job")),
+        });
+        apply_dispatch_begin(&cm, 40_002, &[node_name], scalar_alloc(1, 1_000));
+        apply_dispatch_commit(&cm, 40_002);
+        apply_dispatch_publish(&cm, 40_002);
+
+        let evicted = cm.apply_health_actions(stale_action);
+        assert!(evicted.is_empty());
+        let replacement = cm.get_node(node_name).unwrap();
+        assert_eq!(replacement.incarnation, "incarnation-new");
+        assert_eq!(replacement.state, expected_allocated_state);
+        assert_eq!(cm.get_job(40_002).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_recover_does_not_mutate_replacement_incarnation() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let node_name = "recover-race-node";
+
+        register_node_with_incarnation(&cm, node_name, "incarnation-old", 8, 16_000);
+        let response = cm.apply_operation(&WalOperation::NodeStateChangeExact {
+            name: node_name.into(),
+            expected_incarnation: "incarnation-old".into(),
+            expected_old_state: Some(NodeState::Idle),
+            new_state: NodeState::Down,
+            reason: Some("test heartbeat timeout".into()),
+            admin_locked: false,
+        });
+        assert!(response.node_state_changed);
+
+        let fresh_old_worker = cm.get_node(node_name).unwrap();
+        let stale_action = super::evaluate_node_health(&[&fresh_old_worker], Utc::now(), 90);
+        assert!(matches!(
+            stale_action.as_slice(),
+            [super::HealthAction::Recover {
+                incarnation,
+                old_state: NodeState::Down,
+                recovered_state: NodeState::Idle,
+                ..
+            }] if incarnation == "incarnation-old"
+        ));
+
+        register_node_with_incarnation(&cm, node_name, "incarnation-new", 8, 16_000);
+        let before = cm.get_node(node_name).unwrap();
+        assert_eq!(before.state, NodeState::Down);
+
+        assert!(cm.apply_health_actions(stale_action).is_empty());
+        let replacement = cm.get_node(node_name).unwrap();
+        assert_eq!(replacement.incarnation, "incarnation-new");
+        assert_eq!(replacement.state, NodeState::Down);
+        assert_eq!(
+            replacement.state_reason.as_deref(),
+            Some("test heartbeat timeout")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_name_based_down_does_not_mutate_replacement_incarnation() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let node_name = "state-change-race-node";
+
+        register_node_with_incarnation(&cm, node_name, "incarnation-old", 8, 16_000);
+        register_node_with_incarnation(&cm, node_name, "incarnation-new", 8, 16_000);
+
+        let response = cm.apply_operation(&WalOperation::NodeStateChange {
+            name: node_name.into(),
+            expected_incarnation: "incarnation-old".into(),
+            old_state: NodeState::Idle,
+            new_state: NodeState::Down,
+            reason: Some("delayed health verdict".into()),
+            admin_locked: false,
+        });
+        assert!(!response.node_state_changed);
+        assert!(response.jobs_finalized.is_empty());
+        let replacement = cm.get_node(node_name).unwrap();
+        assert_eq!(replacement.incarnation, "incarnation-new");
+        assert_eq!(replacement.state, NodeState::Idle);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_name_based_remove_does_not_delete_replacement_incarnation() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let node_name = "remove-race-node";
+
+        register_node_with_incarnation(&cm, node_name, "incarnation-old", 8, 16_000);
+        register_node_with_incarnation(&cm, node_name, "incarnation-new", 8, 16_000);
+
+        let response = cm.apply_operation(&WalOperation::NodeRemove {
+            name: node_name.into(),
+            expected_incarnation: "incarnation-old".into(),
+            reason: Some("delayed removal".into()),
+        });
+        assert!(!response.node_removed);
+        assert!(response.jobs_finalized.is_empty());
+        let replacement = cm.get_node(node_name).unwrap();
+        assert_eq!(replacement.incarnation, "incarnation-new");
+        assert_eq!(replacement.state, NodeState::Idle);
+    }
+
     // --- Pure evaluate_node_health tests (no Raft needed) ---
 
     fn make_health_node(
@@ -15383,6 +23124,7 @@ mod tests {
         last_hb: Option<chrono::DateTime<Utc>>,
     ) -> Node {
         let mut node = Node::new(name.into(), ResourceSet::default());
+        node.incarnation = format!("{name}-incarnation");
         node.state = state;
         node.admin_locked = admin_locked;
         node.last_heartbeat = last_hb;
@@ -15402,6 +23144,7 @@ mod tests {
             actions,
             vec![super::HealthAction::MarkDown {
                 name: "n1".into(),
+                incarnation: "n1-incarnation".into(),
                 old_state: NodeState::Idle,
                 admin_locked: false,
             }]
@@ -15442,7 +23185,9 @@ mod tests {
             actions,
             vec![super::HealthAction::Recover {
                 name: "n1".into(),
+                incarnation: "n1-incarnation".into(),
                 old_state: NodeState::Down,
+                recovered_state: NodeState::Idle,
             }]
         );
     }
@@ -15516,6 +23261,7 @@ mod tests {
             actions[0],
             super::HealthAction::MarkDown {
                 name: "stale".into(),
+                incarnation: "stale-incarnation".into(),
                 old_state: NodeState::Idle,
                 admin_locked: false,
             }
@@ -15524,7 +23270,9 @@ mod tests {
             actions[1],
             super::HealthAction::Recover {
                 name: "back".into(),
+                incarnation: "back-incarnation".into(),
                 old_state: NodeState::Down,
+                recovered_state: NodeState::Idle,
             }
         );
     }
@@ -16409,6 +24157,7 @@ mod tests {
         spec.array_job_id = Some(parent);
         spec.array_task_id = Some(task);
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: id,
             spec: Box::new(spec),
         });
@@ -16428,6 +24177,7 @@ mod tests {
             job_id: id,
             exit_code,
             state,
+            finalization_intent: None,
         });
     }
 
@@ -16438,6 +24188,7 @@ mod tests {
 
         // Parent scalar job that fails.
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("parent")),
         });
@@ -16447,6 +24198,7 @@ mod tests {
         let mut child = basic_spec("child");
         child.dependency = vec!["afterok:1".into()];
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 2,
             spec: Box::new(child),
         });
@@ -16464,6 +24216,7 @@ mod tests {
         let cm = test_cluster(&dir).await;
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("parent")),
         });
@@ -16472,6 +24225,7 @@ mod tests {
         let mut child = basic_spec("child");
         child.dependency = vec!["afterok:1".into()];
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 2,
             spec: Box::new(child),
         });
@@ -16494,6 +24248,7 @@ mod tests {
 
         // Parent still running; child waits, not cancelled.
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("parent")),
         });
@@ -16506,6 +24261,7 @@ mod tests {
         let mut child = basic_spec("child");
         child.dependency = vec!["afterok:1".into()];
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 2,
             spec: Box::new(child),
         });
@@ -16535,6 +24291,7 @@ mod tests {
         let mut child = basic_spec("child");
         child.dependency = vec!["afterok:10".into()];
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 20,
             spec: Box::new(child),
         });
@@ -16559,6 +24316,7 @@ mod tests {
         let mut child = basic_spec("child");
         child.dependency = vec!["afterok:10".into()];
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 20,
             spec: Box::new(child),
         });
@@ -16601,6 +24359,7 @@ mod tests {
         let cm = test_cluster(&dir).await;
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            metadata: None,
             job_id: 1,
             spec: Box::new(basic_spec("scalar")),
         });
@@ -17096,6 +24855,7 @@ mod tests {
         cm.apply_operation(&WalOperation::NodeRegister {
             name: "worker1".into(),
             hostname: "worker1".into(),
+            incarnation: String::new(),
             resources: ResourceSet {
                 cpus: 4,
                 memory_mb: 8000,
@@ -17135,6 +24895,7 @@ mod tests {
         cm.apply_operation(&WalOperation::NodeRegister {
             name: "gpu-node".into(),
             hostname: String::new(),
+            incarnation: String::new(),
             resources: ResourceSet {
                 cpus: 8,
                 memory_mb: 16000,
@@ -17182,6 +24943,7 @@ mod tests {
         cm.apply_operation(&WalOperation::NodeRegister {
             name: "gpu-node".into(),
             hostname: String::new(),
+            incarnation: String::new(),
             resources: ResourceSet {
                 cpus: 8,
                 memory_mb: 16000,
@@ -17229,6 +24991,7 @@ mod tests {
         cm.apply_operation(&WalOperation::NodeRegister {
             name: "cpu-node".into(),
             hostname: String::new(),
+            incarnation: String::new(),
             resources: ResourceSet {
                 cpus: 8,
                 memory_mb: 16000,
@@ -17278,6 +25041,7 @@ mod tests {
 
         let snap = ClusterSnapshot {
             jobs: Vec::new(),
+            submission_tokens: Vec::new(),
             nodes: vec![stale],
             reservations: Vec::new(),
             partitions: None,
@@ -17358,35 +25122,37 @@ mod tests {
     // ---- Node deregistration tests ----
 
     fn start_job_on(cm: &ClusterManager, id: JobId, node: &str) {
-        cm.apply_operation(&WalOperation::job_state_change(
-            id,
-            JobState::Pending,
-            JobState::Running,
-        ));
-        cm.apply_operation(&WalOperation::JobStart {
-            job_id: id,
-            nodes: vec![node.into()],
-            resources: scalar_alloc(1, 1000),
-            per_node_alloc: per_node_for(&[node], scalar_alloc(1, 1000)),
-            srun_step_dispatch: false,
-            run_attempt: 0,
-        });
+        let resources = scalar_alloc(1, 1000);
+        apply_dispatch_begin(cm, id, &[node], resources.clone());
+        apply_dispatch_commit(cm, id);
+        apply_dispatch_publish(cm, id);
     }
 
     fn start_srun_job_on(cm: &ClusterManager, id: JobId, node: &str) {
-        cm.apply_operation(&WalOperation::job_state_change(
-            id,
-            JobState::Pending,
-            JobState::Running,
-        ));
-        cm.apply_operation(&WalOperation::JobStart {
+        let generation = cm.get_job(id).unwrap().submission_generation;
+        let incarnation = cm.get_node(node).unwrap().incarnation;
+        let resources = scalar_alloc(1, 1000);
+        let per_node_alloc = per_node_for(&[node], resources.clone());
+        let target_incarnations = HashMap::from([(node.to_string(), incarnation)]);
+        cm.apply_operation(&WalOperation::JobDispatchBegin {
             job_id: id,
-            nodes: vec![node.into()],
-            resources: scalar_alloc(1, 1000),
-            per_node_alloc: per_node_for(&[node], scalar_alloc(1, 1000)),
-            srun_step_dispatch: true,
+            submission_generation: generation,
+            expected_run_attempt: 0,
             run_attempt: 0,
+            target_nodes: vec![node.into()],
+            target_incarnations: target_incarnations.clone(),
+            resources: resources.clone(),
+            per_node_alloc: per_node_alloc.clone(),
         });
+        cm.start_standalone_job_after_registration(
+            id,
+            generation,
+            vec![node.into()],
+            resources,
+            per_node_alloc,
+            target_incarnations,
+        )
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -17399,16 +25165,20 @@ mod tests {
         start_job_on(&cm, id, "n1");
         assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
 
-        let resp = cm.apply_operation(&WalOperation::NodeStateChange {
+        let resp = cm.apply_operation(&durable_node_operation(WalOperation::NodeStateChange {
             name: "n1".into(),
+            expected_incarnation: cm.get_node("n1").unwrap().incarnation,
             old_state: NodeState::Allocated,
             new_state: NodeState::Down,
             reason: Some("heartbeat timeout".into()),
             admin_locked: false,
-        });
-        assert_eq!(resp.jobs_finalized.len(), 1);
-        assert_eq!(resp.jobs_finalized[0].job_id, id);
-        assert_eq!(resp.jobs_finalized[0].state, JobState::NodeFail);
+        }));
+        assert!(resp.terminal_cleanup_deferred);
+        assert!(resp.jobs_finalized.is_empty());
+        let finalized = acknowledge_test_cleanup(&cm, id);
+        assert_eq!(finalized.jobs_finalized.len(), 1);
+        assert_eq!(finalized.jobs_finalized[0].job_id, id);
+        assert_eq!(finalized.jobs_finalized[0].state, JobState::NodeFail);
 
         let job = cm.get_job(id).unwrap();
         assert_eq!(job.state, JobState::NodeFail);
@@ -17428,6 +25198,7 @@ mod tests {
 
         let resp = cm.apply_operation(&WalOperation::NodeStateChange {
             name: "n1".into(),
+            expected_incarnation: String::new(),
             old_state: NodeState::Idle,
             new_state: NodeState::Down,
             reason: None,
@@ -17447,6 +25218,7 @@ mod tests {
 
         cm.apply_operation(&WalOperation::NodeRemove {
             name: "n1".into(),
+            expected_incarnation: String::new(),
             reason: Some("decommission".into()),
         });
         assert!(cm.get_node("n1").is_none());
@@ -17461,12 +25233,16 @@ mod tests {
         let id = submit_and_wait(&cm, basic_spec("j"));
         start_job_on(&cm, id, "n1");
 
-        let resp = cm.apply_operation(&WalOperation::NodeRemove {
+        let resp = cm.apply_operation(&durable_node_operation(WalOperation::NodeRemove {
             name: "n1".into(),
+            expected_incarnation: cm.get_node("n1").unwrap().incarnation,
             reason: None,
-        });
-        assert_eq!(resp.jobs_finalized.len(), 1);
-        assert_eq!(resp.jobs_finalized[0].state, JobState::NodeFail);
+        }));
+        assert!(resp.terminal_cleanup_deferred);
+        assert!(resp.jobs_finalized.is_empty());
+        let finalized = acknowledge_test_cleanup(&cm, id);
+        assert_eq!(finalized.jobs_finalized.len(), 1);
+        assert_eq!(finalized.jobs_finalized[0].state, JobState::NodeFail);
         assert_eq!(cm.get_job(id).unwrap().state, JobState::NodeFail);
         assert!(cm.get_node("n1").is_none());
     }
@@ -17528,8 +25304,11 @@ mod tests {
         let id = submit_and_wait(&cm, basic_spec("j"));
         start_job_on(&cm, id, "n1");
 
-        cm.remove_node("n1", true, Some("bad node".into())).unwrap();
+        let evicted = cm.remove_node("n1", true, Some("bad node".into())).unwrap();
         wait_for("n1 removed", || cm.get_node("n1").is_none());
+        assert!(evicted.is_empty(), "cleanup is still pending");
+        let finalized = acknowledge_test_cleanup(&cm, id);
+        assert_eq!(finalized.jobs_finalized.len(), 1);
 
         assert_eq!(cm.get_job(id).unwrap().state, JobState::NodeFail);
     }
@@ -17558,8 +25337,10 @@ mod tests {
             .unwrap();
         wait_for("n1 removed", || cm.get_node("n1").is_none());
 
-        assert_eq!(evicted.len(), 1);
-        assert_eq!(evicted[0].job_id, id);
+        assert!(evicted.is_empty(), "peer cleanup is still pending");
+        let finalized = acknowledge_test_cleanup(&cm, id);
+        assert_eq!(finalized.jobs_finalized.len(), 1);
+        assert_eq!(finalized.jobs_finalized[0].job_id, id);
         assert_eq!(cm.get_job(id).unwrap().state, JobState::NodeFail);
 
         let n2 = cm.get_node("n2").unwrap();
@@ -17585,12 +25366,11 @@ mod tests {
                 .is_some_and(|n| n.state == NodeState::Draining)
         });
 
-        cm.apply_operation(&WalOperation::JobNodeComplete {
-            job_id: id,
-            node_name: "n1".into(),
-            exit_code: 0,
-            signal: 0,
-        });
+        let attempt = cm.get_job(id).unwrap().run_attempt;
+        assert!(matches!(
+            cm.node_complete(id, "n1", 0, 0, attempt).unwrap(),
+            NodeCompleteResult::AllDone { .. }
+        ));
 
         let node = cm.get_node("n1").unwrap();
         assert_eq!(node.state, NodeState::Drain);
@@ -17647,6 +25427,7 @@ mod tests {
             &mut nodes,
             Utc::now(),
             PendingReason::NodeDown,
+            None,
         );
         assert!(result.is_none());
     }
@@ -17664,6 +25445,7 @@ mod tests {
             &mut nodes,
             Utc::now(),
             PendingReason::NodeDown,
+            None,
         )
         .unwrap();
         assert_eq!(fin.job_id, 1);
@@ -17691,6 +25473,7 @@ mod tests {
             &mut nodes,
             Utc::now(),
             PendingReason::NodeDown,
+            None,
         );
 
         assert_eq!(nodes["n1"].alloc_resources.cpus, 0);
@@ -17712,6 +25495,7 @@ mod tests {
             &mut nodes,
             Utc::now(),
             PendingReason::NodeDown,
+            None,
         );
         assert!(result.is_none());
     }
@@ -17734,6 +25518,7 @@ mod tests {
             &mut nodes,
             Utc::now(),
             PendingReason::NodeDown,
+            None,
         );
 
         let job = &jobs[&1];
@@ -17756,6 +25541,7 @@ mod tests {
             &mut nodes,
             Utc::now(),
             PendingReason::NodeDown,
+            None,
         )
         .unwrap();
         assert_eq!(fin.state, JobState::NodeFail);
@@ -17778,6 +25564,7 @@ mod tests {
             &mut nodes,
             Utc::now(),
             PendingReason::NodeDown,
+            None,
         );
 
         assert_eq!(nodes["n1"].state, NodeState::Drain);
@@ -18465,5 +26252,336 @@ mod tests {
             Some("premium"),
             "the resolved default QoS must be recorded on the job"
         );
+    }
+
+    #[test]
+    fn standalone_attempt_zero_reservation_survives_snapshot_and_exact_cleanup() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        cm.apply_operation(&WalOperation::NodeRegister {
+            name: "n1".into(),
+            hostname: "n1".into(),
+            incarnation: "worker-a".into(),
+            resources: ResourceSet {
+                cpus: 4,
+                memory_mb: 8_000,
+                ..Default::default()
+            },
+            address: "127.0.0.1".into(),
+            port: 6_818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::new(),
+            source: NodeSource::NativeHost,
+        });
+        let generation = Uuid::new_v4();
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 40,
+            spec: Box::new(srun_spec("snapshot-attempt-zero")),
+            metadata: Some(JobSubmissionMetadata {
+                generation,
+                submitted_at: Utc::now(),
+                idempotency: None,
+            }),
+        });
+        let allocation = scalar_alloc(1, 1_000);
+        cm.apply_operation(&WalOperation::JobDispatchBegin {
+            job_id: 40,
+            submission_generation: generation,
+            expected_run_attempt: 0,
+            run_attempt: 0,
+            target_nodes: vec!["n1".into()],
+            target_incarnations: HashMap::from([("n1".into(), "worker-a".into())]),
+            resources: allocation.clone(),
+            per_node_alloc: HashMap::from([("n1".into(), allocation)]),
+        });
+
+        let snapshot = cm.snapshot_state().unwrap();
+        let restored_dir = TempDir::new().unwrap();
+        let restored = ClusterManager::new(test_config(), restored_dir.path()).unwrap();
+        restored.restore_from_snapshot(&snapshot).unwrap();
+
+        let job = restored.get_job(40).unwrap();
+        let pending = job
+            .pending_dispatch
+            .expect("reservation survives crash/replay");
+        assert_eq!(pending.submission_generation, generation);
+        assert_eq!(pending.run_attempt, 0);
+        assert_eq!(pending.target_incarnations["n1"], "worker-a");
+        assert_eq!(restored.get_node("n1").unwrap().alloc_resources.cpus, 1);
+
+        restored.apply_operation(&WalOperation::JobDispatchAbortBegin {
+            job_id: 40,
+            submission_generation: generation,
+            run_attempt: 0,
+        });
+        assert_eq!(restored.get_node("n1").unwrap().alloc_resources.cpus, 1);
+        restored.apply_operation(&WalOperation::JobDispatchTargetClear {
+            job_id: 40,
+            submission_generation: generation,
+            run_attempt: 0,
+            node_name: "n1".into(),
+        });
+        assert_eq!(restored.get_node("n1").unwrap().alloc_resources.cpus, 0);
+        let cleared = restored.apply_operation(&WalOperation::JobDispatchClear {
+            job_id: 40,
+            submission_generation: generation,
+            run_attempt: 0,
+        });
+        assert!(cleared.dispatch_cleared);
+        assert!(restored.get_job(40).unwrap().pending_dispatch.is_none());
+    }
+
+    #[test]
+    fn standalone_start_fences_reused_job_and_worker_identities() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        cm.apply_operation(&WalOperation::NodeRegister {
+            name: "n1".into(),
+            hostname: "n1".into(),
+            incarnation: "worker-a".into(),
+            resources: ResourceSet {
+                cpus: 4,
+                memory_mb: 8_000,
+                ..Default::default()
+            },
+            address: "127.0.0.1".into(),
+            port: 6_818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::new(),
+            source: NodeSource::NativeHost,
+        });
+
+        let job_id = 41;
+        let old_generation = uuid::Uuid::new_v4();
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id,
+            spec: Box::new(srun_spec("old")),
+            metadata: Some(JobSubmissionMetadata {
+                generation: old_generation,
+                submitted_at: Utc::now(),
+                idempotency: None,
+            }),
+        });
+        let allocation = scalar_alloc(1, 1_000);
+        let per_node = HashMap::from([("n1".into(), allocation.clone())]);
+        let old_start = WalOperation::JobStandaloneStart {
+            job_id,
+            submission_generation: old_generation,
+            nodes: vec!["n1".into()],
+            resources: allocation.clone(),
+            per_node_alloc: per_node.clone(),
+            target_incarnations: HashMap::from([("n1".into(), "worker-a".into())]),
+        };
+
+        let replacement_generation = uuid::Uuid::new_v4();
+        cm.jobs.write().insert(
+            job_id,
+            Job::new_with_submission(
+                job_id,
+                srun_spec("replacement"),
+                replacement_generation,
+                Utc::now(),
+            ),
+        );
+        cm.apply_operation(&old_start);
+        assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Pending);
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 0);
+
+        cm.apply_operation(&WalOperation::JobStandaloneStart {
+            job_id,
+            submission_generation: replacement_generation,
+            nodes: vec!["n1".into()],
+            resources: allocation.clone(),
+            per_node_alloc: per_node.clone(),
+            target_incarnations: HashMap::from([("n1".into(), "worker-stale".into())]),
+        });
+        assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Pending);
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 0);
+
+        cm.apply_operation(&WalOperation::JobDispatchBegin {
+            job_id,
+            submission_generation: replacement_generation,
+            expected_run_attempt: 0,
+            run_attempt: 0,
+            target_nodes: vec!["n1".into()],
+            target_incarnations: HashMap::from([("n1".into(), "worker-a".into())]),
+            resources: allocation.clone(),
+            per_node_alloc: per_node.clone(),
+        });
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 1);
+
+        let exact_start = WalOperation::JobStandaloneStart {
+            job_id,
+            submission_generation: replacement_generation,
+            nodes: vec!["n1".into()],
+            resources: allocation,
+            per_node_alloc: per_node,
+            target_incarnations: HashMap::from([("n1".into(), "worker-a".into())]),
+        };
+        cm.apply_operation(&exact_start);
+        cm.apply_operation(&exact_start);
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert_eq!(job.run_attempt, 0);
+        assert_eq!(
+            job.allocated_node_incarnations
+                .get("n1")
+                .map(String::as_str),
+            Some("worker-a")
+        );
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 1);
+
+        let error = cm
+            .cancel_job(job_id, "")
+            .expect_err("generic cancellation cannot bypass standalone worker reap");
+        assert!(error.to_string().contains("worker reap acknowledgement"));
+
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id,
+            exit_code: -1,
+            state: JobState::Cancelled,
+            finalization_intent: None,
+        });
+        assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Running);
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 1);
+
+        cm.apply_operation(&WalOperation::JobStandaloneCancel {
+            job_id,
+            submission_generation: old_generation,
+        });
+        assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Running);
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 1);
+
+        let end_time = DateTime::<Utc>::from_timestamp(1_750_001_000, 0).unwrap();
+        let cancel = WalOperation::DurableFinalization {
+            context: DurableFinalizationContext::exact(replacement_generation, 0, end_time)
+                .with_node_incarnations(HashMap::from([("n1".into(), "worker-a".into())])),
+            operation: Box::new(WalOperation::JobStandaloneCancel {
+                job_id,
+                submission_generation: replacement_generation,
+            }),
+        };
+        let response = cm.apply_operation(&cancel);
+        assert!(!response.terminal_cleanup_deferred);
+        assert_eq!(response.jobs_finalized.len(), 1);
+        let cancelled = cm.get_job(job_id).unwrap();
+        assert_eq!(cancelled.state, JobState::Cancelled);
+        assert!(cancelled.pending_dispatch.is_none());
+        let marker = cancelled
+            .pending_finalization
+            .expect("post-reap standalone cancellation must install its durable marker");
+        assert_eq!(marker.submission_generation, replacement_generation);
+        assert_eq!(marker.run_attempt, 0);
+        assert_eq!(marker.end_time, end_time);
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 0);
+
+        let ack = cm.apply_operation(&WalOperation::JobFinalizationAck {
+            job_id,
+            marker,
+            action: FinalizationAction::KeepTerminal,
+        });
+        assert!(ack.finalization_acked);
+        let finalized = cm.get_job(job_id).unwrap();
+        assert_eq!(finalized.state, JobState::Cancelled);
+        assert!(finalized.pending_finalization.is_none());
+    }
+
+    #[test]
+    fn durable_exact_cancel_cannot_cancel_a_reused_numeric_job_id() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        let job_id = 42;
+        let old_generation = Uuid::new_v4();
+        let replacement_generation = Uuid::new_v4();
+        let end_time = DateTime::<Utc>::from_timestamp(1_750_002_000, 0).unwrap();
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id,
+            spec: Box::new(basic_spec("old")),
+            metadata: Some(JobSubmissionMetadata {
+                generation: old_generation,
+                submitted_at: Utc::now(),
+                idempotency: None,
+            }),
+        });
+        let cancel = WalOperation::DurableFinalization {
+            context: DurableFinalizationContext::exact(old_generation, 0, end_time),
+            operation: Box::new(WalOperation::JobCancelExact {
+                job_id,
+                expected_submission_generation: old_generation,
+            }),
+        };
+        let response = cm.apply_operation(&cancel);
+        assert_eq!(response.jobs_finalized.len(), 1);
+        let old = cm.get_job(job_id).unwrap();
+        assert_eq!(old.state, JobState::Cancelled);
+        let marker = old
+            .pending_finalization
+            .expect("exact cancel installs the durable outbox marker");
+        let ack = cm.apply_operation(&WalOperation::JobFinalizationAck {
+            job_id,
+            marker,
+            action: FinalizationAction::KeepTerminal,
+        });
+        assert!(ack.finalization_acked);
+
+        cm.apply_operation(&WalOperation::EvictTerminalJobs {
+            job_ids: vec![job_id],
+        });
+        assert!(cm.get_job(job_id).is_none());
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id,
+            spec: Box::new(basic_spec("replacement")),
+            metadata: Some(JobSubmissionMetadata {
+                generation: replacement_generation,
+                submitted_at: Utc::now(),
+                idempotency: None,
+            }),
+        });
+
+        let delayed = cm.apply_operation(&cancel);
+        assert!(delayed.jobs_finalized.is_empty());
+        assert!(!delayed.terminal_cleanup_deferred);
+        let replacement = cm.get_job(job_id).expect("replacement remains present");
+        assert_eq!(replacement.submission_generation, replacement_generation);
+        assert_eq!(replacement.state, JobState::Pending);
+        assert!(replacement.pending_finalization.is_none());
+    }
+
+    #[test]
+    fn standalone_cancel_snapshot_rejects_a_reused_numeric_job_id_atomically() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        let job_id = 43;
+        let old_generation = Uuid::new_v4();
+        let replacement_generation = Uuid::new_v4();
+
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id,
+            spec: Box::new(srun_spec("replacement")),
+            metadata: Some(JobSubmissionMetadata {
+                generation: replacement_generation,
+                submitted_at: Utc::now(),
+                idempotency: None,
+            }),
+        });
+        {
+            let mut jobs = cm.jobs.write();
+            let replacement = jobs.get_mut(&job_id).unwrap();
+            replacement.srun_step_dispatch = true;
+            replacement.state = JobState::Running;
+        }
+
+        assert!(cm
+            .standalone_job_for_cancel(job_id, "", Some(old_generation))
+            .unwrap()
+            .is_none());
+        let exact = cm
+            .standalone_job_for_cancel(job_id, "", Some(replacement_generation))
+            .unwrap()
+            .expect("the matching immutable standalone submission is returned");
+        assert_eq!(exact.submission_generation, replacement_generation);
     }
 }

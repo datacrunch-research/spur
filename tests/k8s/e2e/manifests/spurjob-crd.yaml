@@ -81,7 +81,9 @@ spec:
                 properties:
                   count:
                     default: 0
-                    description: Number of GPUs needed.
+                    description: |-
+                      Number of GPUs per node (maps to a gres entry). Unlike the CLI/REST
+                      `--gpus` flag which specifies a job total, this field is always per-node.
                     format: uint32
                     minimum: 0.0
                     type: integer
@@ -205,16 +207,119 @@ spec:
                 items:
                   type: string
                 type: array
+              completionDeliveries:
+                additionalProperties:
+                  description: |-
+                    A terminal Pod completion durably queued for delivery to spurctld.
+
+                    Entries remain in status after acknowledgement with `delivered = true` so
+                    a terminal Pod observed again after an operator restart is not re-enqueued.
+                  properties:
+                    delivered:
+                      default: false
+                      type: boolean
+                    exitCode:
+                      default: 0
+                      format: int32
+                      type: integer
+                    jobId:
+                      default: 0
+                      format: uint32
+                      minimum: 0.0
+                      type: integer
+                    message:
+                      default: ''
+                      type: string
+                    podDispatchToken:
+                      default: ''
+                      type: string
+                    podName:
+                      default: ''
+                      type: string
+                    podUid:
+                      default: ''
+                      type: string
+                    reportingNode:
+                      default: ''
+                      type: string
+                    runAttempt:
+                      default: 0
+                      format: uint32
+                      minimum: 0.0
+                      type: integer
+                    signal:
+                      default: 0
+                      format: int32
+                      type: integer
+                    state:
+                      default: 0
+                      format: int32
+                      type: integer
+                    submissionGeneration:
+                      default: ''
+                      type: string
+                    submissionToken:
+                      default: ''
+                      type: string
+                    workerIncarnation:
+                      default: ''
+                      type: string
+                  type: object
+                default: {}
+                description: |-
+                  Durable terminal-completion outbox, keyed by immutable Pod UID.
+                  A successful report is marked delivered instead of removed so watcher
+                  replay and operator restarts cannot enqueue it again.
+                type: object
+              launchSpecSha256:
+                description: |-
+                  SHA-256 of the canonical SpurJob spec persisted before SubmitJob. The
+                  preview operator rejects later spec drift instead of launching a
+                  workload different from the committed submission intent.
+                nullable: true
+                type: string
               message:
                 description: Human-readable message.
                 nullable: true
                 type: string
+              podDispatchTokens:
+                additionalProperties:
+                  type: string
+                default: {}
+                description: |-
+                  Per-Pod dispatch nonces persisted before creation. A create-response
+                  loss can adopt only a conflicting Pod carrying this durable nonce.
+                type: object
+              podUids:
+                additionalProperties:
+                  type: string
+                default: {}
+                description: |-
+                  Immutable Pod UIDs recorded by the operator after creation. Completion
+                  and cleanup require this provenance in addition to Pod metadata.
+                type: object
               pods:
                 default: []
                 description: Pod names created for this job.
                 items:
                   type: string
                 type: array
+              serviceDispatchTokens:
+                additionalProperties:
+                  type: string
+                default: {}
+                description: |-
+                  Per-Service attempt nonce persisted before creation. A create-response
+                  loss may adopt only an exact desired Service carrying this nonce.
+                type: object
+              serviceUids:
+                additionalProperties:
+                  type: string
+                default: {}
+                description: |-
+                  Immutable Service UIDs recorded after creation. Service control and
+                  finalization require this binding in addition to owner and annotations.
+                type: object
               spurJobId:
                 description: Spur-assigned job ID.
                 format: uint32
@@ -225,6 +330,18 @@ spec:
                 default: ''
                 description: Current state (Pending, Running, Completed, Failed, Cancelled).
                 type: string
+              submissionGeneration:
+                description: |-
+                  Immutable controller submission identity used to fence delayed cleanup
+                  from a future reuse of `spur_job_id`.
+                nullable: true
+                type: string
+              submissionToken:
+                description: |-
+                  Operator-generated token persisted before the SubmitJob RPC. It is the
+                  crash-recovery key for obtaining the original controller identity.
+                nullable: true
+                type: string
             type: object
         required:
         - spec
@@ -234,4 +351,3 @@ spec:
     storage: true
     subresources:
       status: {}
-

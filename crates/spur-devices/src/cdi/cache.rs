@@ -66,8 +66,12 @@ impl CdiCache {
             cdi_dirs.push(PathBuf::from(extra));
         }
 
+        Self::load_from_sources(&cdi_dirs, auto_detect)
+    }
+
+    fn load_from_sources(cdi_dirs: &[PathBuf], auto_detect: bool) -> Self {
         let mut cache = Self::new();
-        let errors = cache.load_from_dirs(&cdi_dirs);
+        let errors = cache.load_from_dirs(cdi_dirs);
         if !errors.is_empty() {
             warn!("CDI spec loading errors:\n{}", errors);
         }
@@ -444,14 +448,14 @@ mod tests {
             .write_json(&dir.path().join("amd.json"))
             .unwrap();
 
-        let cache = CdiCache::load(&[dir.path().to_string_lossy().into_owned()], true);
+        let cache = CdiCache::load_from_sources(&[dir.path().to_path_buf()], true);
         assert_eq!(cache.len(), 1);
         assert!(cache.get_device("amd.com/gpu=0").is_some());
     }
 
     #[test]
     fn test_load_empty_without_auto_detect() {
-        let cache = CdiCache::load(&[], false);
+        let cache = CdiCache::load_from_sources(&[], false);
         assert!(cache.is_empty());
     }
 

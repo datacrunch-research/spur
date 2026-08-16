@@ -440,6 +440,14 @@ impl RunningJob {
             RunningJob::AllocationOnly => None,
         }
     }
+
+    pub fn cgroup_path(&self) -> Option<PathBuf> {
+        match self {
+            RunningJob::Managed { cgroup_path, .. } => cgroup_path.clone(),
+            RunningJob::Forked { cgroup_path, .. } => cgroup_path.clone(),
+            RunningJob::AllocationOnly => None,
+        }
+    }
 }
 
 /// Launch a job script on this node.

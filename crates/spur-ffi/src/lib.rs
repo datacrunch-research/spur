@@ -90,7 +90,10 @@ pub extern "C" fn slurm_submit_batch_job(
         };
 
         let resp = client
-            .submit_job(SubmitJobRequest { spec: Some(spec) })
+            .submit_job(SubmitJobRequest {
+                spec: Some(spec),
+                submission_token: String::new(),
+            })
             .await
             .ok()?;
 
@@ -304,6 +307,7 @@ pub extern "C" fn slurm_kill_job(job_id: c_uint, signal: u16, _flags: u16) -> c_
                 job_id,
                 signal: signal as i32,
                 user: String::new(),
+                expected_submission_generation: String::new(),
             })
             .await
             .ok()?;

@@ -166,7 +166,10 @@ pub fn job_runs_in_active_reservation(
     reservations.iter().any(|r| {
         r.name == res_name
             && r.is_active(now)
-            && job.allocated_nodes.iter().any(|node| r.covers_node(node))
+            && match job.pending_dispatch.as_ref() {
+                Some(dispatch) => dispatch.target_nodes.iter().any(|node| r.covers_node(node)),
+                None => job.allocated_nodes.iter().any(|node| r.covers_node(node)),
+            }
     })
 }
 
@@ -236,10 +239,16 @@ pub fn running_jobs_overlap_start(
 ) -> Option<(crate::job::JobId, String)> {
     let node_set: std::collections::HashSet<&str> = nodes.iter().map(String::as_str).collect();
     for job in jobs.values() {
-        if !matches!(
-            job.state,
-            JobState::Running | JobState::Completing | JobState::Suspended
-        ) {
+        let provisional_nodes = job
+            .pending_dispatch
+            .as_ref()
+            .map(|dispatch| dispatch.target_nodes.as_slice());
+        if provisional_nodes.is_none()
+            && !matches!(
+                job.state,
+                JobState::Running | JobState::Completing | JobState::Suspended
+            )
+        {
             continue;
         }
         if let Some(ex) = except_reservation {
@@ -247,19 +256,19 @@ pub fn running_jobs_overlap_start(
                 continue;
             }
         }
-        let overlaps_node = job
-            .allocated_nodes
-            .iter()
-            .any(|n| node_set.contains(n.as_str()));
+        let occupied_nodes = provisional_nodes.unwrap_or(&job.allocated_nodes);
+        let overlaps_node = occupied_nodes.iter().any(|n| node_set.contains(n.as_str()));
         if !overlaps_node {
             continue;
         }
-        let node = job
-            .allocated_nodes
+        let node = occupied_nodes
             .iter()
             .find(|n| node_set.contains(n.as_str()))
             .cloned()
             .unwrap_or_default();
+        if provisional_nodes.is_some() {
+            return Some((job.job_id, node));
+        }
         let Some(end) = running_job_end(job, Utc::now()) else {
             return Some((job.job_id, node));
         };

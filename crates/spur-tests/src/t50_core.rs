@@ -101,9 +101,10 @@ mod tests {
     }
 
     #[test]
-    fn t50_12_invalid_pending_to_failed() {
+    fn t50_12_pending_to_failed() {
         let mut job = make_job("test");
-        assert_transition_err(&mut job, JobState::Failed);
+        assert_transition_ok(&mut job, JobState::Failed);
+        assert!(job.state.is_terminal());
     }
 
     // ── T50.15: Job path resolution ───────────────────────────────
@@ -970,6 +971,9 @@ address = "http://peer-a:6817"
         // and can be constructed.
         let req = spur_proto::proto::ExecInJobRequest {
             job_id: 42,
+            submission_generation: "generation-a".into(),
+            run_attempt: 3,
+            worker_incarnation: "worker-a".into(),
             command: vec!["ls".into(), "-la".into()],
             user: "alice".into(),
         };
@@ -998,6 +1002,9 @@ address = "http://peer-a:6817"
                     argv: vec!["/bin/bash".into()],
                     env: HashMap::new(),
                     user: "alice".into(),
+                    run_attempt: 3,
+                    submission_generation: "generation-a".into(),
+                    worker_incarnation: "worker-a".into(),
                 },
             )),
         };

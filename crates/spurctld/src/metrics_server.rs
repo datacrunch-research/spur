@@ -233,9 +233,10 @@ mod tests {
     async fn two_node_raft(
         dir: &TempDir,
     ) -> (Arc<crate::raft::RaftHandle>, Arc<crate::raft::RaftHandle>) {
-        let listener1 = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        // Keep this fixture portable to hosts and containers with IPv6 disabled.
+        let listener1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr1 = listener1.local_addr().unwrap();
-        let listener2 = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr2 = listener2.local_addr().unwrap();
         drop(listener1);
         drop(listener2);

@@ -3,6 +3,7 @@
 
 pub mod agent;
 pub mod crd;
+mod execution_identity;
 pub mod health;
 pub mod heartbeat;
 pub mod job_controller;

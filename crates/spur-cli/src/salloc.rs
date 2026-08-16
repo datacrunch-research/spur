@@ -129,6 +129,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     let response = client
         .submit_job(SubmitJobRequest {
             spec: Some(job_spec),
+            submission_token: String::new(),
         })
         .await
         .context("job submission failed")?;
@@ -152,6 +153,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                     job_id,
                     signal: 2, // SIGINT
                     user: cancel_user,
+                    expected_submission_generation: String::new(),
                 })
                 .await;
             std::process::exit(130); // Standard SIGINT exit code
@@ -176,12 +178,19 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
                     job_id,
                     signal: 0,
                     user: user.clone(),
+                    expected_submission_generation: String::new(),
                 })
                 .await;
             std::process::exit(1);
         }
 
-        match client.get_job(GetJobRequest { job_id }).await {
+        match client
+            .get_job(GetJobRequest {
+                job_id,
+                ..Default::default()
+            })
+            .await
+        {
             Ok(resp) => {
                 let job = resp.into_inner();
                 match job.state {
@@ -258,6 +267,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             job_id,
             signal: 0,
             user,
+            expected_submission_generation: String::new(),
         })
         .await;
 
