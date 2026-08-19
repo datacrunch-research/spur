@@ -11,7 +11,7 @@
 //! `UpdateNode`); every other RPC reports `unimplemented` so an unexpected call
 //! fails loudly instead of silently returning a default.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -33,6 +33,8 @@ pub(crate) const MOCK_EXIT_CODE: i32 = 7;
 #[derive(Clone, Default)]
 pub(crate) struct StepCapture {
     create_step_num_tasks: Arc<AtomicU32>,
+    create_step_calls: Arc<AtomicU32>,
+    create_step_failures: Arc<Mutex<VecDeque<(tonic::Code, String)>>>,
     run_step_step_id: Arc<AtomicU32>,
     run_step_calls: Arc<AtomicU32>,
     update_node_names: Arc<Mutex<Vec<String>>>,
@@ -44,6 +46,17 @@ impl StepCapture {
     /// Task count carried by the most recent `CreateJobStep`.
     pub(crate) fn create_step_num_tasks(&self) -> u32 {
         self.create_step_num_tasks.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn create_step_calls(&self) -> u32 {
+        self.create_step_calls.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn fail_next_create_steps(
+        &self,
+        failures: impl IntoIterator<Item = (tonic::Code, String)>,
+    ) {
+        self.create_step_failures.lock().unwrap().extend(failures);
     }
 
     /// Step id carried by the most recent `RunStep`.
@@ -99,6 +112,16 @@ mock_controller_impl! {
             &self,
             request: tonic::Request<proto::CreateJobStepRequest>,
         ) -> Result<tonic::Response<proto::CreateJobStepResponse>, tonic::Status> {
+            self.capture.create_step_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some((code, message)) = self
+                .capture
+                .create_step_failures
+                .lock()
+                .unwrap()
+                .pop_front()
+            {
+                return Err(tonic::Status::new(code, message));
+            }
             self.capture
                 .create_step_num_tasks
                 .store(request.into_inner().num_tasks, Ordering::SeqCst);

@@ -1757,6 +1757,21 @@ impl SlurmController for ControllerService {
         spur_core::auth::check_job_owner(&req.user, &job.spec.user, "attach to")
             .map_err(|e| Status::permission_denied(e.to_string()))?;
 
+        // LaunchJob starts the batch process before its RPC can return, while the
+        // scheduler intentionally publishes Running only after that RPC is
+        // confirmed.  A batch script can therefore start a nested srun during
+        // this narrow Pending -> Running handoff.  Report that state as Aborted
+        // (the gRPC concurrency/retry signal) so new clients can wait for the
+        // controller commit without treating terminal/non-runnable states as
+        // transient.  This check happens before a step is allocated, so retrying
+        // the request cannot duplicate a step.
+        if job.state == spur_core::job::JobState::Pending {
+            return Err(Status::aborted(format!(
+                "job {} is not ready for steps (state: {:?})",
+                job_id, job.state
+            )));
+        }
+
         if job.state != spur_core::job::JobState::Running {
             return Err(Status::failed_precondition(format!(
                 "job {} is not running (state: {:?})",
@@ -4445,7 +4460,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn create_job_step_rejects_when_job_not_running() {
+    async fn create_job_step_reports_pending_start_handoff_as_retryable() {
         let dir = tempfile::TempDir::new().unwrap();
         let svc = test_service(&dir).await;
 
@@ -4475,7 +4490,8 @@ mod tests {
             }))
             .await
             .expect_err("a still-Pending job must not accept a new step");
-        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert_eq!(err.code(), Code::Aborted);
+        assert!(err.message().contains("not ready for steps"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

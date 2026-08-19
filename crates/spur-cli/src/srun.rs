@@ -15,6 +15,9 @@ use spur_proto::proto::{
 use std::collections::HashMap;
 use std::io::Write as _;
 
+const STEP_PARENT_READY_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(10);
+const STEP_PARENT_READY_POLL: tokio::time::Duration = tokio::time::Duration::from_millis(100);
+
 /// Run a parallel job (interactive or allocation-based).
 #[derive(Parser, Debug)]
 #[command(name = "srun", about = "Run a parallel job")]
@@ -730,22 +733,25 @@ async fn dispatch_step(
     let io = params.io;
     let step_mpi = params.mpi;
     let ntasks = crate::sbatch::effective_ntasks(args.ntasks, args.ntasks_per_node, args.nodes);
-    let step_id = client
-        .create_job_step(CreateJobStepRequest {
-            job_id,
-            command: args.command.clone(),
-            num_tasks: ntasks,
-            cpus_per_task: args.cpus_per_task,
-            overlap: false,
-            pty: false,
-            winsize: None,
-            node: String::new(),
-            user: params.user.to_string(),
-        })
-        .await
-        .context("failed to create job step")?
-        .into_inner()
-        .step_id;
+    let step_request = CreateJobStepRequest {
+        job_id,
+        command: args.command.clone(),
+        num_tasks: ntasks,
+        cpus_per_task: args.cpus_per_task,
+        overlap: false,
+        pty: false,
+        winsize: None,
+        node: String::new(),
+        user: params.user.to_string(),
+    };
+    let step_id = create_job_step_when_parent_ready(
+        client,
+        step_request,
+        STEP_PARENT_READY_TIMEOUT,
+        STEP_PARENT_READY_POLL,
+    )
+    .await?
+    .step_id;
 
     if args.input.is_some() {
         eprintln!("srun: warning: --input is not supported in step mode, ignoring");
@@ -783,6 +789,62 @@ async fn dispatch_step(
     Ok(StepDispatchResult {
         exit_code: resp.exit_code,
     })
+}
+
+/// Create a step, tolerating only the short batch-launch handoff in which the
+/// worker has started the parent process but the controller has not yet
+/// committed its Pending -> Running transition.
+///
+/// New controllers identify that conflict with `Aborted`.  The exact legacy
+/// `FailedPrecondition` response is also recognized so workers can be upgraded
+/// before controllers during a rolling deployment.  No other failure is
+/// retried: in particular, this avoids duplicating a step after an ambiguous
+/// transport error.
+async fn create_job_step_when_parent_ready(
+    client: &mut SlurmControllerClient<tonic::transport::Channel>,
+    request: CreateJobStepRequest,
+    timeout: tokio::time::Duration,
+    poll_interval: tokio::time::Duration,
+) -> Result<spur_proto::proto::CreateJobStepResponse> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut announced_wait = false;
+
+    loop {
+        match client.create_job_step(request.clone()).await {
+            Ok(response) => return Ok(response.into_inner()),
+            Err(status) if is_parent_start_handoff(&status) => {
+                if tokio::time::Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "parent job {} did not become ready for steps within {:?}: {}",
+                        request.job_id,
+                        timeout,
+                        status.message()
+                    );
+                }
+                if !announced_wait {
+                    eprintln!(
+                        "srun: waiting for parent job {} to finish starting...",
+                        request.job_id
+                    );
+                    announced_wait = true;
+                }
+                tokio::time::sleep_until(std::cmp::min(
+                    deadline,
+                    tokio::time::Instant::now() + poll_interval,
+                ))
+                .await;
+            }
+            Err(status) => {
+                return Err(status).context("failed to create job step");
+            }
+        }
+    }
+}
+
+fn is_parent_start_handoff(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::Aborted
+        || (status.code() == tonic::Code::FailedPrecondition
+            && status.message().contains("is not running (state: Pending)"))
 }
 
 async fn release_srun_allocation(
@@ -2281,6 +2343,93 @@ mod tests {
             msg.contains("failed to create job step"),
             "expected a CreateJobStep failure, got: {msg}"
         );
+    }
+
+    fn test_step_request() -> CreateJobStepRequest {
+        CreateJobStepRequest {
+            job_id: 1,
+            command: vec!["hostname".into()],
+            num_tasks: 1,
+            cpus_per_task: 1,
+            user: "tester".into(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn create_job_step_waits_through_new_and_legacy_parent_start_handoffs() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.fail_next_create_steps([
+            (
+                tonic::Code::Aborted,
+                "job 1 is not ready for steps (state: Pending)".into(),
+            ),
+            (
+                tonic::Code::FailedPrecondition,
+                "job 1 is not running (state: Pending)".into(),
+            ),
+        ]);
+        let mut client = crate::mock_controller::client(addr).await;
+
+        let response = create_job_step_when_parent_ready(
+            &mut client,
+            test_step_request(),
+            tokio::time::Duration::from_secs(1),
+            tokio::time::Duration::from_millis(1),
+        )
+        .await
+        .expect("the third attempt should observe a ready parent");
+
+        assert_eq!(response.step_id, crate::mock_controller::MOCK_STEP_ID);
+        assert_eq!(capture.create_step_calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn create_job_step_does_not_retry_terminal_precondition() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.fail_next_create_steps([(
+            tonic::Code::FailedPrecondition,
+            "job 1 is not running (state: Failed)".into(),
+        )]);
+        let mut client = crate::mock_controller::client(addr).await;
+
+        let error = create_job_step_when_parent_ready(
+            &mut client,
+            test_step_request(),
+            tokio::time::Duration::from_secs(1),
+            tokio::time::Duration::from_millis(1),
+        )
+        .await
+        .expect_err("a terminal parent is not a startup handoff");
+
+        assert!(format!("{error:#}").contains("failed to create job step"));
+        assert_eq!(capture.create_step_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_job_step_parent_start_wait_is_bounded() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.fail_next_create_steps((0..100).map(|_| {
+            (
+                tonic::Code::Aborted,
+                "job 1 is not ready for steps (state: Pending)".into(),
+            )
+        }));
+        let mut client = crate::mock_controller::client(addr).await;
+
+        let error = create_job_step_when_parent_ready(
+            &mut client,
+            test_step_request(),
+            tokio::time::Duration::from_millis(20),
+            tokio::time::Duration::from_millis(2),
+        )
+        .await
+        .expect_err("a parent that stays Pending must time out");
+
+        let message = format!("{error:#}");
+        assert!(message.contains("did not become ready for steps within 20ms"));
+        assert!(capture.create_step_calls() >= 2);
+        assert!(capture.create_step_calls() < 100);
     }
 
     #[tokio::test]
