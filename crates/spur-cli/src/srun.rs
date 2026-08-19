@@ -47,6 +47,10 @@ pub struct SrunArgs {
     #[arg(long, overrides_with = "ntasks_per_node")]
     pub ntasks_per_node: Option<u32>,
 
+    /// Task distribution across nodes (currently block only)
+    #[arg(short = 'm', long, value_parser = ["block"])]
+    pub distribution: Option<String>,
+
     /// CPUs per task
     #[arg(short = 'c', long, default_value = "1")]
     pub cpus_per_task: u32,
@@ -571,6 +575,7 @@ fn build_srun_job_spec(
         num_nodes: args.nodes,
         num_tasks: crate::sbatch::effective_ntasks(args.ntasks, args.ntasks_per_node, args.nodes),
         tasks_per_node: args.ntasks_per_node.unwrap_or(0),
+        distribution: args.distribution.clone().unwrap_or_default(),
         cpus_per_task: args.cpus_per_task,
         memory_per_node_mb: memory_mb,
         gres,
@@ -1634,6 +1639,37 @@ mod tests {
 
         let absent = SrunArgs::try_parse_from(["srun", "hostname"]).expect("parse");
         assert!(absent.ntasks_per_node.is_none());
+    }
+
+    /// ML Controller uses Slurm's explicit block-distribution spelling for
+    /// deterministic one-task-per-node placement.  Spur already uses block
+    /// for job steps, but its CLI must accept and retain that contract rather
+    /// than failing before dispatch.
+    #[test]
+    fn parses_block_distribution() {
+        let equals = SrunArgs::try_parse_from(["srun", "--distribution=block", "hostname"])
+            .expect("parse --distribution=block");
+        assert_eq!(equals.distribution.as_deref(), Some("block"));
+
+        let short =
+            SrunArgs::try_parse_from(["srun", "-m", "block", "hostname"]).expect("parse -m block");
+        assert_eq!(short.distribution.as_deref(), Some("block"));
+
+        assert!(SrunArgs::try_parse_from(["srun", "--distribution=cyclic", "hostname",]).is_err());
+    }
+
+    #[test]
+    fn build_srun_job_spec_retains_block_distribution() {
+        let args = SrunArgs::try_parse_from(["srun", "--distribution=block", "hostname"])
+            .expect("parse failed");
+        let io = ResolvedIoPaths {
+            stdout: String::new(),
+            stderr: String::new(),
+            stdin: String::new(),
+        };
+        let spec =
+            build_srun_job_spec(&args, "/tmp/work", &io, spur_core::mpi::MPI_NONE).expect("spec");
+        assert_eq!(spec.distribution, "block");
     }
 
     #[test]
