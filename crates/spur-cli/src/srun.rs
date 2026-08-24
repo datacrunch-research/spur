@@ -205,6 +205,11 @@ pub struct SrunArgs {
     )]
     pub controller: String,
 
+    /// Execute this step as the scheduler-managed service account. Only the
+    /// reserved `mlctl` identity is accepted; job ownership stays unchanged.
+    #[arg(long, value_name = "USER")]
+    pub service_user: Option<String>,
+
     /// Command and arguments
     #[arg(trailing_var_arg = true)]
     pub command: Vec<String>,
@@ -764,12 +769,13 @@ async fn dispatch_step(
     {
         anyhow::bail!("{err}");
     }
+    let (uid, gid) = service_credentials(args.service_user.as_deref())?;
     let resp = client
         .run_step(RunStepRequest {
             job_id,
             command: args.command.clone(),
-            uid: nix::unistd::geteuid().as_raw(),
-            gid: nix::unistd::getegid().as_raw(),
+            uid,
+            gid,
             work_dir: work_dir.to_string(),
             environment,
             step_id,
@@ -845,6 +851,22 @@ fn is_parent_start_handoff(status: &tonic::Status) -> bool {
     status.code() == tonic::Code::Aborted
         || (status.code() == tonic::Code::FailedPrecondition
             && status.message().contains("is not running (state: Pending)"))
+}
+
+fn service_credentials(service_user: Option<&str>) -> Result<(u32, u32)> {
+    let Some(service_user) = service_user else {
+        return Ok((
+            nix::unistd::geteuid().as_raw(),
+            nix::unistd::getegid().as_raw(),
+        ));
+    };
+    if service_user != "mlctl" {
+        anyhow::bail!("--service-user supports only the managed mlctl identity");
+    }
+    let user = nix::unistd::User::from_name(service_user)
+        .context("failed to resolve managed service identity")?
+        .ok_or_else(|| anyhow::anyhow!("managed service identity mlctl is not installed"))?;
+    Ok((user.uid.as_raw(), user.gid.as_raw()))
 }
 
 async fn release_srun_allocation(
@@ -2447,5 +2469,11 @@ mod tests {
             msg.contains("--overlap"),
             "expected --overlap error, got: {msg}"
         );
+    }
+
+    #[test]
+    fn managed_service_identity_rejects_arbitrary_users() {
+        let err = service_credentials(Some("root")).expect_err("only mlctl is reserved");
+        assert!(format!("{err:#}").contains("supports only the managed mlctl identity"));
     }
 }
