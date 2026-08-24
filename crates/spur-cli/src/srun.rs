@@ -769,7 +769,8 @@ async fn dispatch_step(
     {
         anyhow::bail!("{err}");
     }
-    let (uid, gid) = service_credentials(args.service_user.as_deref())?;
+    let (uid, gid, managed_node_launcher) =
+        service_credentials(args.service_user.as_deref(), &args.command)?;
     let resp = client
         .run_step(RunStepRequest {
             job_id,
@@ -781,6 +782,7 @@ async fn dispatch_step(
             step_id,
             label: args.label,
             mpi: step_mpi.to_string(),
+            managed_node_launcher,
         })
         .await
         .context("RunStep dispatch failed")?
@@ -853,20 +855,58 @@ fn is_parent_start_handoff(status: &tonic::Status) -> bool {
             && status.message().contains("is not running (state: Pending)"))
 }
 
-fn service_credentials(service_user: Option<&str>) -> Result<(u32, u32)> {
+const KERNEL_LAB_NODE_LAUNCHER: &str = "/usr/local/sbin/mlctl-kernel-lab-node-launcher";
+const KERNEL_LAB_NODE_LAUNCHER_SERVICE_USER: &str = "mlctl-kernel-lab-node-launcher";
+
+fn is_kernel_lab_node_launcher_command(command: &[String]) -> bool {
+    let Some((program, arguments)) = command.split_first() else {
+        return false;
+    };
+    if program != KERNEL_LAB_NODE_LAUNCHER {
+        return false;
+    }
+    match arguments {
+        [action, flag, value] if action == "prepare" && flag == "--request" => {
+            value.starts_with("/mnt/shared/ml-controller/runs/")
+                && value.ends_with("/kernel-lab-node-request.json")
+        }
+        [action, flag, value]
+            if (action == "run" || action == "cleanup") && flag == "--deployment-id" =>
+        {
+            !value.is_empty()
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        }
+        _ => false,
+    }
+}
+
+fn service_credentials(service_user: Option<&str>, command: &[String]) -> Result<(u32, u32, bool)> {
     let Some(service_user) = service_user else {
         return Ok((
             nix::unistd::geteuid().as_raw(),
             nix::unistd::getegid().as_raw(),
+            false,
         ));
     };
+    if service_user == KERNEL_LAB_NODE_LAUNCHER_SERVICE_USER {
+        if !is_kernel_lab_node_launcher_command(command) {
+            anyhow::bail!(
+                "--service-user={KERNEL_LAB_NODE_LAUNCHER_SERVICE_USER} requires the fixed Kernel Lab node-launcher command"
+            );
+        }
+        return Ok((0, 0, true));
+    }
     if service_user != "mlctl" {
-        anyhow::bail!("--service-user supports only the managed mlctl identity");
+        anyhow::bail!(
+            "--service-user supports only the managed mlctl identity or Kernel Lab node launcher"
+        );
     }
     let user = nix::unistd::User::from_name(service_user)
         .context("failed to resolve managed service identity")?
         .ok_or_else(|| anyhow::anyhow!("managed service identity mlctl is not installed"))?;
-    Ok((user.uid.as_raw(), user.gid.as_raw()))
+    Ok((user.uid.as_raw(), user.gid.as_raw(), false))
 }
 
 async fn release_srun_allocation(
@@ -2473,7 +2513,26 @@ mod tests {
 
     #[test]
     fn managed_service_identity_rejects_arbitrary_users() {
-        let err = service_credentials(Some("root")).expect_err("only mlctl is reserved");
+        let err = service_credentials(Some("root"), &[]).expect_err("only mlctl is reserved");
         assert!(format!("{err:#}").contains("supports only the managed mlctl identity"));
+    }
+
+    #[test]
+    fn kernel_lab_node_launcher_identity_requires_the_fixed_command() {
+        let command = vec![
+            KERNEL_LAB_NODE_LAUNCHER.into(),
+            "run".into(),
+            "--deployment-id".into(),
+            "deployment-1".into(),
+        ];
+        assert_eq!(
+            service_credentials(Some(KERNEL_LAB_NODE_LAUNCHER_SERVICE_USER), &command,).unwrap(),
+            (0, 0, true)
+        );
+        assert!(service_credentials(
+            Some(KERNEL_LAB_NODE_LAUNCHER_SERVICE_USER),
+            &["/bin/sh".into(), "-c".into(), "id".into()],
+        )
+        .is_err());
     }
 }

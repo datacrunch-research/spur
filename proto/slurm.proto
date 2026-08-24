@@ -942,6 +942,9 @@ message RunStepRequest {
   uint32 step_id = 7;  // Step id from CreateJobStep, for recording completion
   bool label = 8;      // Prefix output lines with [rank] (srun -l)
   string mpi = 9;      // Step MPI type; when empty, inherit job.spec.mpi
+  // Only the fixed, root-owned ML Controller Kernel Lab node launcher may set
+  // this. Agents reject any other root step before process creation.
+  bool managed_node_launcher = 10;
 }
 
 message RunStepResponse {
@@ -1121,6 +1124,10 @@ message RunCommandRequest {
   uint32 run_attempt = 16;
   string submission_generation = 17;
   string worker_incarnation = 18;
+  // Propagated from RunStepRequest. A true value is accepted only for the
+  // fixed Kernel Lab node-launcher command, then the worker injects the
+  // allocation submitter UID itself.
+  bool managed_node_launcher = 19;
 }
 
 // Register a srun-only allocation on an agent without starting a batch process.

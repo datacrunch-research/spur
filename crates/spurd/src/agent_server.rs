@@ -34,6 +34,32 @@ use crate::executor;
 use crate::mpi_plugin::{self, MpiPluginHost, PmixLaunchGuard};
 use crate::reporter::NodeReporter;
 
+const KERNEL_LAB_NODE_LAUNCHER: &str = "/usr/local/sbin/mlctl-kernel-lab-node-launcher";
+
+fn is_kernel_lab_node_launcher_command(command: &[String]) -> bool {
+    let Some((program, arguments)) = command.split_first() else {
+        return false;
+    };
+    if program != KERNEL_LAB_NODE_LAUNCHER {
+        return false;
+    }
+    match arguments {
+        [action, flag, value] if action == "prepare" && flag == "--request" => {
+            value.starts_with("/mnt/shared/ml-controller/runs/")
+                && value.ends_with("/kernel-lab-node-request.json")
+        }
+        [action, flag, value]
+            if (action == "run" || action == "cleanup") && flag == "--deployment-id" =>
+        {
+            !value.is_empty()
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        }
+        _ => false,
+    }
+}
+
 pub(crate) struct TrackedJob {
     job: executor::RunningJob,
     rootfs_mode: crate::container::RootfsMode,
@@ -2721,7 +2747,16 @@ impl SlurmAgent for AgentService {
         // node already confirmed via LaunchJob (confirm_dispatch_on_nodes) — so a
         // miss is a wrong job/node pairing, not a launch race. The one uncovered
         // case is a spurd restart mid-job, which starts `running` empty.
-        let (gpu_devices, partition, cpus, memory_mb, nodelist, job_mpi, cgroup_path) = {
+        let (
+            gpu_devices,
+            partition,
+            cpus,
+            memory_mb,
+            nodelist,
+            job_mpi,
+            cgroup_path,
+            submitter_uid,
+        ) = {
             let jobs = self.running.lock().await;
             let tracked = jobs.get(&job_id).ok_or_else(|| {
                 Status::not_found(format!("job {} not running on this node", job_id))
@@ -2749,8 +2784,25 @@ impl SlurmAgent for AgentService {
                 nodelist,
                 tracked.mpi.clone(),
                 tracked.job.cgroup_path(),
+                tracked.uid,
             )
         };
+        if req.managed_node_launcher {
+            if req.uid != 0 || req.gid != 0 || !is_kernel_lab_node_launcher_command(&req.command) {
+                return Err(Status::permission_denied(
+                    "managed node launcher request is not the fixed approved command",
+                ));
+            }
+        } else if req.uid == 0 && !is_kernel_lab_node_launcher_command(&req.command) {
+            // Preserve root-owned administrative allocations, but reject a
+            // client attempting to turn an ordinary non-root allocation into
+            // an arbitrary root step by crafting RunStep directly.
+            if submitter_uid != 0 {
+                return Err(Status::permission_denied(
+                    "non-root allocation cannot launch an arbitrary root step",
+                ));
+            }
+        }
         if req.pmix_prepared
             && req.pmix_prepare_token
                 != step_pmix_prepare_token(&req.submission_generation, run_attempt, step_id)
@@ -2817,6 +2869,9 @@ impl SlurmAgent for AgentService {
         let mut bind_env = HashMap::new();
         spur_core::task_launch::apply_gpu_bind_env(&mut bind_env, &req.environment, &gpu_devices);
         senv.extend(&bind_env);
+        if req.managed_node_launcher {
+            senv.set("MLCTL_KERNEL_LAB_SUBMITTER_UID", submitter_uid);
+        }
         if let Some(cpu_bind) = spur_core::task_launch::unsupported_cpu_bind(&req.environment) {
             warn!(
                 job_id,
@@ -4380,6 +4435,33 @@ mod tests {
     #[test]
     fn build_job_script_errors_on_empty() {
         assert!(build_job_script("", &[], &[]).is_err());
+    }
+
+    #[test]
+    fn kernel_lab_node_launcher_command_is_narrow() {
+        assert!(is_kernel_lab_node_launcher_command(&[
+            KERNEL_LAB_NODE_LAUNCHER.into(),
+            "run".into(),
+            "--deployment-id".into(),
+            "deployment-1".into(),
+        ]));
+        assert!(is_kernel_lab_node_launcher_command(&[
+            KERNEL_LAB_NODE_LAUNCHER.into(),
+            "prepare".into(),
+            "--request".into(),
+            "/mnt/shared/ml-controller/runs/deployment-1/kernel-lab-node-request.json".into(),
+        ]));
+        assert!(!is_kernel_lab_node_launcher_command(&[
+            "/bin/sh".into(),
+            "-c".into(),
+            "id".into(),
+        ]));
+        assert!(!is_kernel_lab_node_launcher_command(&[
+            KERNEL_LAB_NODE_LAUNCHER.into(),
+            "cleanup".into(),
+            "--deployment-id".into(),
+            "deployment;id".into(),
+        ]));
     }
 
     #[test]

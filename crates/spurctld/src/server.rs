@@ -28,6 +28,31 @@ use crate::sched_stats::SchedStatsCollector;
 
 const FORWARDED_HEADER: &str = "x-spur-forwarded";
 const LEADER_HEADER: &str = "x-spur-leader";
+const KERNEL_LAB_NODE_LAUNCHER: &str = "/usr/local/sbin/mlctl-kernel-lab-node-launcher";
+
+fn is_kernel_lab_node_launcher_command(command: &[String]) -> bool {
+    let Some((program, arguments)) = command.split_first() else {
+        return false;
+    };
+    if program != KERNEL_LAB_NODE_LAUNCHER {
+        return false;
+    }
+    match arguments {
+        [action, flag, value] if action == "prepare" && flag == "--request" => {
+            value.starts_with("/mnt/shared/ml-controller/runs/")
+                && value.ends_with("/kernel-lab-node-request.json")
+        }
+        [action, flag, value]
+            if (action == "run" || action == "cleanup") && flag == "--deployment-id" =>
+        {
+            !value.is_empty()
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        }
+        _ => false,
+    }
+}
 
 fn validate_worker_incarnation(worker_incarnation: &str) -> Result<(), Status> {
     (!worker_incarnation.is_empty())
@@ -2360,6 +2385,13 @@ impl SlurmController for ControllerService {
         use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
 
         let req = request.into_inner();
+        if req.managed_node_launcher
+            && (req.uid != 0 || req.gid != 0 || !is_kernel_lab_node_launcher_command(&req.command))
+        {
+            return Err(Status::permission_denied(
+                "managed node launcher request is not the fixed approved command",
+            ));
+        }
         let job_id = req.job_id;
 
         let job = self
@@ -2398,6 +2430,7 @@ impl SlurmController for ControllerService {
         let environment = req.environment.clone();
         let uid = req.uid;
         let gid = req.gid;
+        let managed_node_launcher = req.managed_node_launcher;
         let step_id = req.step_id;
         let run_attempt = job.run_attempt;
         let submission_generation = job.submission_generation.to_string();
@@ -2637,6 +2670,7 @@ impl SlurmController for ControllerService {
                         run_attempt,
                         submission_generation,
                         worker_incarnation,
+                        managed_node_launcher,
                     })
                     .await
                     .map_err(|e| {
@@ -3708,6 +3742,33 @@ mod tests {
             validate_worker_incarnation("").unwrap_err().code(),
             Code::InvalidArgument
         );
+    }
+
+    #[test]
+    fn kernel_lab_node_launcher_command_is_narrow() {
+        assert!(is_kernel_lab_node_launcher_command(&[
+            KERNEL_LAB_NODE_LAUNCHER.into(),
+            "run".into(),
+            "--deployment-id".into(),
+            "deployment-1".into(),
+        ]));
+        assert!(is_kernel_lab_node_launcher_command(&[
+            KERNEL_LAB_NODE_LAUNCHER.into(),
+            "prepare".into(),
+            "--request".into(),
+            "/mnt/shared/ml-controller/runs/deployment-1/kernel-lab-node-request.json".into(),
+        ]));
+        assert!(!is_kernel_lab_node_launcher_command(&[
+            "/bin/sh".into(),
+            "-c".into(),
+            "id".into(),
+        ]));
+        assert!(!is_kernel_lab_node_launcher_command(&[
+            KERNEL_LAB_NODE_LAUNCHER.into(),
+            "cleanup".into(),
+            "--deployment-id".into(),
+            "deployment;id".into(),
+        ]));
     }
 
     #[test]
